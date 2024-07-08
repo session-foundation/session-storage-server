@@ -241,7 +241,7 @@ class DatabaseImpl {
 
     DatabaseImpl(Database& parent, const std::filesystem::path& db_path, bool initialize) :
             parent{parent},
-            db{db_path / std::filesystem::u8path("storage.db"),
+            db{db_path / u8"storage.db",
                SQLite::OPEN_READWRITE | (initialize ? SQLite::OPEN_CREATE : 0) |
                        SQLite::OPEN_NOMUTEX,
                SQLite_busy_timeout.count()} {
@@ -255,7 +255,7 @@ class DatabaseImpl {
         if (int rc = db.tryExec("PRAGMA foreign_keys = ON"); rc != SQLITE_OK) {
             auto m = fmt::format(
                     "Failed to enable foreign keys constraints: {}", sqlite3_errstr(rc));
-            log::critical(logcat, m);
+            log::critical(logcat, "{}", m);
             throw std::runtime_error{m};
         }
         int fk_enabled = db.execAndGet("PRAGMA foreign_keys").getInt();
@@ -274,7 +274,7 @@ class DatabaseImpl {
                     "PRAGMA max_page_count = {}"_format(Database::SIZE_LIMIT / page_size));
             rc != SQLITE_OK) {
             auto m = fmt::format("Failed to set max page count: {}", sqlite3_errstr(rc));
-            log::critical(logcat, m);
+            log::critical(logcat, "{}", m);
             throw std::runtime_error{m};
         }
 
@@ -395,7 +395,9 @@ CREATE TABLE messages (
                     oxenc::from_hex(old_owner.begin(), old_owner.end(), pubkey.begin());
                 } else {
                     log::warning(
-                            logcat, "Found invalid owner pubkey '{}' during migration; ignoring");
+                            logcat,
+                            "Found invalid owner pubkey '{}' during migration; ignoring",
+                            old_owner);
                     continue;
                 }
 

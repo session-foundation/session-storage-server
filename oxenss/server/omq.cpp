@@ -97,8 +97,7 @@ void OMQ::handle_storage_test(oxenmq::Message& message) {
         log::debug(
                 logcat, "incoming sn.storage_test request from {}@{}", tester_pk, message.remote);
     } else {
-        log::warning(
-                logcat, "invalid sn.storage_test omq request from {}: sender is not an active SN");
+        log::warning(logcat, "invalid sn.storage_test omq request: sender is not an active SN");
         return message.send_reply("invalid pubkey");
     }
 
@@ -190,7 +189,7 @@ void OMQ::handle_onion_request(oxenmq::Message& message) {
         data = decode_onion_data(message.data[0]);
     } catch (const std::exception& e) {
         auto msg = "Invalid internal onion request: "s + e.what();
-        log::error(logcat, msg);
+        log::error(logcat, "{}", msg);
         message.send_reply(std::to_string(http::BAD_REQUEST.first), msg);
         return;
     }
@@ -389,7 +388,7 @@ void OMQ::init(
         omq_future.get();
     } catch (const std::runtime_error&) {
         auto msg = fmt::format("OxenMQ server failed to bind to port {}", me.omq_quic_port);
-        log::critical(logcat, msg);
+        log::critical(logcat, "{}", msg);
         throw std::runtime_error{msg};
     }
 

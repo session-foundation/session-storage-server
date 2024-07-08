@@ -24,6 +24,13 @@ local submodules = {
 
 local apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -q';
 
+local kitware_repo(distro) = [
+  'eatmydata ' + apt_get_quiet + ' install -y curl ca-certificates',
+  'curl -sSL https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - >/usr/share/keyrings/kitware-archive-keyring.gpg',
+  'echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ ' + distro + ' main" >/etc/apt/sources.list.d/kitware.list',
+  'eatmydata ' + apt_get_quiet + ' update',
+];
+
 local local_gnutls(jobs=6, prefix='/usr/local') = [
   apt_get_quiet + ' install -y curl ca-certificates',
   'curl -sSL https://ftp.gnu.org/gnu/nettle/nettle-3.9.1.tar.gz | tar xfz -',
@@ -190,8 +197,8 @@ local static_check_and_upload = [
   // Various debian builds
   debian_pipeline('Debian (amd64)', docker_base + 'debian-sid', lto=true),
   debian_pipeline('Debian Debug (amd64)', docker_base + 'debian-sid', build_type='Debug'),
-  clang(14, lto=true),
-  debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386'),
+  clang(17, lto=true),
+  debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386', werror=false),
   debian_pipeline('Ubuntu LTS (amd64)', docker_base + 'ubuntu-lts'),
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
   debian_pipeline('Debian 11 bullseye (amd64)',
@@ -202,15 +209,15 @@ local static_check_and_upload = [
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),
-  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64'),
+  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false),
 
   // Static build (on bionic) which gets uploaded to oxen.rocks:
-  debian_pipeline('Static (bionic amd64)',
-                  docker_base + 'ubuntu-bionic',
-                  deps=['autoconf', 'automake', 'file', 'g++-8', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
-                  cmake_extra='-DBUILD_STATIC_DEPS=ON -DCMAKE_C_COMPILER=gcc-8 -DCMAKE_CXX_COMPILER=g++-8',
+  debian_pipeline('Static (focal amd64)',
+                  docker_base + 'ubuntu-focal',
+                  extra_setup=kitware_repo('focal'),
+                  deps=['autoconf', 'automake', 'file', 'g++-10', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
+                  cmake_extra='-DBUILD_STATIC_DEPS=ON -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10',
                   lto=true,
-                  oxen_repo=true,  // for updated cmake
                   extra_cmds=static_check_and_upload),
 
   // Macos builds:

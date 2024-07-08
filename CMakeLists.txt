@@ -13,10 +13,10 @@ endif()
 cmake_minimum_required(VERSION 3.13)
 
 project(oxenss
-    VERSION 2.6.2
+    VERSION 2.7.0
     LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS FALSE)
 
@@ -113,5 +113,9 @@ add_executable(onion-request EXCLUDE_FROM_ALL contrib/onion-request.cpp)
 set_target_properties(onion-request PROPERTIES RUNTIME_OUTPUT_DIRECTORY contrib)
 target_link_libraries(onion-request common crypto cpr::cpr oxenmq::oxenmq quic)
 target_include_directories(onion-request PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(quic-reach-test EXCLUDE_FROM_ALL contrib/quic-reach-test.cpp)
+set_target_properties(quic-reach-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY contrib)
+target_link_libraries(quic-reach-test quic sodium fmt::fmt)
 
 include(cmake/archive.cmake)

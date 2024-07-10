@@ -23,6 +23,8 @@ endif
 override_dh_auto_configure:
 	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release \
 		$(DEB_CMAKE_ARCH_OPTIONS) \
+		-DCMAKE_C_COMPILER=gcc-10 \
+		-DCMAKE_CXX_COMPILER=g++-10 \
 		-DOXENSS_VERSIONTAG=$(call dpkg_late_eval,OXENSS_VERSIONTAG,echo '$(DEB_VERSION)' | sed -e 's/.*-/-/')
 
 override_dh_strip:

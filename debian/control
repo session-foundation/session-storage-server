@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Jason Rhinelander <jason@oxen.io>
 Build-Depends: debhelper (>= 12),
     cmake,
-    g++ (>= 10) | g++-10,
+    g++-10,
     liboxenmq-dev (>= 1.2.17),
     liboxenc-dev (>= 1.0.4),
     liboxen-quic-dev (>= 1.1.0),

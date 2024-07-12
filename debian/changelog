@@ -1,3 +1,12 @@
+oxen-storage-server (2.7.0-2) unstable; urgency=medium
+
+  * deb updates for 2.7.0
+  * Update oxen-logging for C++20 support
+  * drop deprecated docker image name
+  * Fix errant quotes in paths with older fmt versions
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Thu, 11 Jul 2024 22:35:51 -0300
+
 oxen-storage-server (2.7.0-1) unstable; urgency=medium
 
   [ Jason Rhinelander ]

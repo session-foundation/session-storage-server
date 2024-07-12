@@ -1,3 +1,13 @@
+oxen-storage-server (2.7.0-2~ubuntu2404) noble; urgency=medium
+
+  * deb updates for 2.7.0
+  * Update oxen-logging for C++20 support
+  * Disable noble armhf builds
+  * Drop deprecated ci name
+  * Fix errant quotes in paths with older fmt versions
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Thu, 11 Jul 2024 22:37:17 -0300
+
 oxen-storage-server (2.7.0-1~ubuntu2404) noble; urgency=medium
 
   [ Jason Rhinelander ]

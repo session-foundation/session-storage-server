@@ -1,0 +1,60 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Thu, 11 Jul 2024 22:29:20 -0300
+Subject: Fix errant quotes in paths with older fmt versions
+
+The default omq path having quotes broke the omq connection to oxend.
+---
+ oxenss/daemon/command_line.cpp | 6 +++---
+ oxenss/utils/string_utils.hpp  | 8 ++++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/oxenss/daemon/command_line.cpp b/oxenss/daemon/command_line.cpp
+index bee2bee..44f980a 100644
+--- a/oxenss/daemon/command_line.cpp
++++ b/oxenss/daemon/command_line.cpp
+@@ -2,6 +2,7 @@
+ #include <oxenss/logging/oxen_logger.h>
+ #include <oxenss/version.h>
+ #include <oxenss/common/format.h>
++#include <oxenss/utils/string_utils.hpp>
+ 
+ #include <CLI/CLI.hpp>
+ #include <CLI/Error.hpp>
+@@ -124,7 +125,7 @@ parse_result parse_cli_args(int argc, char* argv[]) {
+     }
+ 
+     options.data_dir = base_dir / "storage";
+-    options.oxend_omq_rpc = "ipc://{}"_format(base_dir / "oxend.sock");
++    options.oxend_omq_rpc = "ipc://{}"_format(util::to_sv((base_dir / "oxend.sock").u8string()));
+     data_dir = base_dir / "storage";
+ 
+     cli.add_option("--data-dir", options.data_dir, "Path in which to store persistent data")
+@@ -132,8 +133,7 @@ parse_result parse_cli_args(int argc, char* argv[]) {
+             ->capture_default_str();
+     cli.set_config(
+                "--config-file",
+-               reinterpret_cast<const char*>(
+-                       (options.data_dir / "storage-server.conf").u8string().c_str()),
++               util::to_str((options.data_dir / "storage-server.conf").u8string()),
+                "Path to config file specifying additional command-line options")
+             ->capture_default_str();
+     cli.add_option(
+diff --git a/oxenss/utils/string_utils.hpp b/oxenss/utils/string_utils.hpp
+index 6d1dc52..4b579ce 100644
+--- a/oxenss/utils/string_utils.hpp
++++ b/oxenss/utils/string_utils.hpp
+@@ -148,6 +148,14 @@ T make_from_guts(std::basic_string_view<std::byte> s) {
+     return make_from_guts<T>(std::string_view{reinterpret_cast<const char*>(s.data()), s.size()});
+ }
+ 
++inline std::string_view to_sv(std::u8string_view u8s) {
++    return std::string_view{reinterpret_cast<const char*>(u8s.data()), u8s.size()};
++}
++
++inline std::string to_str(std::u8string_view u8s) {
++    return std::string{to_sv(u8s)};
++}
++
+ std::string lowercase_ascii_string(std::string_view src);
+ 
+ /// Converts a duration into a human friendlier string, such as "3d7h47m12s" or "347µs"

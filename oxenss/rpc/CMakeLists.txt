@@ -13,6 +13,7 @@ target_link_libraries(rpc
     crypto
     server
     snode
+    http
     utils
     logging
     version

@@ -1,3 +1,11 @@
+oxen-storage-server (2.7.1~pre-1~deb13) trixie; urgency=medium
+
+  * Fix errant quotes in paths with older fmt versions
+  * Refactor onion proxy requests to use curl multi mode
+  * Rediff patches
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Fri, 19 Jul 2024 18:38:59 -0300
+
 oxen-storage-server (2.7.0-2~deb13) trixie; urgency=medium
 
   * deb updates for 2.7.0

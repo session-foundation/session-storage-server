@@ -1,3 +1,11 @@
+oxen-storage-server (2.7.1~pre-1~ubuntu2404) noble; urgency=medium
+
+  * Fix errant quotes in paths with older fmt versions
+  * Refactor onion proxy requests to use curl multi mode
+  * Rediff patches
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Fri, 19 Jul 2024 18:39:11 -0300
+
 oxen-storage-server (2.7.0-2~ubuntu2404) noble; urgency=medium
 
   * deb updates for 2.7.0

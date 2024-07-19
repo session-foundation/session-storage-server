@@ -9,17 +9,15 @@
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/server/utils.h>
 #include <oxenss/utils/time.hpp>
+#include <oxenss/http/http_client.h>
 
 #include <chrono>
-#include <forward_list>
-#include <future>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <variant>
 
 #include <nlohmann/json_fwd.hpp>
-#include <cpr/async_wrapper.h>
-#include <variant>
 
 namespace oxenss::rpc {
 
@@ -151,8 +149,7 @@ class RequestHandler {
     snode::ServiceNode& service_node_;
     const crypto::ChannelEncryption& channel_cipher_;
     const crypto::ed25519_seckey ed25519_sk_;
-
-    std::forward_list<cpr::AsyncWrapper<void>> pending_proxy_requests_;
+    std::weak_ptr<http::Client> http_;
 
     // Wrap response `res` to an intermediate node
     Response wrap_proxy_response(
@@ -184,6 +181,10 @@ class RequestHandler {
             snode::ServiceNode& sn,
             const crypto::ChannelEncryption& ce,
             crypto::ed25519_seckey ed_sk);
+
+    // Sets the http client needed to perform proxied onion requests.  This must be set up before
+    // incoming requests are accepted.
+    void set_http_client(std::weak_ptr<http::Client> client) { http_ = std::move(client); }
 
     // Handlers for parsed client requests
     void process_client_req(rpc::store&& req, std::function<void(Response)> cb);

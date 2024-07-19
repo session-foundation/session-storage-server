@@ -1,3 +1,9 @@
+oxen-storage-server (2.7.1~pre-2~ubuntu2404) noble; urgency=medium
+
+  * Fix missing linking to libevent
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Fri, 19 Jul 2024 19:08:55 -0300
+
 oxen-storage-server (2.7.1~pre-1~ubuntu2404) noble; urgency=medium
 
   * Fix errant quotes in paths with older fmt versions

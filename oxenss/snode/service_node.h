@@ -1,8 +1,6 @@
 #pragma once
 
 #include <chrono>
-#include <forward_list>
-#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -10,10 +8,10 @@
 #include <string>
 #include <string_view>
 
-#include <cpr/async_wrapper.h>
 #include <oxenss/storage/database.hpp>
 #include <oxenss/crypto/keys.h>
 #include <oxenss/server/mqbase.h>
+#include <oxenss/http/http_client.h>
 #include "reachability_testing.h"
 #include "stats.h"
 #include "swarm.h"
@@ -89,6 +87,7 @@ class ServiceNode {
     std::string block_hash_;
     std::unique_ptr<Swarm> swarm_;
     std::unique_ptr<Database> db_;
+    std::weak_ptr<http::Client> http_;
 
     SnodeStatus status_ = SnodeStatus::UNKNOWN;
 
@@ -114,8 +113,6 @@ class ServiceNode {
     mutable all_stats all_stats_;
 
     mutable std::recursive_mutex sn_mutex_;
-
-    std::forward_list<cpr::AsyncWrapper<void>> outstanding_https_reqs_;
 
     void send_notifies(message m);
 
@@ -187,6 +184,9 @@ class ServiceNode {
     // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
     // should not be added.
     void register_mq_server(server::MQBase* server);
+
+    // Sets the http client needed to perform HTTPS reachability tests
+    void set_http_client(std::weak_ptr<http::Client> client) { http_ = std::move(client); }
 
     // Return info about this node as it is advertised to other nodes
     const sn_record& own_address() { return our_address_; }

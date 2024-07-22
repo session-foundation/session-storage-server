@@ -1,3 +1,11 @@
+oxen-storage-server (2.8.0-1) unstable; urgency=medium
+
+  * Fix oxen logging path stripping
+  * Bump version to 2.8.0
+  * Bump oxen-libquic and oxen-logging to latest
+
+ -- Jason Rhinelander <jason@imaginary.ca>  Mon, 22 Jul 2024 12:27:24 -0300
+
 oxen-storage-server (2.7.1~pre-2) unstable; urgency=medium
 
   * Fix missing linking to libevent

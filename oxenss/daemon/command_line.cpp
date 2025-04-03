@@ -175,6 +175,11 @@ parse_result parse_cli_args(int argc, char* argv[]) {
             "--force-start",
             options.force_start,
             "Ignore the initialisation ready check (primarily for debugging).");
+    cli.add_flag(
+            "--skip-bootstrap-nodes",
+            options.skip_bootstrap,
+            "Skip the contacting of bootstrap seed nodes on startup (primarily for private node "
+            "networks)");
     cli.add_option(
                "--stats-access-key",
                options.stats_access_keys,

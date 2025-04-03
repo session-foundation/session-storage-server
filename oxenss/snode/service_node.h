@@ -79,6 +79,7 @@ class ServiceNode {
     bool active_ = false;
     std::atomic<bool> got_first_response_ = false;
     bool force_start_ = false;
+    bool skip_bootstrap_ = false;
     std::atomic<bool> shutting_down_ = false;
     hf_revision hardfork_ = {0, 0};
     uint64_t block_height_ = 0;
@@ -170,7 +171,8 @@ class ServiceNode {
             const contact& contact,
             server::OMQ& omq_server,
             const std::filesystem::path& db_location,
-            bool force_start);
+            bool force_start,
+            bool skip_bootstrap);
 
     Database& get_db() { return *db_; }
     const Database& get_db() const { return *db_; }

@@ -50,8 +50,10 @@ ServiceNode::ServiceNode(
         const contact& contact,
         server::OMQ& omq_server,
         const std::filesystem::path& db_location,
-        const bool force_start) :
+        bool force_start,
+        bool skip_bootstrap) :
         force_start_{force_start},
+        skip_bootstrap_{skip_bootstrap},
         db_{std::make_unique<Database>(db_location)},
         our_keys_{keys},
         our_contact_{contact},

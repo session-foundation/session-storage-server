@@ -703,8 +703,9 @@ void ServiceNode::process_snodes_update(std::string_view data) {
     auto [total, contactable] = network_.contacts.counts();
     auto missing = total - contactable;
 
-    if (total >= (oxenss::is_mainnet ? 100 : 10) &&
-        missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den) {
+    if (skip_bootstrap_ ||
+        (total >= (oxenss::is_mainnet ? 100 : 10) &&
+         missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
         log::info(
                 logcat,
                 "Initialized from oxend with {}/{} contactable service nodes",

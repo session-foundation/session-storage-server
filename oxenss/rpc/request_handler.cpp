@@ -565,7 +565,7 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
             access_required = access_required | subaccount_access::Delete;
 
         if (!verify_signature(
-                    service_node_.get_db(),
+                    *service_node_.db,
                     req.pubkey,
                     req.pubkey_ed25519,
                     req.subaccount,
@@ -733,7 +733,7 @@ void RequestHandler::process_client_req(
         }
 
         if (!verify_signature(
-                    service_node_.get_db(),
+                    *service_node_.db,
                     req.pubkey,
                     req.pubkey_ed25519,
                     req.subaccount,
@@ -770,7 +770,7 @@ void RequestHandler::process_client_req(
     std::vector<message> msgs;
     bool more = false;
     try {
-        std::tie(msgs, more) = service_node_.get_db().retrieve(
+        std::tie(msgs, more) = service_node_.db->retrieve(
                 req.pubkey,
                 req.msg_namespace,
                 req.last_hash.value_or(""),
@@ -870,7 +870,7 @@ void RequestHandler::process_client_req(
                 Response{http::NOT_ACCEPTABLE, "delete_all timestamp too far from current time"sv});
     }
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -896,7 +896,7 @@ void RequestHandler::process_client_req(
         handle_action_all_ns(
                 mine,
                 "deleted",
-                service_node_.get_db().delete_all(req.pubkey),
+                service_node_.db->delete_all(req.pubkey),
                 req.b64,
                 ed25519_sk_,
                 req.pubkey.prefixed_hex(),
@@ -906,8 +906,7 @@ void RequestHandler::process_client_req(
         handle_action_one_ns(
                 mine,
                 "deleted",
-                service_node_.get_db().delete_all(
-                        req.pubkey, std::get<namespace_id>(req.msg_namespace)),
+                service_node_.db->delete_all(req.pubkey, std::get<namespace_id>(req.msg_namespace)),
                 req.b64,
                 ed25519_sk_,
                 req.pubkey.prefixed_hex(),
@@ -928,7 +927,7 @@ void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<vo
         return cb(handle_wrong_swarm(req.pubkey));
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -971,7 +970,7 @@ void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<vo
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
-    auto deleted = service_node_.get_db().delete_by_hash(req.pubkey, req.messages);
+    auto deleted = service_node_.db->delete_by_hash(req.pubkey, req.messages);
     std::sort(deleted.begin(), deleted.end());
     auto sig = create_signature(ed25519_sk_, req.pubkey.prefixed_hex(), req.messages, deleted);
     mine["deleted"] = std::move(deleted);
@@ -1002,7 +1001,7 @@ void RequestHandler::process_client_req(
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 std::nullopt,  // no subaccount allowed
@@ -1024,7 +1023,7 @@ void RequestHandler::process_client_req(
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
-    service_node_.get_db().revoke_subaccounts(req.pubkey, req.revoke);
+    service_node_.db->revoke_subaccounts(req.pubkey, req.revoke);
     auto sig = create_signature(ed25519_sk_, req.pubkey.prefixed_hex(), req.timestamp, req.revoke);
     mine["signature"] = req.b64 ? oxenc::to_base64(sig.begin(), sig.end()) : util::view_guts(sig);
     if (req.recurse)
@@ -1055,7 +1054,7 @@ void RequestHandler::process_client_req(
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 std::nullopt,  // no subaccount allowed
@@ -1077,7 +1076,7 @@ void RequestHandler::process_client_req(
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
-    mine["count"] = service_node_.get_db().unrevoke_subaccounts(req.pubkey, req.unrevoke);
+    mine["count"] = service_node_.db->unrevoke_subaccounts(req.pubkey, req.unrevoke);
     auto sig =
             create_signature(ed25519_sk_, req.pubkey.prefixed_hex(), req.timestamp, req.unrevoke);
     mine["signature"] = req.b64 ? oxenc::to_base64(sig.begin(), sig.end()) : util::view_guts(sig);
@@ -1106,7 +1105,7 @@ void RequestHandler::process_client_req(
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 std::nullopt,
                 std::nullopt,  // no subaccount allowed
@@ -1122,7 +1121,7 @@ void RequestHandler::process_client_req(
 
     std::vector<std::string> revoked_subaccounts;
     try {
-        revoked_subaccounts = service_node_.get_db().revoked_subaccounts(req.pubkey);
+        revoked_subaccounts = service_node_.db->revoked_subaccounts(req.pubkey);
     } catch (const std::exception& e) {
         auto msg = fmt::format(
                 "Internal Server Error. Could not retrieve revoked_subaccounts for {}",
@@ -1165,7 +1164,7 @@ void RequestHandler::process_client_req(
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -1191,7 +1190,7 @@ void RequestHandler::process_client_req(
         handle_action_all_ns(
                 mine,
                 "deleted",
-                service_node_.get_db().delete_by_timestamp(req.pubkey, req.before),
+                service_node_.db->delete_by_timestamp(req.pubkey, req.before),
                 req.b64,
                 ed25519_sk_,
                 req.pubkey.prefixed_hex(),
@@ -1201,7 +1200,7 @@ void RequestHandler::process_client_req(
         handle_action_one_ns(
                 mine,
                 "deleted",
-                service_node_.get_db().delete_by_timestamp(
+                service_node_.db->delete_by_timestamp(
                         req.pubkey, std::get<namespace_id>(req.msg_namespace), req.before),
                 req.b64,
                 ed25519_sk_,
@@ -1232,7 +1231,7 @@ void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<voi
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -1258,7 +1257,7 @@ void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<voi
         handle_action_all_ns(
                 mine,
                 "updated",
-                service_node_.get_db().update_all_expiries(req.pubkey, req.expiry),
+                service_node_.db->update_all_expiries(req.pubkey, req.expiry),
                 req.b64,
                 ed25519_sk_,
                 req.pubkey.prefixed_hex(),
@@ -1267,7 +1266,7 @@ void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<voi
         handle_action_one_ns(
                 mine,
                 "updated",
-                service_node_.get_db().update_all_expiries(
+                service_node_.db->update_all_expiries(
                         req.pubkey, std::get<namespace_id>(req.msg_namespace), req.expiry),
                 req.b64,
                 ed25519_sk_,
@@ -1309,7 +1308,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -1352,7 +1351,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
-    auto updated = service_node_.get_db().update_expiry(
+    auto updated = service_node_.db->update_expiry(
             req.pubkey,
             req.messages,
             expiry,
@@ -1373,7 +1372,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
             if (!updated_hashes.count(m))
                 unchanged_hashes.push_back(m);
         if (!unchanged_hashes.empty())
-            unchanged = service_node_.get_db().get_expiries(req.pubkey, unchanged_hashes);
+            unchanged = service_node_.db->get_expiries(req.pubkey, unchanged_hashes);
     }
 
     std::vector<std::string> updated_hash;
@@ -1439,7 +1438,7 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
     }
 
     if (!verify_signature(
-                service_node_.get_db(),
+                *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
                 req.subaccount,
@@ -1454,7 +1453,7 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
     }
 
     json res = json::object();
-    res["expiries"] = service_node_.get_db().get_expiries(req.pubkey, req.messages);
+    res["expiries"] = service_node_.db->get_expiries(req.pubkey, req.messages);
     return cb(Response{http::OK, std::move(res)});
 }
 
@@ -1657,7 +1656,7 @@ void RequestHandler::process_client_req(
 Response RequestHandler::process_retrieve_all() {
     std::vector<message> msgs;
     try {
-        msgs = service_node_.get_db().retrieve_all();
+        msgs = service_node_.db->retrieve_all();
     } catch (const std::exception& e) {
         return {http::INTERNAL_SERVER_ERROR, "could not retrieve all messages"s};
     }

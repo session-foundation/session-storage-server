@@ -174,8 +174,7 @@ class ServiceNode {
             bool force_start,
             bool skip_bootstrap);
 
-    Database& get_db() { return *db_; }
-    const Database& get_db() const { return *db_; }
+    std::unique_ptr<Database> db;
 
     const Network& network() { return network_; }
 

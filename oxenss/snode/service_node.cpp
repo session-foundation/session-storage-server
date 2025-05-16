@@ -49,17 +49,17 @@ ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
         server::OMQ& omq_server,
-        const std::filesystem::path& db_location,
+        const std::filesystem::path& dblocation,
         bool force_start,
         bool skip_bootstrap) :
         force_start_{force_start},
         skip_bootstrap_{skip_bootstrap},
-        db_{std::make_unique<Database>(db_location)},
         our_keys_{keys},
         our_contact_{contact},
         network_{*omq_server},
         omq_server_{omq_server},
-        all_stats_{*omq_server} {
+        all_stats_{*omq_server},
+        db{std::make_unique<Database>(dblocation)} {
     mq_servers_.push_back(&omq_server);
 
     log::info(logcat, "Requesting initial swarm state");
@@ -67,7 +67,7 @@ ServiceNode::ServiceNode(
     omq_server->add_timer(
             [this] {
                 std::lock_guard l{sn_mutex_};
-                db_->clean_expired();
+                db->clean_expired();
             },
             Database::CLEANUP_PERIOD);
 
@@ -351,10 +351,11 @@ bool ServiceNode::snode_ready(std::string* reason) {
     std::vector<std::string> problems;
 
     if (!hf_at_least(STORAGE_SERVER_HARDFORK))
-        problems.push_back(fmt::format(
-                "not yet on hardfork {}.{}",
-                STORAGE_SERVER_HARDFORK.first,
-                STORAGE_SERVER_HARDFORK.second));
+        problems.push_back(
+                fmt::format(
+                        "not yet on hardfork {}.{}",
+                        STORAGE_SERVER_HARDFORK.first,
+                        STORAGE_SERVER_HARDFORK.second));
     if (syncing_)
         problems.push_back("not done syncing");
 
@@ -451,7 +452,7 @@ void ServiceNode::check_new_members() {
     }
 
     if (auto send_now = swarm_.extract_ready_members(); !send_now.empty()) {
-        auto msgs = db_->retrieve_all();
+        auto msgs = db->retrieve_all();
         log::debug(
                 logcat,
                 "Initiating swarm message dump ({} message) to new swarm member(s): {}",
@@ -530,7 +531,7 @@ bool ServiceNode::process_store(
     all_stats_.bump_store_requests();
 
     /// store in the database (if not already present)
-    const auto result = db_->store(msg, expiry);
+    const auto result = db->store(msg, expiry);
     if (new_msg)
         *new_msg = result == StoreResult::New;
 
@@ -542,7 +543,7 @@ bool ServiceNode::process_store(
 
 void ServiceNode::save_bulk(const std::vector<message>& msgs) {
     try {
-        db_->bulk_store(msgs);
+        db->bulk_store(msgs);
     } catch (const std::exception& e) {
         log::error(logcat, "failed to save batch to the database: {}", e.what());
         return;
@@ -974,7 +975,7 @@ void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) const {
     std::unordered_map<user_pubkey, swarm_id_t> pk_swarm_cache;
     std::unordered_map<swarm_id_t, std::vector<message>> to_relay;
 
-    std::vector<message> all_msgs = db_->retrieve_all();
+    std::vector<message> all_msgs = db->retrieve_all();
     log::debug(logcat, "We have {} messages", all_msgs.size());
     for (auto& entry : all_msgs) {
         if (!entry.pubkey) {
@@ -1080,7 +1081,7 @@ std::string ServiceNode::get_stats() const {
     val["height"] = block_height_;
     val["target_height"] = target_height_;
 
-    std::vector<int> counts = db_->get_message_counts();
+    std::vector<int> counts = db->get_message_counts();
     int64_t total = std::accumulate(counts.begin(), counts.end(), int64_t{0});
 
     counts.erase(
@@ -1131,12 +1132,12 @@ std::string ServiceNode::get_stats() const {
         val["account_msg_mean"] = total / (double)counts.size();
 
     auto& ns_stats = (val["namespace_messages"] = nlohmann::json::object());
-    for (auto& [ns, count] : db_->get_namespace_counts())
+    for (auto& [ns, count] : db->get_namespace_counts())
         ns_stats[fmt::format("{}", ns)] = count;
 
-    val["db_used"] = db_->get_used_bytes();
-    val["db_total"] = db_->get_total_bytes();
-    val["db_max"] = Database::SIZE_LIMIT;
+    val["dbused"] = db->get_used_bytes();
+    val["dbtotal"] = db->get_total_bytes();
+    val["dbmax"] = Database::SIZE_LIMIT;
 
     return val.dump();
 }
@@ -1165,9 +1166,9 @@ std::string ServiceNode::get_status_line() const {
             STORAGE_SERVER_VERSION_STRING,
             oxenss::is_mainnet ? "" : " (TESTNET)",
             syncing_ ? "; SYNCING" : "",
-            db_->get_message_count(),
-            util::get_human_readable_bytes(db_->get_used_bytes()),
-            db_->get_owner_count(),
+            db->get_message_count(),
+            util::get_human_readable_bytes(db->get_used_bytes()),
+            db->get_owner_count(),
             stats.client_store_requests,
             stats.client_retrieve_requests,
             stats.onion_requests,

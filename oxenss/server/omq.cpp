@@ -47,16 +47,28 @@ std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
 void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     log::debug(logcat, "[OMQ] handle sn.data_ready from: {}", message.conn.to_string());
 
-    auto& xpk_str = message.conn.pubkey();
-    if (xpk_str.size() != sizeof(crypto::x25519_pubkey))
-        return message.send_reply("Remote not recognized as SN");
+    SNDataReadyResponse response = {};
+    if (response.status == SNDataReadyStatus::Nil) {
+        auto& xpk_str = message.conn.pubkey();
+        if (xpk_str.size() != sizeof(crypto::x25519_pubkey)) {
+            response.status = SNDataReadyStatus::RemoteNotRecognizedAsSN;
+        } else {
+            crypto::x25519_pubkey xpk;
+            std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
+            if (!service_node_->is_swarm_peer(xpk))
+                response.status = SNDataReadyStatus::SwarmMismatch;
+        }
+    }
 
-    crypto::x25519_pubkey xpk;
-    std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
-    if (!service_node_->is_swarm_peer(xpk))
-        return message.send_reply("Swarm mismatch");
+    if (response.status == SNDataReadyStatus::Nil) {
+        response.status = SNDataReadyStatus::OK;
+        response.newest_timestamp = service_node_->db->retrieve_newest_timestamp();
+    }
 
-    message.send_reply("OK");
+    oxenc::bt_dict_producer dict;
+    dict.append("s", static_cast<uint8_t>(response.status));
+    dict.append("t", response.newest_timestamp);
+    message.send_reply(dict.view());
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {

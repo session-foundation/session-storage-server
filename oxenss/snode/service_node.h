@@ -85,7 +85,6 @@ class ServiceNode {
     uint64_t block_height_ = 0;
     uint64_t target_height_ = 0;
     std::string block_hash_;
-    std::unique_ptr<Database> db_;
     std::weak_ptr<http::Client> http_;
 
     SnodeStatus status_ = SnodeStatus::UNKNOWN;

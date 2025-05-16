@@ -129,6 +129,9 @@ class Database {
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
 
+    // Get the latest owned message's timestamp. Returns 0 if there are no messages in the DB
+    uint64_t retrieve_newest_timestamp();
+
     // Removes expired messages from the database; the `Database` instance owner should call
     // this periodically.
     void clean_expired();

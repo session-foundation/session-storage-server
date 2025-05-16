@@ -428,19 +428,39 @@ void ServiceNode::check_new_members() {
                 c->pubkey_x25519.view(),
                 "sn.data_ready",
                 [this, pk](bool success, std::vector<std::string> data) {
+
+                    std::string error;
+                    server::SNDataReadyResponse result = {};
                     if (data.empty()) {
-                        success = false;
-                        data.push_back("Empty reply"s);
-                    } else if (data[0] != "OK"sv) {
-                        success = false;
+                        error = "Empty reply";
+                    } else {
+                        oxenc::bt_dict_consumer d{data[0]};
+                        try {
+                            uint32_t status_u32 = d.require<uint32_t>("s"sv);
+                            uint32_t last = static_cast<uint32_t>(server::SNDataReadyStatus::Count);
+                            if (status_u32 >= last)
+                                error = "SN data ready status was OOB (received {})"_format(last);
+                            else
+                                result.status = static_cast<server::SNDataReadyStatus>(status_u32);
+                        } catch (const std::exception& e) {
+                            error = "SN data ready status was not a 4 byte unsigned integer";
+                        }
+
+                        try {
+                            result.newest_timestamp = d.require<uint64_t>("t");
+                        } catch (const std::exception& e) {
+                            error = "SN data ready timestamp was not an 8 byte unsigned integer";
+                        }
                     }
-                    if (!success) {
+
+                    if (result.status == server::SNDataReadyStatus::Nil) {
                         log::info(
                                 logcat,
                                 "Failed to connect to remote SS {} to initiate new "
-                                "data transfer ({}); will retry soon",
+                                "data transfer ({}: {}); will retry soon",
                                 pk,
-                                fmt::join(data, ", "));
+                                fmt::join(data, ", "),
+                                error);
                         return;
                     }
                     log::debug(

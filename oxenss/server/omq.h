@@ -28,6 +28,19 @@ namespace snode {
 
 namespace oxenss::server {
 
+enum class SNDataReadyStatus {
+    Nil,
+    RemoteNotRecognizedAsSN,
+    SwarmMismatch,
+    OK,
+    Count,
+};
+
+struct SNDataReadyResponse {
+    SNDataReadyStatus status;
+    uint64_t newest_timestamp;
+};
+
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;
     oxenmq::ConnectionID oxend_conn_;

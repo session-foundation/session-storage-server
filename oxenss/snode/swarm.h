@@ -45,7 +45,7 @@ class Swarm {
             pending_new_members_;
 
     // Extract relevant information from incoming swarm composition.
-    SwarmEvents derive_swarm_events(const swarms_t& swarms) const;
+    SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
 
   public:
     Network& network;
@@ -59,7 +59,9 @@ class Swarm {
     /// Update swarm state; this takes care of updating both this swarm itself, and propagates the
     /// general network swarm changes to the Network object (including contacts) as well.
     SwarmEvents update_swarms(
-            swarms_t&& swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts);
+            uint64_t height,
+            swarms_t&& swarms,
+            const std::map<crypto::legacy_pubkey, contact>& new_contacts);
 
     bool is_pubkey_for_us(const user_pubkey& pk) const;
 

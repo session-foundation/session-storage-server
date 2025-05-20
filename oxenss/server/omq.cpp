@@ -29,6 +29,49 @@ namespace oxenss::server {
 
 static auto logcat = log::Cat("server");
 
+BTSerialiseResult sn_data_ready_response_serialise(
+        SNDataReadyResponse& item,
+        BTSerialise serialise,
+        std::string_view serialized_data) {
+
+    BTSerialiseResult result = {};
+
+    constexpr std::string_view STATUS_KEY = "s";
+    constexpr std::string_view TIMESTAMP_KEY = "t";
+    if (serialise == BTSerialise::Write) {
+        assert(serialized_data.empty());
+        oxenc::bt_dict_producer dict;
+        dict.append(STATUS_KEY, static_cast<uint8_t>(item.status));
+        dict.append(TIMESTAMP_KEY, item.newest_timestamp);
+        result.write_payload = dict.view();
+        result.success = true;
+    } else {
+        oxenc::bt_dict_consumer d{serialized_data};
+        SNDataReadyResponse response = {};
+        try {
+            uint32_t status_u32 = d.require<uint32_t>(STATUS_KEY);
+            uint32_t last = static_cast<uint32_t>(SNDataReadyStatus::Count);
+            if (status_u32 >= last)
+                result.read_error = "SN data ready status was OOB (received {})"_format(last);
+            else
+                response.status = static_cast<SNDataReadyStatus>(status_u32);
+        } catch (const std::exception& e) {
+            result.read_error = "SN data ready status was not a 4 byte unsigned integer";
+        }
+
+        try {
+            response.newest_timestamp = d.require<uint64_t>(TIMESTAMP_KEY);
+        } catch (const std::exception& e) {
+            result.read_error = "SN data ready timestamp was not an 8 byte unsigned integer";
+        }
+
+        result.success = result.read_error.empty();
+        if (result.success)
+            item = std::move(response);
+    }
+    return result;
+}
+
 std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
     log::trace(logcat, "[OMQ] Peer Lookup");
 
@@ -65,10 +108,9 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
         response.newest_timestamp = service_node_->db->retrieve_newest_timestamp();
     }
 
-    oxenc::bt_dict_producer dict;
-    dict.append("s", static_cast<uint8_t>(response.status));
-    dict.append("t", response.newest_timestamp);
-    message.send_reply(dict.view());
+    BTSerialiseResult write_result = sn_data_ready_response_serialise(response, BTSerialise::Write, "");
+    assert(write_result.success);
+    message.send_reply(write_result.write_payload);
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {

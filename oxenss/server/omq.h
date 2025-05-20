@@ -41,6 +41,20 @@ struct SNDataReadyResponse {
     uint64_t newest_timestamp;
 };
 
+enum class BTSerialise {
+    Read,
+    Write,
+};
+
+struct BTSerialiseResult {
+    bool success;
+    std::string write_payload;
+    std::string read_error;
+};
+
+BTSerialiseResult sn_data_ready_response_serialise(
+        server::SNDataReadyResponse& item, BTSerialise serialise, std::string_view serialized_data);
+
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;
     oxenmq::ConnectionID oxend_conn_;

@@ -16,7 +16,7 @@ static auto logswarm = log::Cat("swarm");
 
 Swarm::~Swarm() = default;
 
-SwarmEvents Swarm::derive_swarm_events(const swarms_t& swarms) const {
+SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) const {
     SwarmEvents events{};
 
     events.our_swarm_id = INVALID_SWARM_ID;
@@ -31,14 +31,27 @@ SwarmEvents Swarm::derive_swarm_events(const swarms_t& swarms) const {
     const auto& new_swarm = events.our_swarm_id;
     const auto& old_swarm = cur_swarm_id_;
 
-    if (new_swarm == INVALID_SWARM_ID)
+    if (new_swarm == INVALID_SWARM_ID) {
+        if (cur_swarm_id_ != INVALID_SWARM_ID)
+            log::warning(
+                    logswarm,
+                    "Leaving swarm {:#018x}: we are no longer an active Service Node",
+                    cur_swarm_id_);
+        else
+            log::debug(logswarm, "Still not an active Service Node");
+
         // We are not in any swarm (or have been kicked out); nothing to do
         return events;
+    }
 
-    if (old_swarm == INVALID_SWARM_ID)
+    if (old_swarm == INVALID_SWARM_ID) {
+        log::info(logcat, "Joined swarm {:#18x} (blk {:#018x})", new_swarm, height);
         // We were previously not in a swarm, which means we just got assigned to one and so we have
         // nothing to do (other snodes will also see this and push messages to us).
+        events.new_swarm_members = events.our_swarm_members;
+        events.new_swarm_members.erase(our_pk);
         return events;
+    }
 
     if (old_swarm != new_swarm) {
         // Moved to a new swarm
@@ -58,6 +71,13 @@ SwarmEvents Swarm::derive_swarm_events(const swarms_t& swarms) const {
             // |.................########|########!!!!!!!!!!!!!!!!!|
             events.dissolved = true;
         }
+        log::info(
+                logcat,
+                "Changed from {:018x} {}to {:018x} (blk {})",
+                old_swarm,
+                new_swarm,
+                height,
+                events.dissolved ? "(dissolved) " : "");
 
         // If our old swarm is still alive then that means we got moved out of it, and so there's
         // nothing for us to do because the remaining swarm members will continue to administer the
@@ -105,36 +125,15 @@ SwarmEvents Swarm::derive_swarm_events(const swarms_t& swarms) const {
 }
 
 SwarmEvents Swarm::update_swarms(
-        swarms_t&& swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts) {
+        uint64_t height,
+        swarms_t&& swarms,
+        const std::map<crypto::legacy_pubkey, contact>& new_contacts) {
 
     std::lock_guard lock{network.mut_};
 
-    auto events = derive_swarm_events(swarms);
+    auto events = derive_swarm_events(height, swarms);
 
-    if (events.our_swarm_id == INVALID_SWARM_ID) {
-        if (cur_swarm_id_ != INVALID_SWARM_ID)
-            log::warning(
-                    logswarm,
-                    "Leaving swarm {:#018x}: we are no longer an active Service Node",
-                    cur_swarm_id_);
-        else
-            log::debug(logswarm, "Still not an active Service Node");
-    } else {
-
-        if (cur_swarm_id_ == INVALID_SWARM_ID)
-            log::info(logswarm, "SN now active, joining swarm {:#018x}", events.our_swarm_id);
-        else if (cur_swarm_id_ != events.our_swarm_id)
-            log::info(
-                    logswarm,
-                    "SN moving from swarm {:#018x} to swarm {:#018x}",
-                    cur_swarm_id_,
-                    events.our_swarm_id);
-
-        // The following only make sense if we are active, i.e. still in a swarm
-
-        if (events.dissolved)
-            log::info(logswarm, "Our swarm ({:#018x}) got DISSOLVED!", cur_swarm_id_);
-
+    if (events.our_swarm_id != INVALID_SWARM_ID) {
         for (const auto& pk : events.new_swarm_members) {
             log::info(logswarm, "New SN joining our swarm: {}", pk);
             pending_new_members_.emplace(pk, std::chrono::steady_clock::now());

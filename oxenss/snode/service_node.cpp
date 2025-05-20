@@ -428,39 +428,23 @@ void ServiceNode::check_new_members() {
                 c->pubkey_x25519.view(),
                 "sn.data_ready",
                 [this, pk](bool success, std::vector<std::string> data) {
-
-                    std::string error;
-                    server::SNDataReadyResponse result = {};
+                    server::SNDataReadyResponse response = {};
+                    server::BTSerialiseResult read_result = {};
                     if (data.empty()) {
-                        error = "Empty reply";
+                        read_result.read_error = "Empty reply";
                     } else {
-                        oxenc::bt_dict_consumer d{data[0]};
-                        try {
-                            uint32_t status_u32 = d.require<uint32_t>("s"sv);
-                            uint32_t last = static_cast<uint32_t>(server::SNDataReadyStatus::Count);
-                            if (status_u32 >= last)
-                                error = "SN data ready status was OOB (received {})"_format(last);
-                            else
-                                result.status = static_cast<server::SNDataReadyStatus>(status_u32);
-                        } catch (const std::exception& e) {
-                            error = "SN data ready status was not a 4 byte unsigned integer";
-                        }
-
-                        try {
-                            result.newest_timestamp = d.require<uint64_t>("t");
-                        } catch (const std::exception& e) {
-                            error = "SN data ready timestamp was not an 8 byte unsigned integer";
-                        }
+                        read_result = server::sn_data_ready_response_serialise(
+                                response, server::BTSerialise::Read, data[0]);
                     }
 
-                    if (result.status == server::SNDataReadyStatus::Nil) {
+                    if (!read_result.success) {
                         log::info(
                                 logcat,
                                 "Failed to connect to remote SS {} to initiate new "
                                 "data transfer ({}: {}); will retry soon",
                                 pk,
                                 fmt::join(data, ", "),
-                                error);
+                                read_result.read_error);
                         return;
                     }
                     log::debug(
@@ -573,7 +557,7 @@ void ServiceNode::save_bulk(const std::vector<message>& msgs) {
 }
 
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
-    swarm_.update_swarms(std::move(bu.swarms), bu.contacts);
+    swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
 }
 
@@ -615,7 +599,7 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
         active_ = true;
     }
 
-    auto events = swarm_.update_swarms(std::move(bu.swarms), bu.contacts);
+    auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED

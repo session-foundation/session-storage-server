@@ -131,15 +131,21 @@ SwarmEvents Swarm::update_swarms(
     auto events = derive_swarm_events(height, swarms);
 
     if (events.our_swarm_id != INVALID_SWARM_ID) {
-        for (const auto& pk : events.new_swarm_members) {
+        for (const auto& pk : events.new_swarm_members)
             log::info(logswarm, "New SN joining our swarm: {}", pk);
-            pending_new_members_.emplace(pk, std::chrono::steady_clock::now());
-        }
 
         for (auto swarm : events.new_swarms)
             log::info(logswarm, "New network swarm: {}", swarm);
 
-        members_.clear();
+        // Remove members that are no longer in the swarm from our runtime state
+        for (auto it = members_.begin(); it != members_.end(); ) {
+            if (events.our_swarm_members.find(it->first) == events.our_swarm_members.end())
+                it = members_.erase(it);
+            else
+                it++;
+        }
+
+        // Add members from the swarm that are missing from our runtime state
         for (auto it : events.our_swarm_members)
             members_.try_emplace(it);
     }
@@ -192,58 +198,53 @@ size_t Swarm::size() const {
     return members_.size();
 }
 
-std::set<crypto::legacy_pubkey> Swarm::extract_pending_members() {
+std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_pending_members() {
     std::lock_guard lock{network.mut_};
 
     std::set<crypto::legacy_pubkey> result;
     auto now = std::chrono::steady_clock::now();
-    for (auto it = pending_new_members_.begin(); it != pending_new_members_.end();) {
-        auto& [pk, when] = *it;
-        if (!members_.count(pk)) {
-            // No longer in our swarm
-            it = pending_new_members_.erase(it);
+    for (auto it = members_.begin(); it != members_.end(); it++) {
+        MemberState& state = it->second;
+        if (state.status != MemberStatus::ContactDetailsPending)
             continue;
-        }
-
-        if (when && *when <= now) {
-            *when = now + NEW_SWARM_MEMBER_RETRY;
+        std::chrono::steady_clock::time_point& next_retry =
+                it->second.check_contact_info_next_retry;
+        if (now >= next_retry) {
+            next_retry = now + NEW_SWARM_MEMBER_RETRY;
+            const crypto::legacy_pubkey& pk = it->first;
             result.insert(pk);
         }
-        ++it;
     }
 
     return result;
 }
 
-std::set<crypto::legacy_pubkey> Swarm::extract_ready_members() {
+std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_ready_members() {
     std::lock_guard lock{network.mut_};
 
     std::set<crypto::legacy_pubkey> result;
-    for (auto it = pending_new_members_.begin(); it != pending_new_members_.end();) {
-        auto& [pk, when] = *it;
-        if (!members_.count(pk)) {
-            // No longer in our swarm
-            it = pending_new_members_.erase(it);
-        } else if (!when) {
-            // Found one that is marked ready, so steal it:
-            result.insert(pk);
-            it = pending_new_members_.erase(it);
-        } else {
-            ++it;
-        }
+    for (auto& it : members_) {
+        if (it.second.status != MemberStatus::ContactDetailsReady)
+            continue;
+        const crypto::legacy_pubkey& pk = it.first;
+        it.second.status = MemberStatus::Ready;
+        result.insert(pk);
     }
 
     return result;
 }
 
-void Swarm::set_member_ready(
+void Swarm::set_member_contact_details_ready(
         const crypto::legacy_pubkey& pk, std::optional<std::chrono::milliseconds> last_synced_ts) {
     std::lock_guard lock{network.mut_};
-    if (auto it = pending_new_members_.find(pk); it != pending_new_members_.end())
-        it->second = std::nullopt;
-    if (last_synced_ts)
-        if (auto it = members_.find(pk); it != members_.end())
-            it->second.newest_msg_timestamp = *last_synced_ts;
-}
 
+    auto it = members_.find(pk);
+    assert(it != members_.end());
+
+    if (it != members_.end()) {
+        it->second.status = MemberStatus::ContactDetailsReady;
+        if (last_synced_ts)
+            it->second.newest_msg_timestamp = *last_synced_ts;
+    }
+}
 }  // namespace oxenss::snode

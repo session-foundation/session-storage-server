@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <set>
-#include <unordered_map>
 
 #include "network.h"
 #include "oxenss/crypto/keys.h"
@@ -35,13 +34,6 @@ constexpr auto NEW_SWARM_MEMBER_RETRY = 30s;
 class Swarm {
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
-    // Pubkeys of new members into our swarm who we haven't yet established communications with;
-    // once we do, we push all our swarm's messages to them.  The value is the earliest timestamp at
-    // which we should next try contacting them, or nullopt if we have confirmed contact and can now
-    // send the data.
-    std::unordered_map<crypto::legacy_pubkey, std::optional<std::chrono::steady_clock::time_point>>
-            pending_new_members_;
-
     // Extract relevant information from incoming swarm composition.
     SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
 
@@ -51,8 +43,23 @@ class Swarm {
 
     ~Swarm();
 
+    enum struct MemberStatus {
+        // Pubkeys of new members into our swarm who we haven't yet established communications with;
+        // once we do, we push all our swarm's messages to them.
+        ContactDetailsPending,
+        ContactDetailsReady,
+        Ready,
+    };
+
     struct MemberState {
+        MemberStatus status;
         std::chrono::milliseconds newest_msg_timestamp;
+
+        // The earliest timestamp at which the swarm will check if they have received contact
+        // information for this member yet and can send them data. Only utilised when status is
+        // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact
+        // detail has been confirmed.
+        std::chrono::steady_clock::time_point check_contact_info_next_retry;
     };
 
     std::map<crypto::legacy_pubkey, MemberState> members_;  // includes `our_pk`, when we are in a swarm.
@@ -86,17 +93,19 @@ class Swarm {
 
     // Resets the timer and returns the pubkeys of any new swarm members that are due to be
     // contacted to push swarm messages to.
-    std::set<crypto::legacy_pubkey> extract_pending_members();
+    std::set<crypto::legacy_pubkey> extract_contact_details_pending_members();
 
     // Marks a pending member as ready, so that it is returned by the next call to
-    // `extract_ready_members()`, and is no longer returned by `extract_pending_members()`.
-    void set_member_ready(
+    // `extract_contact_details_ready_members()`, and is no longer returned by
+    // `extract_contract_details_pending_member()`.
+    void set_member_contact_details_ready(
             const crypto::legacy_pubkey& pk,
             std::optional<std::chrono::milliseconds> last_synced_ts);
 
     // Extracts any "ready" members (that is, those that were pending and then marked ready with
-    // `set_member_ready`), returning them and removing them from the pending members list.
-    std::set<crypto::legacy_pubkey> extract_ready_members();
+    // `set_member_contact_details_ready`), returning them and transitioning them from the pending
+    // state.
+    std::set<crypto::legacy_pubkey> extract_contact_details_ready_members();
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

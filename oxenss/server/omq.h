@@ -38,7 +38,7 @@ enum class SNDataReadyStatus {
 
 struct SNDataReadyResponse {
     SNDataReadyStatus status;
-    uint64_t newest_timestamp;
+    std::chrono::milliseconds newest_timestamp;
 };
 
 enum class BTSerialise {

@@ -42,7 +42,7 @@ BTSerialiseResult sn_data_ready_response_serialise(
         assert(serialized_data.empty());
         oxenc::bt_dict_producer dict;
         dict.append(STATUS_KEY, static_cast<uint8_t>(item.status));
-        dict.append(TIMESTAMP_KEY, item.newest_timestamp);
+        dict.append(TIMESTAMP_KEY, item.newest_timestamp.count());
         result.write_payload = dict.view();
         result.success = true;
     } else {
@@ -60,7 +60,8 @@ BTSerialiseResult sn_data_ready_response_serialise(
         }
 
         try {
-            response.newest_timestamp = d.require<uint64_t>(TIMESTAMP_KEY);
+            uint64_t newest_timestamp = d.require<uint64_t>(TIMESTAMP_KEY);
+            response.newest_timestamp = std::chrono::milliseconds(newest_timestamp);
         } catch (const std::exception& e) {
             result.read_error = "SN data ready timestamp was not an 8 byte unsigned integer";
         }

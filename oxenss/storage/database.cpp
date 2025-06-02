@@ -661,17 +661,17 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     return get_message(*impl, st);
 }
 
-uint64_t Database::retrieve_newest_timestamp() {
+std::chrono::milliseconds Database::retrieve_newest_timestamp() {
     auto impl = get_impl(false);
     auto st = impl->prepared_st(
             "SELECT COALESCE((SELECT timestamp FROM owned_messages ORDER BY timestamp DESC LIMIT "
             "1), 0);");
-    uint64_t result = 0;
+    std::chrono::milliseconds result = {};
     while (st->executeStep()) {
         int64_t time = get<int64_t>(st);
         assert(time >= 0);
         if (time >= 0)
-            result = static_cast<uint64_t>(time);
+            result = std::chrono::milliseconds(static_cast<uint64_t>(time));
     }
     return result;
 }

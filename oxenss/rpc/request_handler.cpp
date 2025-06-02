@@ -434,13 +434,13 @@ static void distribute_command(
     res->pending += peers.size();
 
     for (auto& peer : peers) {
-        auto ct = sn.contacts().find(peer);
+        auto ct = sn.contacts().find(peer.first);
         if (!ct || !*ct) {
             log::debug(
                     logcat,
                     "Not distributing {} to swarm peer {}: SN {}",
                     cmd,
-                    peer,
+                    peer.first,
                     ct ? "is non-contactable" : "not found");
             res->pending--;
             continue;
@@ -454,7 +454,7 @@ static void distribute_command(
                         log::warning(
                                 logcat,
                                 "Response timeout from {} for forwarded command {}",
-                                peer,
+                                peer.first,
                                 cmd);
                     bool good_result = success && parts.size() == 1;
                     if (good_result) {
@@ -465,7 +465,7 @@ static void distribute_command(
                                     logcat,
                                     "Received unparsable response to {} from {}: {}",
                                     cmd,
-                                    peer,
+                                    peer.first,
                                     e.what());
                             good_result = false;
                         }

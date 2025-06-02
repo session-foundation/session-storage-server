@@ -89,12 +89,9 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
     /// --- WE are still in the same swarm if we reach here ---
 
     /// See if anyone joined our swarm: if so, we need to push messages to them:
-    std::set_difference(
-            events.our_swarm_members.begin(),
-            events.our_swarm_members.end(),
-            members_.begin(),
-            members_.end(),
-            std::inserter(events.new_swarm_members, events.new_swarm_members.end()));
+    for (auto it : events.our_swarm_members)
+        if (members_.count(it) == 0)
+            events.new_swarm_members.insert(it);
     events.new_swarm_members.erase(our_pk);
 
     // See if there are any new swarms, because if there are, we might need to push messages to them
@@ -142,7 +139,9 @@ SwarmEvents Swarm::update_swarms(
         for (auto swarm : events.new_swarms)
             log::info(logswarm, "New network swarm: {}", swarm);
 
-        members_ = events.our_swarm_members;
+        members_.clear();
+        for (auto it : events.our_swarm_members)
+            members_.try_emplace(it);
     }
 
     cur_swarm_id_ = events.our_swarm_id;
@@ -157,13 +156,13 @@ bool Swarm::is_pubkey_for_us(const user_pubkey& pk) const {
     return maybe_swarm && cur_swarm_id_ == *maybe_swarm;
 }
 
-std::set<crypto::legacy_pubkey> Swarm::members() const {
+std::map<crypto::legacy_pubkey, Swarm::MemberState> Swarm::members() const {
     std::shared_lock lock{network.mut_};
     return members_;
 }
 
 // Returns a copy of all the other members of this swarm, not including this node.
-std::set<crypto::legacy_pubkey> Swarm::peers() const {
+std::map<crypto::legacy_pubkey, Swarm::MemberState> Swarm::peers() const {
     auto peers = members();
     peers.erase(our_pk);
     return peers;
@@ -237,10 +236,14 @@ std::set<crypto::legacy_pubkey> Swarm::extract_ready_members() {
     return result;
 }
 
-void Swarm::set_member_ready(const crypto::legacy_pubkey& pk) {
+void Swarm::set_member_ready(
+        const crypto::legacy_pubkey& pk, std::optional<std::chrono::milliseconds> last_synced_ts) {
     std::lock_guard lock{network.mut_};
     if (auto it = pending_new_members_.find(pk); it != pending_new_members_.end())
         it->second = std::nullopt;
+    if (last_synced_ts)
+        if (auto it = members_.find(pk); it != members_.end())
+            it->second.newest_msg_timestamp = *last_synced_ts;
 }
 
 }  // namespace oxenss::snode

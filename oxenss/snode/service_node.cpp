@@ -419,7 +419,7 @@ void ServiceNode::check_new_members() {
                     pk,
                     fmt::join(NEW_SWARM_MEMBER_HANDSHAKE_VERSION, "."),
                     fmt::join(c->version, "."));
-            swarm_.set_member_ready(pk);
+            swarm_.set_member_ready(pk, std::nullopt);
             continue;
         }
 
@@ -451,7 +451,7 @@ void ServiceNode::check_new_members() {
                             logcat,
                             "Successful contact made with swarm member {}, queuing a message push",
                             pk);
-                    swarm_.set_member_ready(pk);
+                    swarm_.set_member_ready(pk, response.newest_timestamp);
                 });
     }
 

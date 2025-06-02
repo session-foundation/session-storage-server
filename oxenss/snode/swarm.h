@@ -35,8 +35,6 @@ constexpr auto NEW_SWARM_MEMBER_RETRY = 30s;
 class Swarm {
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
-    std::set<crypto::legacy_pubkey> members_;  // includes `our_pk`, when we are in a swarm.
-
     // Pubkeys of new members into our swarm who we haven't yet established communications with;
     // once we do, we push all our swarm's messages to them.  The value is the earliest timestamp at
     // which we should next try contacting them, or nullopt if we have confirmed contact and can now
@@ -48,13 +46,20 @@ class Swarm {
     SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
 
   public:
-    Network& network;
-    const crypto::legacy_pubkey our_pk;
-
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :
             network{network}, our_pk{our_pk} {}
 
     ~Swarm();
+
+    struct MemberState {
+        std::chrono::milliseconds newest_msg_timestamp;
+    };
+
+    std::map<crypto::legacy_pubkey, MemberState> members_;  // includes `our_pk`, when we are in a swarm.
+
+    Network& network;
+
+    const crypto::legacy_pubkey our_pk;
 
     /// Update swarm state; this takes care of updating both this swarm itself, and propagates the
     /// general network swarm changes to the Network object (including contacts) as well.
@@ -66,10 +71,10 @@ class Swarm {
     bool is_pubkey_for_us(const user_pubkey& pk) const;
 
     // Returns a copy of all the members of this swarm, including this node.
-    std::set<crypto::legacy_pubkey> members() const;
+    std::map<crypto::legacy_pubkey, MemberState> members() const;
 
     // Returns a copy of all the other members of this swarm, not including this node.
-    std::set<crypto::legacy_pubkey> peers() const;
+    std::map<crypto::legacy_pubkey, MemberState> peers() const;
 
     // Returns true if the given pubkey is recognized as a member of this swarm.
     bool is_member(const crypto::legacy_pubkey& pk) const;
@@ -85,7 +90,9 @@ class Swarm {
 
     // Marks a pending member as ready, so that it is returned by the next call to
     // `extract_ready_members()`, and is no longer returned by `extract_pending_members()`.
-    void set_member_ready(const crypto::legacy_pubkey& pk);
+    void set_member_ready(
+            const crypto::legacy_pubkey& pk,
+            std::optional<std::chrono::milliseconds> last_synced_ts);
 
     // Extracts any "ready" members (that is, those that were pending and then marked ready with
     // `set_member_ready`), returning them and removing them from the pending members list.

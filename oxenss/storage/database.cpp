@@ -283,6 +283,8 @@ class DatabaseImpl {
     }
 
     void initialize_database() {
+        [[maybe_unused]] int32_t db_version = db.execAndGet("PRAGMA user_version").getInt();
+
         if (!db.tableExists("owners")) {
             create_schema();
         }
@@ -329,6 +331,15 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
                 ORDER BY timestamp DESC LIMIT 50
         );
     END;
+            )");
+        }
+
+        if (!db.tableExists("runtime_state")) {
+            log::info(logcat, "Upgrading database schema: adding runtime_state");
+            db.exec(R"(
+CREATE TABLE runtime_state (
+    sn_blob BLOB
+);
             )");
         }
 
@@ -1206,4 +1217,21 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
+std::string Database::runtime_state_sn_blob(BTSerialise serialise, const std::string& write_blob)
+{
+    std::string result;
+    auto impl = get_impl(serialise == BTSerialise::Write);
+    if (serialise == BTSerialise::Read) {
+        auto stmt = impl->prepared_st("SELECT sn_blob FROM runtime_state LIMIT 1");
+        auto maybe_result = exec_and_maybe_get<std::string>(stmt);
+        if (maybe_result)
+            result = std::move(*maybe_result);
+    } else {
+        if (write_blob.size()) {
+            auto stmt = impl->prepared_st("REPLACE INTO runtime_state (sn_blob) VALUES (?)");
+            exec_query(stmt, write_blob);
+        }
+    }
+    return result;
+}
 }  // namespace oxenss

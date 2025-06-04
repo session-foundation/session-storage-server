@@ -10,6 +10,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/oxenmq.h>
+#include <oxenss/common/serialize.h>
 
 namespace oxenss {
 
@@ -39,17 +40,6 @@ enum class SNDataReadyStatus {
 struct SNDataReadyResponse {
     SNDataReadyStatus status;
     std::chrono::milliseconds newest_timestamp;
-};
-
-enum class BTSerialise {
-    Read,
-    Write,
-};
-
-struct BTSerialiseResult {
-    bool success;
-    std::string write_payload;
-    std::string read_error;
 };
 
 BTSerialiseResult sn_data_ready_response_serialise(

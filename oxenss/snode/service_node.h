@@ -12,6 +12,7 @@
 
 #include <oxenss/crypto/keys.h>
 #include <oxenss/common/message.h>
+#include <oxenss/common/serialize.h>
 #include <oxenss/storage/database.hpp>
 #include "network.h"
 #include "swarm.h"
@@ -72,6 +73,13 @@ constexpr std::string_view to_string(SnodeStatus status) {
     }
     return "Unknown"sv;
 }
+
+struct SerialiseResult {
+    BTSerialiseResult bt_serialise;
+    std::map<crypto::legacy_pubkey, Swarm::MemberState> swarm_members;
+    swarms_t network_swarms;
+    swarm_id_t swarm_cur_swarm_id;
+};
 
 /// All service node logic that is not network-specific
 class ServiceNode {
@@ -172,6 +180,10 @@ class ServiceNode {
             const std::filesystem::path& db_location,
             bool force_start,
             bool skip_bootstrap);
+
+    SerialiseResult serialize(BTSerialise serialise, std::string_view serialized_data) const;
+
+    uint64_t last_serialize_hash = 0;
 
     std::unique_ptr<Database> db;
 

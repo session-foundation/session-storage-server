@@ -45,6 +45,110 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
+SerialiseResult ServiceNode::serialize(BTSerialise serialise, std::string_view serialized_data) const
+{
+    SerialiseResult result = {};
+
+    constexpr std::string_view VERSION_KEY = "@";
+    constexpr std::string_view NETWORK_SWARMS_KEY = "network.swarms";
+    constexpr std::string_view SWARM_CUR_SWARM_ID = "swarm.cur_swarm_id";
+    constexpr std::string_view SWARM_MEMBERS_KEY = "swarm.members";
+
+    uint32_t version = 0;
+    if (serialise == BTSerialise::Write) {
+        oxenc::bt_dict_producer d;
+        d.append(VERSION_KEY, version);
+
+        {
+            oxenc::bt_list_producer network_swarm_list = d.append_list(NETWORK_SWARMS_KEY);
+            for (auto it : network_.swarms_) {
+                auto swarm = network_swarm_list.append_list();
+                swarm.append<uint64_t>(it.first);  // swarm_id_t
+
+                {  // Append list of pubkeys for this swarm
+                    for (const crypto::legacy_pubkey& pk : it.second)
+                        swarm.append<std::string_view>(pk.view());
+                }
+            }
+        }
+
+        d.append(SWARM_CUR_SWARM_ID, swarm_.cur_swarm_id_);
+
+        { // Append list of _our_ swarm members
+            oxenc::bt_list_producer swarm_member_list = d.append_list(SWARM_MEMBERS_KEY);
+            for (auto it : swarm_.members_)
+                swarm_member_list.append(it.first);  // pk
+        }
+
+        result.bt_serialise.success = true;
+        result.bt_serialise.write_payload = d.view();
+    } else {
+        if (serialized_data.size()) {
+            oxenc::bt_dict_consumer d{serialized_data};
+            try {
+                version = d.require<uint8_t>(VERSION_KEY);
+            } catch (const std::exception& e) {
+                result.bt_serialise.read_error = "Failed to parse version: {}"_format(e.what());
+            }
+
+            if (result.bt_serialise.read_error.empty()) {
+                try {  // Network swarms
+                    auto [key, network_swarm_list] = d.next_list_consumer();
+                    assert(key == NETWORK_SWARMS_KEY);
+
+                    while (!network_swarm_list.is_finished()) {
+                        auto swarm = network_swarm_list.consume_list_consumer();
+                        uint64_t swarm_id = swarm.consume<uint64_t>();
+
+                        std::set<crypto::legacy_pubkey>& keys = result.network_swarms[swarm_id];
+                        while (!swarm.is_finished()) {
+                            auto bytes = swarm.consume<std::string_view>();
+                            keys.insert(keys.end(), crypto::legacy_pubkey::from_bytes(bytes));
+                        }
+                    }
+
+                } catch (const std::exception& e) {
+                    result.bt_serialise.read_error =
+                            "Failed to parse network swarms: {}"_format(e.what());
+                }
+            }
+
+            if (result.bt_serialise.read_error.empty()) {
+                try {
+                    result.swarm_cur_swarm_id = d.require<uint64_t>(SWARM_CUR_SWARM_ID);
+                } catch (const std::exception& e) {
+                    result.bt_serialise.read_error =
+                            "Failed to swarm's current swarm ID: {}"_format(e.what());
+                }
+            }
+
+            if (result.bt_serialise.read_error.empty()) {
+                try {  // Swarm members
+                    auto [key, list] = d.next_list_consumer();
+                    assert(key == SWARM_MEMBERS_KEY);
+
+                    while (!list.is_finished()) {
+                        auto bytes = list.consume<std::string_view>();
+                        result.swarm_members[crypto::legacy_pubkey::from_bytes(bytes)];
+                    }
+                } catch (const std::exception& e) {
+                    result.bt_serialise.read_error =
+                            "Failed to parse swarm members: {}"_format(e.what());
+                }
+            }
+        }
+        result.bt_serialise.success = result.bt_serialise.read_error.empty();
+    }
+
+    return result;
+}
+
+static uint64_t fnv1a64_hasher(std::string_view bytes, uint64_t hash) {
+    for (size_t i = 0; i < bytes.size(); i++)
+        hash = (bytes[i] ^ hash) * 1099511628211 /*FNV Prime*/;
+    return hash;
+}
+
 ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
@@ -62,7 +166,26 @@ ServiceNode::ServiceNode(
         db{std::make_unique<Database>(dblocation)} {
     mq_servers_.push_back(&omq_server);
 
-    log::info(logcat, "Requesting initial swarm state");
+    std::string blob_data = db->runtime_state_sn_blob(BTSerialise::Read, "");
+    SerialiseResult serialise_result = serialize(BTSerialise::Read, blob_data);
+    if (serialise_result.bt_serialise.success) {
+        last_serialize_hash = fnv1a64_hasher(blob_data, FNV1A64_SEED);
+        swarm_.members_ = std::move(serialise_result.swarm_members);
+        network_.swarms_ = std::move(serialise_result.network_swarms);
+        swarm_.cur_swarm_id_ = serialise_result.swarm_cur_swarm_id;
+    } else {
+        blob_data.clear();
+    }
+
+    log::info(
+            logcat,
+            "Loaded {} ({}) swarms from disk (#{:x}; in swarm {:x} w/ {} members). Requesting "
+            "initial swarm state",
+            network_.swarms_.size(),
+            util::get_human_readable_bytes(blob_data.size()),
+            last_serialize_hash,
+            swarm_.cur_swarm_id_,
+            swarm_.members_.size());
 
     omq_server->add_timer(
             [this] {
@@ -88,6 +211,7 @@ ServiceNode::ServiceNode(
                 syncing_ = false;
             },
             1h);
+
 }
 
 void ServiceNode::on_oxend_connected() {
@@ -429,12 +553,12 @@ void ServiceNode::check_new_members() {
                 "sn.data_ready",
                 [this, pk](bool success, std::vector<std::string> data) {
                     server::SNDataReadyResponse response = {};
-                    server::BTSerialiseResult read_result = {};
+                    BTSerialiseResult read_result = {};
                     if (data.empty()) {
                         read_result.read_error = "Empty reply";
                     } else {
                         read_result = server::sn_data_ready_response_serialise(
-                                response, server::BTSerialise::Read, data[0]);
+                                response, BTSerialise::Read, data[0]);
                     }
 
                     if (!read_result.success) {
@@ -559,6 +683,25 @@ void ServiceNode::save_bulk(const std::vector<message>& msgs) {
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
     swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
+
+    snode::SerialiseResult serialise_result = serialize(BTSerialise::Write, "");
+    if (serialise_result.bt_serialise.success) {
+        uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
+        if (last_serialize_hash != hash) {
+            log::info(
+                    logcat,
+                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
+                    block_height_,
+                    last_serialize_hash,
+                    hash,
+                    util::get_human_readable_bytes(
+                            serialise_result.bt_serialise.write_payload.size()));
+
+            last_serialize_hash = hash;
+            db->runtime_state_sn_blob(
+                    BTSerialise::Write, serialise_result.bt_serialise.write_payload);
+        }
+    }
 }
 
 void ServiceNode::on_snodes_update(block_update&& bu) {
@@ -600,6 +743,26 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
     }
 
     auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
+
+    // Serialise state to blob and store into DB if dirtied
+    snode::SerialiseResult serialise_result = serialize(BTSerialise::Write, "");
+    if (serialise_result.bt_serialise.success) {
+        uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
+        if (last_serialize_hash != hash) {
+            log::info(
+                    logcat,
+                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
+                    block_height_,
+                    last_serialize_hash,
+                    hash,
+                    util::get_human_readable_bytes(
+                            serialise_result.bt_serialise.write_payload.size()));
+
+            last_serialize_hash = hash;
+            db->runtime_state_sn_blob(
+                    BTSerialise::Write, serialise_result.bt_serialise.write_payload);
+        }
+    }
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED

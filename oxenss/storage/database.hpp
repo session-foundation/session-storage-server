@@ -1,6 +1,7 @@
 #pragma once
 
 #include <oxenss/common/subaccount_token.h>
+#include <oxenss/common/serialize.h>
 #include <oxenss/common/message.h>
 #include <oxenss/common/pubkey.h>
 
@@ -213,6 +214,8 @@ class Database {
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
+
+    std::string runtime_state_sn_blob(BTSerialise serialise, const std::string& write_blob);
 };
 
 }  // namespace oxenss

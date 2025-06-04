@@ -32,8 +32,6 @@ struct SwarmEvents {
 constexpr auto NEW_SWARM_MEMBER_RETRY = 30s;
 
 class Swarm {
-    swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
-
     // Extract relevant information from incoming swarm composition.
     SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
 
@@ -61,6 +59,8 @@ class Swarm {
         // detail has been confirmed.
         std::chrono::steady_clock::time_point check_contact_info_next_retry;
     };
+
+    swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
     std::map<crypto::legacy_pubkey, MemberState> members_;  // includes `our_pk`, when we are in a swarm.
 

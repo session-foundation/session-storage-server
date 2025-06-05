@@ -523,7 +523,7 @@ void ServiceNode::record_retrieve_request() {
 }
 
 void ServiceNode::check_new_members() {
-    for (const auto& pk : swarm_.extract_contact_details_pending_members()) {
+    for (const auto& pk : swarm_.extract_contact_pending_members()) {
         auto c = network_.contacts.find(pk);
         if (!c || !*c) {
             // We don't have contact info, so don't do anything right now and this will get
@@ -579,7 +579,7 @@ void ServiceNode::check_new_members() {
                 });
     }
 
-    if (auto send_now = swarm_.extract_contact_details_ready_members(); !send_now.empty()) {
+    if (auto send_now = swarm_.extract_contacts_needing_db_dump(); !send_now.empty()) {
         auto msgs = db->retrieve_all();
         log::debug(
                 logcat,

@@ -445,6 +445,7 @@ static void distribute_command(
             res->pending--;
             continue;
         }
+
         sn.omq_server()->request(
                 ct->pubkey_x25519.view(),
                 "sn.storage_cc",

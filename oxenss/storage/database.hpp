@@ -33,6 +33,8 @@ enum class StoreResult {
     Full,      // Can't insert right now because the database is full.
 };
 
+inline std::atomic<int> tmp_init_db_version = 0;
+
 // Storage database class.
 class Database {
     std::stack<std::unique_ptr<DatabaseImpl>> impl_pool_;

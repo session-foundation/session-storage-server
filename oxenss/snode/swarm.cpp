@@ -146,9 +146,29 @@ SwarmEvents Swarm::update_swarms(
         }
 
         // Add members from the swarm that are missing from our runtime state
-        for (auto it : events.our_swarm_members)
-            members_.try_emplace(it);
+        for (auto it : events.new_swarm_members) {
+            auto& pair = members_[it];
+
+            // TODO: Remove this after everyone migrates their DB version to v1. v1 is when we
+            // started making the nodes store the swarm list and their swarm members to the DB to
+            // persist on restart.
+            //
+            // Before this, on startup they would consider all the nodes in the swarm they loaded
+            // from get_service_nodes as joining the swarm and perform a full message DB dump.
+            // Deploying this onto a live network would cause all the nodes to do a DB dump to each
+            // other the moment they upgraded.
+            //
+            // However after they upgrade and start persisting the swarm state to disk, from that
+            // point onwards they will correctly identify nodes that are leaving and joining their
+            // swarm and only do a message dump when necessary.
+            if (oxenss::tmp_init_db_version == 0) {
+                pair.new_swarm_member = false; // Prevent the swarm DB dump on newly migrated nodes
+            } else {
+                pair.new_swarm_member = true;
+            }
+        }
     }
+    oxenss::tmp_init_db_version = 1; // Disable after the first swarm update
 
     cur_swarm_id_ = events.our_swarm_id;
 
@@ -198,7 +218,7 @@ size_t Swarm::size() const {
     return members_.size();
 }
 
-std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_pending_members() {
+std::set<crypto::legacy_pubkey> Swarm::extract_contact_pending_members() {
     std::lock_guard lock{network.mut_};
 
     std::set<crypto::legacy_pubkey> result;
@@ -219,7 +239,7 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_pending_members()
     return result;
 }
 
-std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_ready_members() {
+std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
     std::lock_guard lock{network.mut_};
 
     std::set<crypto::legacy_pubkey> result;
@@ -228,7 +248,10 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contact_details_ready_members() {
             continue;
         const crypto::legacy_pubkey& pk = it.first;
         it.second.status = MemberStatus::Ready;
-        result.insert(pk);
+        if (it.second.new_swarm_member) {
+            it.second.new_swarm_member = false;
+            result.insert(pk);
+        }
     }
 
     return result;

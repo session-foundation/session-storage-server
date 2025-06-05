@@ -53,6 +53,10 @@ class Swarm {
         MemberStatus status;
         std::chrono::milliseconds newest_msg_timestamp;
 
+        // Set if this member joined the swarm. They are assumed to not have any of the messages for
+        // the swarm yet so a full DB will be initiated
+        bool new_swarm_member;
+
         // The earliest timestamp at which the swarm will check if they have received contact
         // information for this member yet and can send them data. Only utilised when status is
         // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact
@@ -92,8 +96,13 @@ class Swarm {
     size_t size() const;
 
     // Resets the timer and returns the pubkeys of any new swarm members that are due to be
-    // contacted to push swarm messages to.
-    std::set<crypto::legacy_pubkey> extract_contact_details_pending_members();
+    // contacted to establish liveness in prep for transitioning to a contact that we can push swarm
+    // messages to.
+    std::set<crypto::legacy_pubkey> extract_contact_pending_members();
+
+    // Returns the pubkeys of any new swarm members that have joined that we now have contact
+    // details for, mark them as ready and need a dump of the DB.
+    std::set<crypto::legacy_pubkey> extract_contacts_needing_db_dump();
 
     // Marks a pending member as ready, so that it is returned by the next call to
     // `extract_contact_details_ready_members()`, and is no longer returned by
@@ -101,11 +110,6 @@ class Swarm {
     void set_member_contact_details_ready(
             const crypto::legacy_pubkey& pk,
             std::optional<std::chrono::milliseconds> last_synced_ts);
-
-    // Extracts any "ready" members (that is, those that were pending and then marked ready with
-    // `set_member_contact_details_ready`), returning them and transitioning them from the pending
-    // state.
-    std::set<crypto::legacy_pubkey> extract_contact_details_ready_members();
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

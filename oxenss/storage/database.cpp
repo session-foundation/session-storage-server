@@ -283,7 +283,7 @@ class DatabaseImpl {
     }
 
     void initialize_database() {
-        [[maybe_unused]] int32_t db_version = db.execAndGet("PRAGMA user_version").getInt();
+        tmp_init_db_version = db.execAndGet("PRAGMA user_version").getInt();
 
         if (!db.tableExists("owners")) {
             create_schema();
@@ -341,10 +341,10 @@ CREATE TABLE runtime_state (
     sn_blob BLOB
 );
             )");
+            db.exec("PRAGMA user_version = 1;");
         }
 
         views_triggers_indices();
-
         log::info(logcat, "Database setup complete");
     }
 

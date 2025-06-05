@@ -101,6 +101,7 @@ class ServiceNode {
     const contact our_contact_;
 
     Network network_;
+
     Swarm swarm_{network_, our_keys_.pub};
 
     server::OMQ& omq_server_;

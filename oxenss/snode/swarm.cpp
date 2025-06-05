@@ -46,8 +46,8 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
 
     if (old_swarm == INVALID_SWARM_ID) {
         log::info(logcat, "Joined swarm {:#18x} (blk {})", new_swarm, height);
-        // We were previously not in a swarm, which means we just got assigned to one and so we have
-        // nothing to do (other snodes will also see this and push messages to us).
+        // We were previously not in a swarm, which means we just got assigned to one, we need to
+        // relay any of our messages belonging to the swarm
         events.new_swarm_members = events.our_swarm_members;
         events.new_swarm_members.erase(our_pk);
         return events;

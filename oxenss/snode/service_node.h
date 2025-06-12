@@ -61,9 +61,6 @@ inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2
 
 class Swarm;
 
-/// WRONG_REQ - request was ignored as not valid (e.g. incorrect tester)
-enum class MessageTestStatus { SUCCESS, RETRY, ERROR, WRONG_REQ };
-
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
         case SnodeStatus::UNSTAKED: return "Unstaked"sv;

@@ -48,9 +48,9 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members to distribute missing messages and/or retry recursive swarm requests that failed
 constexpr auto DO_BACKLOGGED_MSG_RELAY_INTERVAL = 3s;
 
-SerialiseResult ServiceNode::serialize(BTSerialise serialise, std::string_view serialized_data) const
+SNSerialiseResult ServiceNode::serialize(Serialise serialise, std::string_view serialized_data) const
 {
-    SerialiseResult result = {};
+    SNSerialiseResult result = {};
 
     constexpr std::string_view VERSION_KEY = "@";
     constexpr std::string_view NETWORK_SWARMS_KEY = "network.swarms";
@@ -58,7 +58,7 @@ SerialiseResult ServiceNode::serialize(BTSerialise serialise, std::string_view s
     constexpr std::string_view SWARM_MEMBERS_KEY = "swarm.members";
 
     uint32_t version = 0;
-    if (serialise == BTSerialise::Write) {
+    if (serialise == Serialise::Write) {
         oxenc::bt_dict_producer d;
         d.append(VERSION_KEY, version);
 
@@ -163,8 +163,8 @@ ServiceNode::ServiceNode(
         db{std::make_unique<Database>(dblocation)} {
     mq_servers_.push_back(&omq_server);
 
-    std::string blob_data = db->runtime_state_sn_blob(BTSerialise::Read, "");
-    SerialiseResult serialise_result = serialize(BTSerialise::Read, blob_data);
+    std::string blob_data = db->runtime_state_sn_blob(Serialise::Read, "");
+    SNSerialiseResult serialise_result = serialize(Serialise::Read, blob_data);
     if (serialise_result.bt_serialise.success) {
         last_serialize_hash = fnv1a64_hasher(blob_data, FNV1A64_SEED);
         swarm_.members_ = std::move(serialise_result.swarm_members);
@@ -596,7 +596,7 @@ void ServiceNode::do_msg_backlog_relay() {
                             read_result.read_error = "Empty reply";
                         } else {
                             read_result = server::sn_data_ready_response_serialise(
-                                    response, BTSerialise::Read, data[0]);
+                                    response, Serialise::Read, data[0]);
                         }
 
                         if (!read_result.success) {
@@ -908,7 +908,7 @@ void ServiceNode::on_bootstrap_update(block_update&& bu) {
     swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
 
-    snode::SerialiseResult serialise_result = serialize(BTSerialise::Write, "");
+    snode::SNSerialiseResult serialise_result = serialize(Serialise::Write, "");
     if (serialise_result.bt_serialise.success) {
         uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
         if (last_serialize_hash != hash) {
@@ -923,7 +923,7 @@ void ServiceNode::on_bootstrap_update(block_update&& bu) {
 
             last_serialize_hash = hash;
             db->runtime_state_sn_blob(
-                    BTSerialise::Write, serialise_result.bt_serialise.write_payload);
+                    Serialise::Write, serialise_result.bt_serialise.write_payload);
         }
     }
 }
@@ -969,7 +969,7 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
     auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
 
     // Serialise state to blob and store into DB if dirtied
-    snode::SerialiseResult serialise_result = serialize(BTSerialise::Write, "");
+    snode::SNSerialiseResult serialise_result = serialize(Serialise::Write, "");
     if (serialise_result.bt_serialise.success) {
         uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
         if (last_serialize_hash != hash) {
@@ -984,7 +984,7 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
 
             last_serialize_hash = hash;
             db->runtime_state_sn_blob(
-                    BTSerialise::Write, serialise_result.bt_serialise.write_payload);
+                    Serialise::Write, serialise_result.bt_serialise.write_payload);
         }
     }
 

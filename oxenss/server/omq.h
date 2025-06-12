@@ -43,7 +43,7 @@ struct SNDataReadyResponse {
 };
 
 BTSerialiseResult sn_data_ready_response_serialise(
-        server::SNDataReadyResponse& item, BTSerialise serialise, std::string_view serialized_data);
+        server::SNDataReadyResponse& item, Serialise serialise, std::string_view serialized_data);
 
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;

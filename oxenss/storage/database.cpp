@@ -1217,11 +1217,11 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
-std::string Database::runtime_state_sn_blob(BTSerialise serialise, const std::string& write_blob)
+std::string Database::runtime_state_sn_blob(Serialise serialise, const std::string& write_blob)
 {
     std::string result;
-    auto impl = get_impl(serialise == BTSerialise::Write);
-    if (serialise == BTSerialise::Read) {
+    auto impl = get_impl(serialise == Serialise::Write);
+    if (serialise == Serialise::Read) {
         auto stmt = impl->prepared_st("SELECT sn_blob FROM runtime_state LIMIT 1");
         auto maybe_result = exec_and_maybe_get<std::string>(stmt);
         if (maybe_result)

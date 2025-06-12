@@ -30,15 +30,13 @@ namespace oxenss::server {
 static auto logcat = log::Cat("server");
 
 BTSerialiseResult sn_data_ready_response_serialise(
-        SNDataReadyResponse& item,
-        BTSerialise serialise,
-        std::string_view serialized_data) {
+        SNDataReadyResponse& item, Serialise serialise, std::string_view serialized_data) {
 
     BTSerialiseResult result = {};
 
     constexpr std::string_view STATUS_KEY = "s";
     constexpr std::string_view TIMESTAMP_KEY = "t";
-    if (serialise == BTSerialise::Write) {
+    if (serialise == Serialise::Write) {
         assert(serialized_data.empty());
         oxenc::bt_dict_producer dict;
         dict.append(STATUS_KEY, static_cast<uint8_t>(item.status));
@@ -109,7 +107,8 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
         response.newest_timestamp = service_node_->db->retrieve_newest_timestamp();
     }
 
-    BTSerialiseResult write_result = sn_data_ready_response_serialise(response, BTSerialise::Write, "");
+    BTSerialiseResult write_result =
+            sn_data_ready_response_serialise(response, Serialise::Write, "");
     assert(write_result.success);
     message.send_reply(write_result.write_payload);
 }

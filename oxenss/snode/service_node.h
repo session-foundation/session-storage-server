@@ -74,7 +74,7 @@ constexpr std::string_view to_string(SnodeStatus status) {
     return "Unknown"sv;
 }
 
-struct SerialiseResult {
+struct SNSerialiseResult {
     BTSerialiseResult bt_serialise;
     std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;
     swarms_t network_swarms;
@@ -207,7 +207,7 @@ class ServiceNode {
             bool force_start,
             bool skip_bootstrap);
 
-    SerialiseResult serialize(BTSerialise serialise, std::string_view serialized_data) const;
+    SNSerialiseResult serialize(Serialise serialise, std::string_view serialized_data) const;
 
     uint64_t last_serialize_hash = 0;
 

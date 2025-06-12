@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 namespace oxenss {
-enum class BTSerialise {
+enum class Serialise {
     Read,
     Write,
 };

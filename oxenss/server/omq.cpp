@@ -318,6 +318,9 @@ OMQ::OMQ(
             log::debug(logcat,"Received new snode address info from oxend for {}",
                     pk.hex());
             service_node_->contacts().update(pk, c);
+
+            // Wake up thread incase there are retryable requests blocked on missing contact info
+            service_node_->retryable_requests_cv.notify_all();
         } catch (const std::exception& e) {
             log::error(logcat, "Received invalid snode address update from oxend: {}", e.what());
         }

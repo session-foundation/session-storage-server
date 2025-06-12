@@ -86,8 +86,9 @@ enum class RetryReason {
 struct RequestRetryEntry {
     crypto::legacy_pubkey key;
     RetryReason reason;
+    bool retry_underway;
     std::chrono::steady_clock::time_point deadline;
-    float deadline_delay_coeff;
+    std::chrono::milliseconds next_retry_delay;
 };
 
 struct RequestRetry {
@@ -137,11 +138,17 @@ class ServiceNode {
 
     mutable std::recursive_mutex sn_mutex_;
 
+    // Lock to be taken when interacting with the 'retryable_requests' queue
     std::mutex retryable_requests_mutex;
 
+    // List of requests that will be re-attempted periodically through the
+    // 'retryable_requests_thread'
     std::vector<RequestRetry> retryable_requests;
 
-    std::chrono::steady_clock::time_point swarm_member_deadline = {};
+    std::thread retryable_requests_thread;
+
+    // The time point at which the next swarm member check should be executed
+    std::chrono::steady_clock::time_point swarm_member_check_deadline = {};
 
     void send_notifies(message m);
 
@@ -155,7 +162,7 @@ class ServiceNode {
     void on_snodes_update(block_update&& bu);
 
     // Called periodically to attempt to initiate transfers to new snode members
-    void do_msg_backlog_relay();
+    void check_new_members();
 
     // Called if our oxend looks like it is missing lots of records when we first get data from it
     // to load initial data (especially contact info) from the bootstrap nodes.
@@ -220,7 +227,7 @@ class ServiceNode {
 
     const contact& own_address() { return our_contact_; }
 
-    // Enqueue a request to be re-attempted every 'DO_BACKLOGGED_MSG_RELAY_INTERVAL' intervals.
+    // Enqueue a request to be re-attempted
     void add_retryable_request(RequestRetry&& item);
 
     // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
@@ -312,6 +319,10 @@ class ServiceNode {
     void update_swarms(std::promise<bool>* on_completion = nullptr);
 
     server::OMQ& omq_server() { return omq_server_; }
+
+    std::condition_variable retryable_requests_cv;
+
+    void retryable_requests_thread_entry_point();
 };
 
 }  // namespace oxenss::snode

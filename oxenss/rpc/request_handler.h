@@ -22,13 +22,6 @@
 
 namespace oxenss::rpc {
 
-// When a storage test returns a "retry" response, we retry again after this interval:
-inline constexpr auto TEST_RETRY_INTERVAL = 50ms;
-
-// If a storage test is still returning "retry" after this long since the initial request then
-// we give up and send an error response back to the requestor:
-inline constexpr auto TEST_RETRY_PERIOD = 55s;
-
 // Minimum and maximum TTL permitted for storing a new, public message
 inline constexpr auto TTL_MINIMUM = 10s;
 inline constexpr auto TTL_MAXIMUM = 14 * 24h;

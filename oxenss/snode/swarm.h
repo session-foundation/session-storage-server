@@ -27,6 +27,31 @@ struct SwarmEvents {
     std::set<crypto::legacy_pubkey> our_swarm_members;
 };
 
+enum struct SwarmMemberStatus {
+    // Pubkeys of new members into our swarm who we haven't yet established communications with;
+    // once we do, we push all our swarm's messages to them.
+    ContactDetailsPending,
+    ContactDetailsReady,
+    Ready,
+};
+
+struct SwarmMemberState {
+    SwarmMemberStatus status;
+
+    std::chrono::milliseconds newest_msg_timestamp;
+
+    // Set if this member joined the swarm. They are assumed to not have any of the messages for
+    // the swarm yet so a full DB will be initiated
+    bool new_swarm_member;
+
+    // The earliest timestamp at which the swarm will check if they have received contact
+    // information for this member yet and can send them data. Only utilised when status is
+    // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact
+    // detail has been confirmed.
+    std::chrono::steady_clock::time_point check_contact_info_next_retry;
+};
+
+
 // How often we wait, after returning a pending new member, before we return the member again from
 // `extract_new_members()`.
 constexpr auto NEW_SWARM_MEMBER_RETRY = 30s;
@@ -35,38 +60,18 @@ class Swarm {
     // Extract relevant information from incoming swarm composition.
     SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
 
+    friend class ServiceNode;
+
+    std::map<crypto::legacy_pubkey, SwarmMemberState>
+            members_;  // includes `our_pk`, when we are in a swarm.
+
+    swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
+
   public:
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :
             network{network}, our_pk{our_pk} {}
 
     ~Swarm();
-
-    enum struct MemberStatus {
-        // Pubkeys of new members into our swarm who we haven't yet established communications with;
-        // once we do, we push all our swarm's messages to them.
-        ContactDetailsPending,
-        ContactDetailsReady,
-        Ready,
-    };
-
-    struct MemberState {
-        MemberStatus status;
-        std::chrono::milliseconds newest_msg_timestamp;
-
-        // Set if this member joined the swarm. They are assumed to not have any of the messages for
-        // the swarm yet so a full DB will be initiated
-        bool new_swarm_member;
-
-        // The earliest timestamp at which the swarm will check if they have received contact
-        // information for this member yet and can send them data. Only utilised when status is
-        // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact
-        // detail has been confirmed.
-        std::chrono::steady_clock::time_point check_contact_info_next_retry;
-    };
-
-    swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
-
-    std::map<crypto::legacy_pubkey, MemberState> members_;  // includes `our_pk`, when we are in a swarm.
 
     Network& network;
 
@@ -82,15 +87,15 @@ class Swarm {
     bool is_pubkey_for_us(const user_pubkey& pk) const;
 
     // Returns a copy of all the members of this swarm, including this node.
-    std::map<crypto::legacy_pubkey, MemberState> members() const;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> members() const;
 
     // Returns a copy of all the other members of this swarm, not including this node.
-    std::map<crypto::legacy_pubkey, MemberState> peers() const;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> peers() const;
 
-    // Returns true if the given pubkey is recognized as a member of this swarm.
-    bool is_member(const crypto::legacy_pubkey& pk) const;
-    bool is_member(const crypto::x25519_pubkey& pk) const;
-    bool is_member(const crypto::ed25519_pubkey& pk) const;
+    // Returns the swarm member's state if the given pubkey is recognized as a member of this swarm.
+    std::optional<SwarmMemberState> is_member(const crypto::legacy_pubkey& pk) const;
+    std::optional<SwarmMemberState> is_member(const crypto::x25519_pubkey& pk) const;
+    std::optional<SwarmMemberState> is_member(const crypto::ed25519_pubkey& pk) const;
 
     // Returns the size of this swarm (including this node).
     size_t size() const;

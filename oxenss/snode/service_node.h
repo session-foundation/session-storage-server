@@ -76,9 +76,28 @@ constexpr std::string_view to_string(SnodeStatus status) {
 
 struct SerialiseResult {
     BTSerialiseResult bt_serialise;
-    std::map<crypto::legacy_pubkey, Swarm::MemberState> swarm_members;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;
     swarms_t network_swarms;
     swarm_id_t swarm_cur_swarm_id;
+};
+
+enum class RetryReason {
+    NON_CONTACTABLE,
+    FAILED_TO_SEND,
+};
+
+struct RequestRetryEntry {
+    crypto::legacy_pubkey key;
+    RetryReason reason;
+    std::chrono::steady_clock::time_point deadline;
+    float deadline_delay_coeff;
+};
+
+struct RequestRetry {
+    std::string_view cmd;
+    std::string req_payload;
+    uint64_t hash;
+    std::vector<RequestRetryEntry> nodes;
 };
 
 /// All service node logic that is not network-specific
@@ -121,6 +140,12 @@ class ServiceNode {
 
     mutable std::recursive_mutex sn_mutex_;
 
+    std::mutex retryable_requests_mutex;
+
+    std::vector<RequestRetry> retryable_requests;
+
+    std::chrono::steady_clock::time_point swarm_member_deadline = {};
+
     void send_notifies(message m);
 
     // Save multiple messages to the database at once (i.e. in a single transaction)
@@ -133,7 +158,7 @@ class ServiceNode {
     void on_snodes_update(block_update&& bu);
 
     // Called periodically to attempt to initiate transfers to new snode members
-    void check_new_members();
+    void do_msg_backlog_relay();
 
     // Called if our oxend looks like it is missing lots of records when we first get data from it
     // to load initial data (especially contact info) from the bootstrap nodes.
@@ -193,9 +218,13 @@ class ServiceNode {
     const Swarm& swarm() { return swarm_; }
 
     Contacts& contacts() { return network_.contacts; }
+
     const Contacts& contacts() const { return network_.contacts; }
 
     const contact& own_address() { return our_contact_; }
+
+    // Enqueue a request to be re-attempted every 'DO_BACKLOGGED_MSG_RELAY_INTERVAL' intervals.
+    void add_retryable_request(RequestRetry&& item);
 
     // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
     // should not be added.
@@ -223,8 +252,9 @@ class ServiceNode {
             rpc::OnionRequestMetadata&& data,
             std::function<void(bool success, std::vector<std::string> data)> cb) const;
 
-    // Returns true if the given x pubkey is recognized as one of our current swarm members
-    bool is_swarm_peer(const crypto::x25519_pubkey& xpk);
+    // Returns the peer's state if the given x pubkey is recognized as one of our current swarm
+    // members
+    std::optional<SwarmMemberState> is_swarm_peer(const crypto::x25519_pubkey& xpk);
 
     const hf_revision& hf() const { return hardfork_; }
 

@@ -182,35 +182,40 @@ bool Swarm::is_pubkey_for_us(const user_pubkey& pk) const {
     return maybe_swarm && cur_swarm_id_ == *maybe_swarm;
 }
 
-std::map<crypto::legacy_pubkey, Swarm::MemberState> Swarm::members() const {
+std::map<crypto::legacy_pubkey, SwarmMemberState> Swarm::members() const {
     std::shared_lock lock{network.mut_};
     return members_;
 }
 
 // Returns a copy of all the other members of this swarm, not including this node.
-std::map<crypto::legacy_pubkey, Swarm::MemberState> Swarm::peers() const {
+std::map<crypto::legacy_pubkey, SwarmMemberState> Swarm::peers() const {
     auto peers = members();
     peers.erase(our_pk);
     return peers;
 }
 
-bool Swarm::is_member(const crypto::legacy_pubkey& pk) const {
+std::optional<SwarmMemberState> Swarm::is_member(const crypto::legacy_pubkey& pk) const {
     std::shared_lock lock{network.mut_};
-    return members_.count(pk);
+    std::optional<SwarmMemberState> result;
+    if (const auto& it = members_.find(pk); it != members_.end())
+        result = it->second;
+    return result;
 }
 
-bool Swarm::is_member(const crypto::x25519_pubkey& pk) const {
+std::optional<SwarmMemberState> Swarm::is_member(const crypto::x25519_pubkey& pk) const {
     std::shared_lock lock{network.mut_};
+    std::optional<SwarmMemberState> result;
     if (auto lpk = network.contacts.lookup(pk))
-        return members_.count(*lpk);
-    return false;
+        result = is_member(*lpk);
+    return result;
 }
 
-bool Swarm::is_member(const crypto::ed25519_pubkey& pk) const {
+std::optional<SwarmMemberState> Swarm::is_member(const crypto::ed25519_pubkey& pk) const {
     std::shared_lock lock{network.mut_};
+    std::optional<SwarmMemberState> result;
     if (auto lpk = network.contacts.lookup(pk))
-        return members_.count(*lpk);
-    return false;
+        result = is_member(*lpk);
+    return result;
 }
 
 size_t Swarm::size() const {
@@ -224,8 +229,8 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contact_pending_members() {
     std::set<crypto::legacy_pubkey> result;
     auto now = std::chrono::steady_clock::now();
     for (auto it = members_.begin(); it != members_.end(); it++) {
-        MemberState& state = it->second;
-        if (state.status != MemberStatus::ContactDetailsPending)
+        SwarmMemberState& state = it->second;
+        if (state.status != SwarmMemberStatus::ContactDetailsPending)
             continue;
         std::chrono::steady_clock::time_point& next_retry =
                 it->second.check_contact_info_next_retry;
@@ -244,10 +249,10 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
 
     std::set<crypto::legacy_pubkey> result;
     for (auto& it : members_) {
-        if (it.second.status != MemberStatus::ContactDetailsReady)
+        if (it.second.status != SwarmMemberStatus::ContactDetailsReady)
             continue;
         const crypto::legacy_pubkey& pk = it.first;
-        it.second.status = MemberStatus::Ready;
+        it.second.status = SwarmMemberStatus::Ready;
         if (it.second.new_swarm_member) {
             it.second.new_swarm_member = false;
             result.insert(pk);
@@ -265,7 +270,7 @@ void Swarm::set_member_contact_details_ready(
     assert(it != members_.end());
 
     if (it != members_.end()) {
-        it->second.status = MemberStatus::ContactDetailsReady;
+        it->second.status = SwarmMemberStatus::ContactDetailsReady;
         if (last_synced_ts)
             it->second.newest_msg_timestamp = *last_synced_ts;
     }

@@ -2,6 +2,7 @@
 
 #include "serialization.h"
 #include "sn_test.h"
+#include <fmt/chrono.h>
 #include <fmt/ranges.h>
 #include <oxenmq/connections.h>
 #include <oxen/quic/format.hpp>
@@ -43,7 +44,9 @@ using MISSING_PUBKEY_THRESHOLD = std::ratio<3, 100>;
 /// TODO: there should be config.h to store constants like these
 constexpr auto OXEND_PING_INTERVAL = 30s;
 
-constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
+// How often to trigger 'do_backlogged_msg_relay' which checks for 'data ready' handshakes from
+// swarm members to distribute missing messages and/or retry recursive swarm requests that failed
+constexpr auto DO_BACKLOGGED_MSG_RELAY_INTERVAL = 3s;
 
 SerialiseResult ServiceNode::serialize(BTSerialise serialise, std::string_view serialized_data) const
 {
@@ -194,7 +197,7 @@ ServiceNode::ServiceNode(
             },
             Database::CLEANUP_PERIOD);
 
-    omq_server->add_timer([this] { check_new_members(); }, NEW_SWARM_MEMBER_INTERVAL);
+    omq_server->add_timer([this] { do_msg_backlog_relay(); }, DO_BACKLOGGED_MSG_RELAY_INTERVAL);
 
     // We really want to make sure nodes don't get stuck in "syncing" mode,
     // so if we are still "syncing" after a long time, activate SN regardless
@@ -328,6 +331,11 @@ static std::optional<block_update> parse_swarm_update(
     }
 
     return maybe_bu;
+}
+
+void ServiceNode::add_retryable_request(RequestRetry&& item) {
+    std::unique_lock lock{retryable_requests_mutex};
+    retryable_requests.emplace_back(item);
 }
 
 void ServiceNode::register_mq_server(server::MQBase* server) {
@@ -489,7 +497,7 @@ bool ServiceNode::snode_ready(std::string* reason) {
     return problems.empty() || force_start_;
 }
 
-bool ServiceNode::is_swarm_peer(const crypto::x25519_pubkey& xpk) {
+std::optional<SwarmMemberState> ServiceNode::is_swarm_peer(const crypto::x25519_pubkey& xpk) {
     return swarm_.is_member(xpk);
 }
 
@@ -522,71 +530,293 @@ void ServiceNode::record_retrieve_request() {
     all_stats_.bump_retrieve_requests();
 }
 
-void ServiceNode::check_new_members() {
-    for (const auto& pk : swarm_.extract_contact_pending_members()) {
-        auto c = network_.contacts.find(pk);
-        if (!c || !*c) {
-            // We don't have contact info, so don't do anything right now and this will get
-            // triggered again later.
-            log::debug(
-                    logcat,
-                    "Leaving {} as pending: node {}",
-                    pk,
-                    c ? "has missing contact info" : "is unknown");
-            continue;
+struct LookupRetryIndexes {
+    std::optional<size_t> retryable_index;
+    std::optional<size_t> node_index;
+};
+
+static LookupRetryIndexes lookup_retry_indexes(
+        std::span<RequestRetry> retryable_requests,
+        uint64_t request_hash,
+        const crypto::legacy_pubkey& key) {
+    LookupRetryIndexes result = {};
+
+    // Find the retry request
+    for (size_t index = 0; index < retryable_requests.size(); index++) {
+        if (retryable_requests[index].hash == request_hash) {
+            result.retryable_index = index;
+            break;
         }
-
-        if (c->version < NEW_SWARM_MEMBER_HANDSHAKE_VERSION) {
-            log::debug(
-                    logcat,
-                    "Skipping handshake with new swarm member {}: v{}+ required, remote is v{}",
-                    pk,
-                    fmt::join(NEW_SWARM_MEMBER_HANDSHAKE_VERSION, "."),
-                    fmt::join(c->version, "."));
-            swarm_.set_member_contact_details_ready(pk, std::nullopt);
-            continue;
-        }
-
-        log::debug(logcat, "Initiating contact with new swarm member {}", pk);
-        omq_server_->request(
-                c->pubkey_x25519.view(),
-                "sn.data_ready",
-                [this, pk](bool success, std::vector<std::string> data) {
-                    server::SNDataReadyResponse response = {};
-                    BTSerialiseResult read_result = {};
-                    if (data.empty()) {
-                        read_result.read_error = "Empty reply";
-                    } else {
-                        read_result = server::sn_data_ready_response_serialise(
-                                response, BTSerialise::Read, data[0]);
-                    }
-
-                    if (!read_result.success) {
-                        log::info(
-                                logcat,
-                                "Failed to connect to remote SS {} to initiate new "
-                                "data transfer ({}: {}); will retry soon",
-                                pk,
-                                fmt::join(data, ", "),
-                                read_result.read_error);
-                        return;
-                    }
-                    log::debug(
-                            logcat,
-                            "Successful contact made with swarm member {}, queuing a message push",
-                            pk);
-                    swarm_.set_member_contact_details_ready(pk, response.newest_timestamp);
-                });
     }
 
-    if (auto send_now = swarm_.extract_contacts_needing_db_dump(); !send_now.empty()) {
-        auto msgs = db->retrieve_all();
-        log::debug(
-                logcat,
-                "Initiating swarm message dump ({} message) to new swarm member(s): {}",
-                msgs.size(),
-                fmt::join(send_now, ", "));
-        relay_messages(std::move(msgs), send_now);
+    // Find the matching node inside the retry request
+    if (result.retryable_index) {
+        const RequestRetry& request = retryable_requests[*result.retryable_index];
+        for (size_t index = 0; index < request.nodes.size(); index++) {
+            if (request.nodes[index].key == key) {
+                result.node_index = index;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
+void ServiceNode::do_msg_backlog_relay() {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= swarm_member_deadline) {
+        swarm_member_deadline = now + 10s;
+        for (const auto& pk : swarm_.extract_contact_pending_members()) {
+            auto c = network_.contacts.find(pk);
+            if (!c || !*c) {
+                // We don't have contact info, so don't do anything right now and this will get
+                // triggered again later.
+                log::debug(
+                        logcat,
+                        "Leaving {} as pending: node {}",
+                        pk,
+                        c ? "has missing contact info" : "is unknown");
+                continue;
+            }
+
+            if (c->version < NEW_SWARM_MEMBER_HANDSHAKE_VERSION) {
+                log::debug(
+                        logcat,
+                        "Skipping handshake with new swarm member {}: v{}+ required, remote is v{}",
+                        pk,
+                        fmt::join(NEW_SWARM_MEMBER_HANDSHAKE_VERSION, "."),
+                        fmt::join(c->version, "."));
+                swarm_.set_member_contact_details_ready(pk, std::nullopt);
+                continue;
+            }
+
+            log::debug(logcat, "Initiating contact with new swarm member {}", pk);
+            omq_server_->request(
+                    c->pubkey_x25519.view(),
+                    "sn.data_ready",
+                    [this, pk](bool success, std::vector<std::string> data) {
+                        server::SNDataReadyResponse response = {};
+                        BTSerialiseResult read_result = {};
+                        if (data.empty()) {
+                            read_result.read_error = "Empty reply";
+                        } else {
+                            read_result = server::sn_data_ready_response_serialise(
+                                    response, BTSerialise::Read, data[0]);
+                        }
+
+                        if (!read_result.success) {
+                            log::info(
+                                    logcat,
+                                    "Failed to connect to remote SS {} to initiate new "
+                                    "data transfer ({}: {}); will retry soon",
+                                    pk,
+                                    fmt::join(data, ", "),
+                                    read_result.read_error);
+                            return;
+                        }
+                        log::debug(
+                                logcat,
+                                "Successful contact made with swarm member {}, marking as ready",
+                                pk);
+                        swarm_.set_member_contact_details_ready(pk, response.newest_timestamp);
+                    });
+        }
+
+        if (auto send_now = swarm_.extract_contacts_needing_db_dump(); !send_now.empty()) {
+            auto msgs = db->retrieve_all();
+            log::debug(
+                    logcat,
+                    "Initiating swarm message dump ({} message) to new swarm member(s): {}",
+                    msgs.size(),
+                    fmt::join(send_now, ", "));
+            relay_messages(std::move(msgs), send_now);
+        }
+    }
+
+    // Retry failed/timed-out requests
+    std::unique_lock lock{retryable_requests_mutex};
+    if (log::Level level = log::Level::debug;
+        log::get_level(logcat) <= level && retryable_requests.size()) {
+
+        fmt::memory_buffer log_buffer;
+        fmt::format_to(
+                std::back_inserter(log_buffer),
+                "Attempting {} retryable requests\n",
+                retryable_requests.size());
+
+        for (size_t index = 0; index < retryable_requests.size(); index++) {
+            const auto& item = retryable_requests[index];
+            fmt::format_to(
+                    std::back_inserter(log_buffer),
+                    "{}  [{}] '{}' command {} to {} node(s){}",
+                    index ? "\n" : "",
+                    index,
+                    item.cmd,
+                    util::get_human_readable_bytes(item.req_payload.size()),
+                    item.nodes.size(),
+                    item.nodes.size() ? "\n  NODES" : "");
+
+            for (size_t node_index = 0; node_index < item.nodes.size(); node_index++) {
+                const auto& node_item = item.nodes[node_index];
+                std::string_view reason = "";
+                switch (node_item.reason) {
+                    case RetryReason::NON_CONTACTABLE: reason = "non-contactable"; break;
+                    case RetryReason::FAILED_TO_SEND: reason = "failed to send"; break;
+                }
+
+                std::string deadline = "now";
+                if (node_item.deadline >= now) {
+                    auto delta = node_item.deadline - now;
+                    deadline =
+                            "in {}"_format(std::chrono::duration_cast<std::chrono::seconds>(delta));
+                }
+
+                fmt::format_to(
+                        std::back_inserter(log_buffer),
+                        "\n    {}: {} ({}) retrying {}",
+                        index,
+                        node_item.key,
+                        reason,
+                        deadline);
+            }
+        }
+
+        log::log(logcat, level, "{}", fmt::to_string(log_buffer));
+    }
+
+    for (auto it = retryable_requests.begin(); it != retryable_requests.end();) {
+
+        // Create a hash of the inputs so that we can match dispatched requests easily with the
+        // originating retry item.
+        if (it->hash == 0) {
+            it->hash = FNV1A64_SEED;
+            it->hash = fnv1a64_hasher(it->cmd, it->hash);
+            it->hash = fnv1a64_hasher(it->req_payload, it->hash);
+        }
+
+        for (auto node_it = it->nodes.begin(); node_it != it->nodes.end();) {
+            auto on_request_done = [this, hash = it->hash, key = node_it->key](
+                                           bool success, std::vector<std::string> parts) {
+
+                std::unique_lock lock{retryable_requests_mutex};
+
+                // Lookup the originating retry-request responsible for this OMQ response
+                LookupRetryIndexes lookup = lookup_retry_indexes(retryable_requests, hash, key);
+                if (!lookup.retryable_index)
+                    return;
+
+                RequestRetry& request = retryable_requests[*lookup.retryable_index];
+                if (lookup.node_index) {
+                    RequestRetryEntry& node = request.nodes[*lookup.node_index];
+
+                    // We cleanup the request in all situations except timeout (timeout
+                    // indicating that the node was non-responsive, maybe offline). In an error
+                    // state we don't know what state the recipient's storage server is in and
+                    // we default to deleting it and ending the retry attempts.
+                    rpc::SNStorageCCResult store_result =
+                            rpc::interpret_sn_storage_cc_response_parts(success, parts);
+                    bool cleanup = store_result.status != rpc::SNStorageCCResultStatus::Timeout;
+
+                    if (cleanup) {
+                        std::string_view outcome = "succeeded";
+                        if (store_result.status != rpc::SNStorageCCResultStatus::Good)
+                            outcome = "failed unrecoverably";
+
+                        log::trace(
+                                logcat,
+                                "Retry to {} for {} ({}) {}, cleaning up",
+                                key,
+                                request.cmd,
+                                util::get_human_readable_bytes(request.req_payload.size()),
+                                outcome);
+
+                        request.nodes.erase(request.nodes.begin() + *lookup.node_index);
+                    } else {
+                        // Extend the next retry deadline and re-attempt later
+                        float& delay_coeff = node.deadline_delay_coeff;
+                        delay_coeff = std::max(delay_coeff, 1.f) * 1.3f;
+                        delay_coeff = std::min(delay_coeff, 2.f);
+
+                        auto init_delay = std::chrono::duration_cast<std::chrono::seconds>(
+                                DO_BACKLOGGED_MSG_RELAY_INTERVAL);
+                        auto delay = std::chrono::seconds(
+                                static_cast<size_t>(init_delay.count() * delay_coeff));
+
+                        node.deadline = std::chrono::steady_clock::now() + delay;
+                        log::trace(
+                                logcat,
+                                "Retry to {} for {} ({}) timed out, next attempt in ~{}",
+                                key,
+                                request.cmd,
+                                util::get_human_readable_bytes(request.req_payload.size()),
+                                delay);
+                    }
+                }
+
+                // Remove retryable request if there are no more nodes to retry to
+                if (request.nodes.empty())
+                    retryable_requests.erase(retryable_requests.begin() + *lookup.retryable_index);
+            };
+
+            std::optional<SwarmMemberState> is_member = swarm_.is_member(node_it->key);
+            if (is_member) {
+                // Retry request if ready
+                bool is_due = now >= node_it->deadline;
+                bool ready =
+                        (is_member->status == SwarmMemberStatus::ContactDetailsReady ||
+                         is_member->status == SwarmMemberStatus::Ready);
+                crypto::x25519_pubkey pubkey_x25519 = {};
+
+                if (ready && is_due) {
+                    auto ct = contacts().find(node_it->key);
+                    if (ct && *ct)
+                        pubkey_x25519 = ct->pubkey_x25519;
+                }
+
+                if (ready && is_due && pubkey_x25519) {
+                    omq_server()->request(
+                            pubkey_x25519.view(),
+                            "sn.storage_cc",
+                            on_request_done,
+                            it->cmd,
+                            it->req_payload,
+                            oxenmq::send_option::request_timeout{5s});
+                }
+
+                if (!ready) { // Separate logging from logic for code clarity
+                    log::trace(
+                            logcat,
+                            "Retry to {} ({}) deferred, member hasn't signaled 'data ready' (was "
+                            "{})",
+                            node_it->key,
+                            it->cmd,
+                            static_cast<uint8_t>(is_member->status));
+                } else if (!pubkey_x25519) {
+                    log::trace(
+                            logcat,
+                            "Retry to {} ({}) deferred, contact info missing",
+                            node_it->key,
+                            it->cmd);
+                }
+            }
+
+            if (is_member) {
+                node_it++;
+            } else {
+                log::trace(
+                        logcat,
+                        "Retry to {} ({}) cancelled, not a member in swarm anymore",
+                        node_it->key,
+                        it->cmd);
+                node_it = it->nodes.erase(node_it);
+            }
+        }
+
+        if (it->nodes.empty())
+            it = retryable_requests.erase(it);
+        else
+            it++;
     }
 }
 

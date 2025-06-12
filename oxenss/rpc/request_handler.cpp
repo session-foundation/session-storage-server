@@ -403,13 +403,16 @@ struct swarm_response {
     bool b64;
     nlohmann::json result;
     std::function<void(rpc::Response)> cb;
+    std::vector<snode::RequestRetryEntry> retry_nodes;
+    std::string cmd;
+    std::string req_payload;
 };
 
 // Replies to a swarm request via its callback; sends an http::OK unless all of the
 // swarm entries returned things with "failed" in them or in the case of a non-recursive request,
 // the top-level object has a "failed" in it then we send back an INTERNAL_SERVER_ERROR
 // along with the response.
-void reply_or_fail(const std::shared_ptr<swarm_response>& res) {
+static void reply_or_fail(snode::ServiceNode& sn, const std::shared_ptr<swarm_response>& res) {
     auto res_code = http::INTERNAL_SERVER_ERROR;
     if (auto swarm_obj = res->result.find("swarm"); swarm_obj != res->result.end()) {
         for (const auto& [sn_pkey, obj] : swarm_obj->items()) {
@@ -423,13 +426,38 @@ void reply_or_fail(const std::shared_ptr<swarm_response>& res) {
     }
 
     res->cb(Response{res_code, std::move(res->result)});
+
+    if (res->retry_nodes.size()) {
+        snode::RequestRetry retry = {};
+        retry.nodes = std::move(res->retry_nodes);
+        retry.cmd = res->cmd;
+        retry.req_payload = std::move(res->req_payload);
+        sn.add_retryable_request(std::move(retry));
+    }
 }
 
-static void distribute_command(
-        snode::ServiceNode& sn,
-        std::shared_ptr<swarm_response>& res,
-        std::string_view cmd,
-        const rpc::recursive& req) {
+SNStorageCCResult interpret_sn_storage_cc_response_parts(
+        bool success, std::span<std::string> parts) {
+    bool good_result = success && parts.size() == 1;
+    SNStorageCCResult result = {};
+    if (good_result) {
+        result.status = SNStorageCCResultStatus::Good;
+    } else {
+        bool timeout = !success;
+        if (timeout) {
+            result.status = SNStorageCCResultStatus::Timeout;
+        } else if (parts.size() == 2) {
+            result.status = SNStorageCCResultStatus::ErrorCodeReason;
+            result.error_code = parts[0];
+            result.error_reason = parts[1];
+        } else {
+            result.status = SNStorageCCResultStatus::BadPeerResponse;
+        }
+    }
+    return result;
+}
+
+static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_response>& res) {
     auto peers = sn.swarm().peers();
     res->pending += peers.size();
 
@@ -439,36 +467,36 @@ static void distribute_command(
             log::debug(
                     logcat,
                     "Not distributing {} to swarm peer {}: SN {}",
-                    cmd,
+                    res->cmd,
                     peer.first,
                     ct ? "is non-contactable" : "not found");
             res->pending--;
+
+            snode::RequestRetryEntry entry = {};
+            entry.key = peer.first;
+            entry.reason = snode::RetryReason::NON_CONTACTABLE;
+            res->retry_nodes.push_back(entry);
             continue;
         }
 
         sn.omq_server()->request(
                 ct->pubkey_x25519.view(),
                 "sn.storage_cc",
-                [res, peer, peer_ed = ct->pubkey_ed25519, cmd](bool success, auto parts) {
+                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](bool success, auto parts) {
                     json peer_result;
-                    if (!success)
-                        log::warning(
-                                logcat,
-                                "Response timeout from {} for forwarded command {}",
-                                peer.first,
-                                cmd);
-                    bool good_result = success && parts.size() == 1;
-                    if (good_result) {
+                    SNStorageCCResult store_result =
+                            interpret_sn_storage_cc_response_parts(success, parts);
+                    if (store_result.status == SNStorageCCResultStatus::Good) {
                         try {
                             peer_result = bt_to_json(oxenc::bt_dict_consumer{parts[0]});
                         } catch (const std::exception& e) {
                             log::warning(
                                     logcat,
                                     "Received unparsable response to {} from {}: {}",
-                                    cmd,
+                                    res->cmd,
                                     peer.first,
                                     e.what());
-                            good_result = false;
+                            store_result.status = SNStorageCCResultStatus::BadPeerResponse;
                         }
                     }
 
@@ -477,15 +505,30 @@ static void distribute_command(
                     // If we're the last response then we reply:
                     bool send_reply = --res->pending == 0;
 
-                    if (!good_result) {
+                    if (store_result.status != SNStorageCCResultStatus::Good) {
                         peer_result = json{{"failed", true}};
-                        if (!success)
+                        bool timeout = store_result.status == SNStorageCCResultStatus::Timeout;
+                        if (timeout) {
                             peer_result["timeout"] = true;
-                        else if (parts.size() == 2) {
-                            peer_result["code"] = parts[0];
-                            peer_result["reason"] = parts[1];
-                        } else
+                        } else if (store_result.status == SNStorageCCResultStatus::ErrorCodeReason) {
+                            peer_result["code"] = store_result.error_code;
+                            peer_result["reason"] = store_result.error_reason;
+                        } else {
                             peer_result["bad_peer_response"] = true;
+                        }
+
+                        log::debug(
+                                logcat,
+                                "Failure response from {} for forwarded command {} ({}): <{}>",
+                                peer.first,
+                                res->cmd,
+                                timeout ? "will be retried" : "unretryable due to error",
+                                peer_result.dump());
+
+                        snode::RequestRetryEntry entry = {};
+                        entry.key = peer.first;
+                        entry.reason = snode::RetryReason::FAILED_TO_SEND;
+                        res->retry_nodes.push_back(entry);
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");
                             it != peer_result.end() && it->is_string())
@@ -493,12 +536,11 @@ static void distribute_command(
                     }
 
                     res->result["swarm"][peer_ed.hex()] = std::move(peer_result);
-
                     if (send_reply)
-                        reply_or_fail(res);
+                        reply_or_fail(sn, res);
                 },
-                cmd,
-                bt_serialize(req.to_bt()),
+                res->cmd,
+                res->req_payload,
                 oxenmq::send_option::request_timeout{5s});
     }
 }
@@ -510,11 +552,13 @@ std::pair<std::shared_ptr<swarm_response>, std::unique_lock<std::mutex>> static 
     res->cb = std::move(cb);
     res->pending = 1;
     res->b64 = req.b64;
+    res->cmd = RPC::names()[0];
+    res->req_payload = bt_serialize(req.to_bt());
 
     std::unique_lock<std::mutex> lock{res->mutex, std::defer_lock};
     if (req.recurse) {
         // Send it off to our peers right away, before we process it ourselves
-        distribute_command(sn, res, RPC::names()[0], req);
+        distribute_command(sn, res);
         lock.lock();
     }
     return {std::move(res), std::move(lock)};
@@ -645,7 +689,7 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
             obfuscate_pubkey(req.pubkey));
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -918,7 +962,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<void(Response)> cb) {
@@ -980,7 +1024,7 @@ void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<vo
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1031,7 +1075,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1085,7 +1129,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1212,7 +1256,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<void(Response)> cb) {
@@ -1278,7 +1322,7 @@ void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<voi
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<void(Response)> cb) {
@@ -1419,7 +1463,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(std::move(res));
+        reply_or_fail(service_node_, std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<void(Response)> cb) {

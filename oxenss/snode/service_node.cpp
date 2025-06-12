@@ -146,12 +146,6 @@ SerialiseResult ServiceNode::serialize(BTSerialise serialise, std::string_view s
     return result;
 }
 
-static uint64_t fnv1a64_hasher(std::string_view bytes, uint64_t hash) {
-    for (size_t i = 0; i < bytes.size(); i++)
-        hash = (bytes[i] ^ hash) * 1099511628211 /*FNV Prime*/;
-    return hash;
-}
-
 ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,

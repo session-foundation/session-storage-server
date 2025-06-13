@@ -112,9 +112,7 @@ class Swarm {
     // Marks a pending member as ready, so that it is returned by the next call to
     // `extract_contact_details_ready_members()`, and is no longer returned by
     // `extract_contract_details_pending_member()`.
-    void set_member_contact_details_ready(
-            const crypto::legacy_pubkey& pk,
-            std::optional<std::chrono::milliseconds> last_synced_ts);
+    void set_member_contact_details_ready(const crypto::legacy_pubkey& pk);
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

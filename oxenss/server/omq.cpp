@@ -29,48 +29,6 @@ namespace oxenss::server {
 
 static auto logcat = log::Cat("server");
 
-BTSerialiseResult sn_data_ready_response_serialise(
-        SNDataReadyResponse& item, Serialise serialise, std::string_view serialized_data) {
-
-    BTSerialiseResult result = {};
-
-    constexpr std::string_view STATUS_KEY = "s";
-    constexpr std::string_view TIMESTAMP_KEY = "t";
-    if (serialise == Serialise::Write) {
-        assert(serialized_data.empty());
-        oxenc::bt_dict_producer dict;
-        dict.append(STATUS_KEY, static_cast<uint8_t>(item.status));
-        dict.append(TIMESTAMP_KEY, item.newest_timestamp.count());
-        result.write_payload = dict.view();
-        result.success = true;
-    } else {
-        oxenc::bt_dict_consumer d{serialized_data};
-        SNDataReadyResponse response = {};
-        try {
-            uint32_t status_u32 = d.require<uint32_t>(STATUS_KEY);
-            uint32_t last = static_cast<uint32_t>(SNDataReadyStatus::Count);
-            if (status_u32 >= last)
-                result.read_error = "SN data ready status was OOB (received {})"_format(last);
-            else
-                response.status = static_cast<SNDataReadyStatus>(status_u32);
-        } catch (const std::exception& e) {
-            result.read_error = "SN data ready status was not a 4 byte unsigned integer";
-        }
-
-        try {
-            uint64_t newest_timestamp = d.require<uint64_t>(TIMESTAMP_KEY);
-            response.newest_timestamp = std::chrono::milliseconds(newest_timestamp);
-        } catch (const std::exception& e) {
-            result.read_error = "SN data ready timestamp was not an 8 byte unsigned integer";
-        }
-
-        result.success = result.read_error.empty();
-        if (result.success)
-            item = std::move(response);
-    }
-    return result;
-}
-
 std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
     log::trace(logcat, "[OMQ] Peer Lookup");
 
@@ -89,28 +47,16 @@ std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
 void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     log::debug(logcat, "[OMQ] handle sn.data_ready from: {}", message.conn.to_string());
 
-    SNDataReadyResponse response = {};
-    if (response.status == SNDataReadyStatus::Nil) {
-        auto& xpk_str = message.conn.pubkey();
-        if (xpk_str.size() != sizeof(crypto::x25519_pubkey)) {
-            response.status = SNDataReadyStatus::RemoteNotRecognizedAsSN;
-        } else {
-            crypto::x25519_pubkey xpk;
-            std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
-            if (!service_node_->is_swarm_peer(xpk))
-                response.status = SNDataReadyStatus::SwarmMismatch;
-        }
-    }
+    auto& xpk_str = message.conn.pubkey();
+    if (xpk_str.size() != sizeof(crypto::x25519_pubkey))
+        return message.send_reply("Remote not recognized as SN");
 
-    if (response.status == SNDataReadyStatus::Nil) {
-        response.status = SNDataReadyStatus::OK;
-        response.newest_timestamp = service_node_->db->retrieve_newest_timestamp();
-    }
+    crypto::x25519_pubkey xpk;
+    std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
+    if (!service_node_->is_swarm_peer(xpk))
+        return message.send_reply("Swarm mismatch");
 
-    BTSerialiseResult write_result =
-            sn_data_ready_response_serialise(response, Serialise::Write, "");
-    assert(write_result.success);
-    message.send_reply(write_result.write_payload);
+    message.send_reply("OK");
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {

@@ -262,17 +262,11 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
     return result;
 }
 
-void Swarm::set_member_contact_details_ready(
-        const crypto::legacy_pubkey& pk, std::optional<std::chrono::milliseconds> last_synced_ts) {
+void Swarm::set_member_contact_details_ready(const crypto::legacy_pubkey& pk) {
     std::lock_guard lock{network.mut_};
-
     auto it = members_.find(pk);
     assert(it != members_.end());
-
-    if (it != members_.end()) {
+    if (it != members_.end())
         it->second.status = SwarmMemberStatus::ContactDetailsReady;
-        if (last_synced_ts)
-            it->second.newest_msg_timestamp = *last_synced_ts;
-    }
 }
 }  // namespace oxenss::snode

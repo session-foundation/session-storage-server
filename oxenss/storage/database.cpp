@@ -672,21 +672,6 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     return get_message(*impl, st);
 }
 
-std::chrono::milliseconds Database::retrieve_newest_timestamp() {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
-            "SELECT COALESCE((SELECT timestamp FROM owned_messages ORDER BY timestamp DESC LIMIT "
-            "1), 0);");
-    std::chrono::milliseconds result = {};
-    while (st->executeStep()) {
-        int64_t time = get<int64_t>(st);
-        assert(time >= 0);
-        if (time >= 0)
-            result = std::chrono::milliseconds(static_cast<uint64_t>(time));
-    }
-    return result;
-}
-
 StoreResult Database::store(const message& msg, std::chrono::system_clock::time_point* expiry) {
 
     auto impl = get_impl(true);

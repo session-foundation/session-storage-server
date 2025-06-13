@@ -28,23 +28,6 @@ namespace snode {
 }  // namespace oxenss
 
 namespace oxenss::server {
-
-enum class SNDataReadyStatus {
-    Nil,
-    RemoteNotRecognizedAsSN,
-    SwarmMismatch,
-    OK,
-    Count,
-};
-
-struct SNDataReadyResponse {
-    SNDataReadyStatus status;
-    std::chrono::milliseconds newest_timestamp;
-};
-
-BTSerialiseResult sn_data_ready_response_serialise(
-        server::SNDataReadyResponse& item, Serialise serialise, std::string_view serialized_data);
-
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;
     oxenmq::ConnectionID oxend_conn_;

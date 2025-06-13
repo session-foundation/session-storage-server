@@ -583,7 +583,7 @@ void ServiceNode::check_new_members() {
                     pk,
                     fmt::join(NEW_SWARM_MEMBER_HANDSHAKE_VERSION, "."),
                     fmt::join(c->version, "."));
-            swarm_.set_member_contact_details_ready(pk, std::nullopt);
+            swarm_.set_member_contact_details_ready(pk);
             continue;
         }
 
@@ -592,30 +592,26 @@ void ServiceNode::check_new_members() {
                 c->pubkey_x25519.view(),
                 "sn.data_ready",
                 [this, pk](bool success, std::vector<std::string> data) {
-                    server::SNDataReadyResponse response = {};
-                    BTSerialiseResult read_result = {};
                     if (data.empty()) {
-                        read_result.read_error = "Empty reply";
-                    } else {
-                        read_result = server::sn_data_ready_response_serialise(
-                                response, Serialise::Read, data[0]);
+                        success = false;
+                        data.push_back("Empty reply"s);
+                    } else if (data[0] != "OK"sv) {
+                        success = false;
                     }
-
-                    if (!read_result.success) {
+                    if (!success) {
                         log::info(
                                 logcat,
                                 "Failed to connect to remote SS {} to initiate new "
-                                "data transfer ({}: {}); will retry soon",
+                                "data transfer ({}); will retry soon",
                                 pk,
-                                fmt::join(data, ", "),
-                                read_result.read_error);
+                                fmt::join(data, ", "));
                         return;
                     }
                     log::debug(
                             logcat,
                             "Successful contact made with swarm member {}, marking as ready",
                             pk);
-                    swarm_.set_member_contact_details_ready(pk, response.newest_timestamp);
+                    swarm_.set_member_contact_details_ready(pk);
                 });
     }
 

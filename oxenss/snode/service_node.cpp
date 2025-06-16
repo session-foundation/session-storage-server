@@ -48,9 +48,190 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 30s;
 
-SNSerialiseResult ServiceNode::serialize(Serialise serialise, std::string_view serialized_data) const
+static SerialiseRetryableRequestsResult serialize_retryable_requests(
+        Serialise serialise, std::string_view read_data, std::span<RequestRetry> write_data) {
+    SerialiseRetryableRequestsResult result = {};
+    uint32_t version = 0;
+
+    constexpr std::string_view VERSION_KEY = "@";
+    constexpr std::string_view RETRYABLE_REQUESTS_KEY = "r";
+    assert(VERSION_KEY < RETRYABLE_REQUESTS_KEY);
+
+    // Retryable request keys
+    constexpr std::string_view COMMAND_KEY = "c";
+    constexpr std::string_view REQ_PAYLOAD_KEY = "r";
+    constexpr std::string_view CREATE_TIME_KEY = "t";
+    constexpr std::string_view NODES_KEY = "u";
+    assert(COMMAND_KEY < CREATE_TIME_KEY);
+    assert(REQ_PAYLOAD_KEY < CREATE_TIME_KEY);
+    assert(CREATE_TIME_KEY < NODES_KEY);
+
+    // Retrayble request entry keys
+    constexpr std::string_view KEY_KEY = "i";
+    constexpr std::string_view DEADLINE_KEY = "l";
+    constexpr std::string_view NEXT_RETRY_DELAY_KEY = "n";
+    constexpr std::string_view REASON_KEY = "r";
+    assert(KEY_KEY < DEADLINE_KEY);
+    assert(DEADLINE_KEY < NEXT_RETRY_DELAY_KEY);
+    assert(NEXT_RETRY_DELAY_KEY < REASON_KEY);
+
+    if (serialise == Serialise::Write) {
+        oxenc::bt_dict_producer d;
+        d.append(VERSION_KEY, version);
+
+        oxenc::bt_list_producer retry_list = d.append_list(RETRYABLE_REQUESTS_KEY);
+        for (const auto& it : write_data) {
+            oxenc::bt_dict_producer retry_dict = retry_list.append_dict();
+            retry_dict.append(COMMAND_KEY, it.cmd);
+            retry_dict.append(REQ_PAYLOAD_KEY, it.req_payload);
+            uint64_t create_time_u64 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               it.create_time.time_since_epoch())
+                                               .count();
+            retry_dict.append(CREATE_TIME_KEY, create_time_u64);
+            oxenc::bt_list_producer node_list = retry_dict.append_list(NODES_KEY);
+            for (const auto& node_it : it.nodes) {
+                oxenc::bt_dict_producer node_dict = node_list.append_dict();
+                uint32_t reason_u32 = static_cast<uint32_t>(node_it.reason);
+                uint64_t deadline_u64 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                node_it.deadline.time_since_epoch())
+                                                .count();
+                uint64_t next_retry_delay_u64 = node_it.next_retry_delay.count();
+                node_dict.append(KEY_KEY, node_it.key);
+                node_dict.append(DEADLINE_KEY, deadline_u64);
+                node_dict.append(NEXT_RETRY_DELAY_KEY, next_retry_delay_u64);
+                node_dict.append(REASON_KEY, reason_u32);
+            }
+        }
+
+        result.bt.success = true;
+        result.bt.write_payload = d.view();
+    } else {
+        if (read_data.size()) {
+            oxenc::bt_dict_consumer d{read_data};
+            try {
+                version = d.require<uint8_t>(VERSION_KEY);
+            } catch (const std::exception& e) {
+                result.bt.read_error =
+                        "Failed to parse retryable request version: {}"_format(e.what());
+            }
+
+            if (version != 0)
+                result.bt.read_error =
+                        "Unrecognised retryable request version: {}, skipping"_format(version);
+
+            if (result.bt.read_error.empty()) {
+                // Initially a dummy list that we will std::move the real list into
+                oxenc::bt_list_consumer retry_list("l");
+                try {
+                    auto [key, list] = d.next_list_consumer();
+                    assert(key == RETRYABLE_REQUESTS_KEY);
+                    retry_list = std::move(list);
+                } catch (const std::exception& e) {
+                    result.bt.read_error =
+                            "Failed to read retryable request list: {}"_format(e.what());
+                }
+
+                while (result.bt.read_error.empty() && !retry_list.is_finished()) {
+                    auto request_dict = retry_list.consume_dict_consumer();
+
+                    RequestRetry request = {};
+                    try {
+                        request.cmd = request_dict.require<std::string>(COMMAND_KEY);
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to read retryable request command: {}"_format(e.what());
+                        continue;
+                    }
+
+                    try {
+                        request.req_payload = request_dict.require<std::string>(REQ_PAYLOAD_KEY);
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to read retryable request, request payload: {}"_format(
+                                        e.what());
+                        continue;
+                    }
+
+                    try {
+                        uint64_t create_time_u64 = request_dict.require<uint64_t>(CREATE_TIME_KEY);
+                        request.create_time = std::chrono::steady_clock::time_point(
+                                std::chrono::milliseconds(create_time_u64));
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to read retryable request, create time: {}"_format(e.what());
+                        continue;
+                    }
+
+                    oxenc::bt_list_consumer node_list("l");  // Dummy list
+                    try {
+                        auto [key, list] = request_dict.next_list_consumer();
+                        assert(key == NODES_KEY);
+                        node_list = std::move(list);
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to read retryable request, node list: {}"_format(e.what());
+                        continue;
+                    }
+
+                    while (result.bt.read_error.empty() && !node_list.is_finished()) {
+                        auto node_dict = node_list.consume_dict_consumer();
+                        RequestRetryEntry node = {};
+                        try {
+                            std::string_view key_bytes =
+                                    node_dict.require<std::string_view>(KEY_KEY);
+                            node.key = crypto::legacy_pubkey::from_bytes(key_bytes);
+                        } catch (const std::exception& e) {
+                            result.bt.read_error =
+                                    "Failed to parse retryable request node key: {}"_format(
+                                            e.what());
+                            continue;
+                        }
+
+                        try {
+                            uint64_t deadline_u64 = node_dict.require<uint64_t>(DEADLINE_KEY);
+                            node.deadline = std::chrono::steady_clock::time_point(
+                                    std::chrono::milliseconds(deadline_u64));
+                        } catch (const std::exception& e) {
+                            result.bt.read_error =
+                                    "Failed to parse retryable request node deadline: {}"_format(
+                                            e.what());
+                            continue;
+                        }
+
+                        try {
+                            uint64_t next_retry_delay_u64 =
+                                    node_dict.require<uint64_t>(NEXT_RETRY_DELAY_KEY);
+                            node.next_retry_delay = std::chrono::milliseconds(next_retry_delay_u64);
+                        } catch (const std::exception& e) {
+                            result.bt.read_error =
+                                    "Failed to parse retryable request next retry delay: {}"_format(
+                                            e.what());
+                            continue;
+                        }
+
+                        try {
+                            uint32_t reason_u32 = node_dict.require<uint32_t>(REASON_KEY);
+                            node.reason = static_cast<RetryReason>(reason_u32);
+                        } catch (const std::exception& e) {
+                            result.bt.read_error =
+                                    "Failed to parse retryable request reason {}"_format(e.what());
+                            continue;
+                        }
+
+                        request.nodes.emplace_back(std::move(node));
+                    }
+                    result.retryable_requests.emplace_back(std::move(request));
+                }
+            }
+        }
+        result.bt.success = result.bt.read_error.empty();
+    }
+    return result;
+}
+
+SerialiseSwarmsResult ServiceNode::serialize_swarms(Serialise serialise, std::string_view read_data) const
 {
-    SNSerialiseResult result = {};
+    SerialiseSwarmsResult result = {};
 
     constexpr std::string_view VERSION_KEY = "@";
     constexpr std::string_view NETWORK_SWARMS_KEY = "network.swarms";
@@ -77,24 +258,24 @@ SNSerialiseResult ServiceNode::serialize(Serialise serialise, std::string_view s
 
         d.append(SWARM_CUR_SWARM_ID, swarm_.cur_swarm_id_);
 
-        { // Append list of _our_ swarm members
+        {  // Append list of _our_ swarm members
             oxenc::bt_list_producer swarm_member_list = d.append_list(SWARM_MEMBERS_KEY);
             for (auto it : swarm_.members_)
                 swarm_member_list.append(it.first);  // pk
         }
 
-        result.bt_serialise.success = true;
-        result.bt_serialise.write_payload = d.view();
+        result.bt.success = true;
+        result.bt.write_payload = d.view();
     } else {
-        if (serialized_data.size()) {
-            oxenc::bt_dict_consumer d{serialized_data};
+        if (read_data.size()) {
+            oxenc::bt_dict_consumer d{read_data};
             try {
                 version = d.require<uint8_t>(VERSION_KEY);
             } catch (const std::exception& e) {
-                result.bt_serialise.read_error = "Failed to parse version: {}"_format(e.what());
+                result.bt.read_error = "Failed to parse version: {}"_format(e.what());
             }
 
-            if (result.bt_serialise.read_error.empty()) {
+            if (result.bt.read_error.empty()) {
                 try {  // Network swarms
                     auto [key, network_swarm_list] = d.next_list_consumer();
                     assert(key == NETWORK_SWARMS_KEY);
@@ -111,21 +292,21 @@ SNSerialiseResult ServiceNode::serialize(Serialise serialise, std::string_view s
                     }
 
                 } catch (const std::exception& e) {
-                    result.bt_serialise.read_error =
+                    result.bt.read_error =
                             "Failed to parse network swarms: {}"_format(e.what());
                 }
             }
 
-            if (result.bt_serialise.read_error.empty()) {
+            if (result.bt.read_error.empty()) {
                 try {
                     result.swarm_cur_swarm_id = d.require<uint64_t>(SWARM_CUR_SWARM_ID);
                 } catch (const std::exception& e) {
-                    result.bt_serialise.read_error =
+                    result.bt.read_error =
                             "Failed to swarm's current swarm ID: {}"_format(e.what());
                 }
             }
 
-            if (result.bt_serialise.read_error.empty()) {
+            if (result.bt.read_error.empty()) {
                 try {  // Swarm members
                     auto [key, list] = d.next_list_consumer();
                     assert(key == SWARM_MEMBERS_KEY);
@@ -135,12 +316,12 @@ SNSerialiseResult ServiceNode::serialize(Serialise serialise, std::string_view s
                         result.swarm_members[crypto::legacy_pubkey::from_bytes(bytes)];
                     }
                 } catch (const std::exception& e) {
-                    result.bt_serialise.read_error =
+                    result.bt.read_error =
                             "Failed to parse swarm members: {}"_format(e.what());
                 }
             }
         }
-        result.bt_serialise.success = result.bt_serialise.read_error.empty();
+        result.bt.success = result.bt.read_error.empty();
     }
 
     return result;
@@ -163,26 +344,44 @@ ServiceNode::ServiceNode(
         db{std::make_unique<Database>(dblocation)} {
     mq_servers_.push_back(&omq_server);
 
-    std::string blob_data = db->runtime_state_sn_blob(Serialise::Read, "");
-    SNSerialiseResult serialise_result = serialize(Serialise::Read, blob_data);
-    if (serialise_result.bt_serialise.success) {
-        last_serialize_hash = fnv1a64_hasher(blob_data, FNV1A64_SEED);
-        swarm_.members_ = std::move(serialise_result.swarm_members);
-        network_.swarms_ = std::move(serialise_result.network_swarms);
-        swarm_.cur_swarm_id_ = serialise_result.swarm_cur_swarm_id;
+    std::string swarms_blob = db->runtime_state_blob(BlobType::Swarms, Serialise::Read, "");
+    SerialiseSwarmsResult swarm_result = serialize_swarms(Serialise::Read, swarms_blob);
+    if (swarm_result.bt.success) {
+        last_swarms_serialize_hash = fnv1a64_hasher(swarms_blob, FNV1A64_SEED);
+        swarm_.members_ = std::move(swarm_result.swarm_members);
+        network_.swarms_ = std::move(swarm_result.network_swarms);
+        swarm_.cur_swarm_id_ = swarm_result.swarm_cur_swarm_id;
     } else {
-        blob_data.clear();
+        log::error(logcat, "Deserialising of swarms failed: {}", swarm_result.bt.read_error);
+        swarms_blob.clear();
+    }
+
+    std::string retryable_blob =
+            db->runtime_state_blob(BlobType::RetryableRequests, Serialise::Read, "");
+    SerialiseRetryableRequestsResult retryable_result =
+            serialize_retryable_requests(Serialise::Read, retryable_blob, {});
+    if (retryable_result.bt.success) {
+        last_retryable_serialize_hash = fnv1a64_hasher(retryable_blob, FNV1A64_SEED);
+        retryable_requests = std::move(retryable_result.retryable_requests);
+    } else {
+        log::error(
+                logcat,
+                "Deserialising of retryable requests failed: {}",
+                retryable_result.bt.read_error);
+        retryable_blob.clear();
     }
 
     log::info(
             logcat,
-            "Loaded {} ({}) swarms from disk (#{:x}; in swarm {:x} w/ {} members). Requesting "
-            "initial swarm state",
+            "Loaded {} ({}) swarms (#{:x}; in swarm {:x} w/ {} members) and {} ({}) retryable "
+            "requests from disk. Requesting initial swarm state",
             network_.swarms_.size(),
-            util::get_human_readable_bytes(blob_data.size()),
-            last_serialize_hash,
+            util::get_human_readable_bytes(swarms_blob.size()),
+            last_swarms_serialize_hash,
             swarm_.cur_swarm_id_,
-            swarm_.members_.size());
+            swarm_.members_.size(),
+            retryable_requests.size(),
+            util::get_human_readable_bytes(retryable_blob.size()));
 
     omq_server->add_timer(
             [this] {
@@ -332,7 +531,7 @@ static std::optional<block_update> parse_swarm_update(
 void ServiceNode::add_retryable_request(RequestRetry&& item) {
     std::unique_lock lock{retryable_requests_mutex};
     retryable_requests.emplace_back(item);
-    retryable_requests_cv.notify_all(); // Wake up retry thread
+    retryable_requests_cv.notify_all();  // Wake up retry thread
 }
 
 void ServiceNode::register_mq_server(server::MQBase* server) {
@@ -716,28 +915,38 @@ void ServiceNode::save_bulk(const std::vector<message>& msgs) {
     log::trace(logcat, "saved messages count: {}", msgs.size());
 }
 
+static void store_swarms_blob_if_changed(uint64_t block_height, const SerialiseSwarmsResult& serialise_result, Database& db, uint64_t& last_hash) {
+    if (serialise_result.bt.success) {
+        uint64_t hash = fnv1a64_hasher(serialise_result.bt.write_payload, FNV1A64_SEED);
+        if (last_hash != hash) {
+            log::debug(
+                    logcat,
+                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
+                    block_height,
+                    last_hash,
+                    hash,
+                    util::get_human_readable_bytes(serialise_result.bt.write_payload.size()));
+            last_hash = hash;
+            db.runtime_state_blob(
+                    BlobType::Swarms, Serialise::Write, serialise_result.bt.write_payload);
+        }
+    } else {
+        if (static bool once = true; once) {
+            once = false;
+            log::error(
+                    logcat,
+                    "Failed to serialize swarms to blob: {}",
+                    serialise_result.bt.write_payload);
+        }
+    }
+}
+
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
     swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
 
-    snode::SNSerialiseResult serialise_result = serialize(Serialise::Write, "");
-    if (serialise_result.bt_serialise.success) {
-        uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
-        if (last_serialize_hash != hash) {
-            log::info(
-                    logcat,
-                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
-                    block_height_,
-                    last_serialize_hash,
-                    hash,
-                    util::get_human_readable_bytes(
-                            serialise_result.bt_serialise.write_payload.size()));
-
-            last_serialize_hash = hash;
-            db->runtime_state_sn_blob(
-                    Serialise::Write, serialise_result.bt_serialise.write_payload);
-        }
-    }
+    snode::SerialiseSwarmsResult write = serialize_swarms(Serialise::Write, "");
+    store_swarms_blob_if_changed(block_height_, write, *db, last_swarms_serialize_hash);
 }
 
 void ServiceNode::on_snodes_update(block_update&& bu) {
@@ -781,24 +990,8 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
     auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
 
     // Serialise state to blob and store into DB if dirtied
-    snode::SNSerialiseResult serialise_result = serialize(Serialise::Write, "");
-    if (serialise_result.bt_serialise.success) {
-        uint64_t hash = fnv1a64_hasher(serialise_result.bt_serialise.write_payload, FNV1A64_SEED);
-        if (last_serialize_hash != hash) {
-            log::info(
-                    logcat,
-                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
-                    block_height_,
-                    last_serialize_hash,
-                    hash,
-                    util::get_human_readable_bytes(
-                            serialise_result.bt_serialise.write_payload.size()));
-
-            last_serialize_hash = hash;
-            db->runtime_state_sn_blob(
-                    Serialise::Write, serialise_result.bt_serialise.write_payload);
-        }
-    }
+    snode::SerialiseSwarmsResult write = serialize_swarms(Serialise::Write, "");
+    store_swarms_blob_if_changed(block_height_, write, *db, last_swarms_serialize_hash);
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED
@@ -1435,6 +1628,11 @@ void ServiceNode::retryable_requests_thread_entry_point() {
             fmt::memory_buffer trace_buffer;
             for (size_t index = 0; index < retryable_requests.size(); index++) {
                 const auto& item = retryable_requests[index];
+                auto item_age =
+                        std::chrono::duration_cast<std::chrono::seconds>(now - item.create_time);
+                if (item_age >= rpc::TTL_MAXIMUM_PRIVATE)
+                    continue;
+
                 if (log::get_level(logcat) <= log::Level::trace) {
                     fmt::format_to(
                             std::back_inserter(trace_buffer),
@@ -1448,7 +1646,7 @@ void ServiceNode::retryable_requests_thread_entry_point() {
 
                 for (size_t node_index = 0; node_index < item.nodes.size(); node_index++) {
                     const auto& node_item = item.nodes[node_index];
-                    bool is_due = now>= node_item.deadline;
+                    bool is_due = now >= node_item.deadline;
                     due_requests += is_due;
 
                     if (log::get_level(logcat) <= log::Level::trace) {
@@ -1499,6 +1697,12 @@ void ServiceNode::retryable_requests_thread_entry_point() {
                 it->hash = FNV1A64_SEED;
                 it->hash = fnv1a64_hasher(it->cmd, it->hash);
                 it->hash = fnv1a64_hasher(it->req_payload, it->hash);
+            }
+
+            auto it_age = std::chrono::duration_cast<std::chrono::seconds>(now - it->create_time);
+            if (it_age >= rpc::TTL_MAXIMUM_PRIVATE) {
+                log::debug(logcat, "Retry request ({}) expired after {}", it->cmd, it_age);
+                it->nodes.clear();
             }
 
             for (auto node_it = it->nodes.begin(); node_it != it->nodes.end();) {
@@ -1641,6 +1845,31 @@ void ServiceNode::retryable_requests_thread_entry_point() {
                 it = retryable_requests.erase(it);
             else
                 it++;
+        }
+
+        SerialiseRetryableRequestsResult write =
+                serialize_retryable_requests(Serialise::Write, "", retryable_requests);
+        if (write.bt.success) {
+            uint64_t hash = fnv1a64_hasher(write.bt.write_payload, FNV1A64_SEED);
+            if (last_retryable_serialize_hash != hash) {
+                log::debug(
+                        logcat,
+                        "Retryable requests dirtied #{:x} => #{:x}, saving {} to DB",
+                        last_retryable_serialize_hash,
+                        hash,
+                        util::get_human_readable_bytes(write.bt.write_payload.size()));
+                last_retryable_serialize_hash = hash;
+                db->runtime_state_blob(
+                        BlobType::RetryableRequests, Serialise::Write, write.bt.write_payload);
+            }
+        } else {
+            if (static bool once = true; once) {
+                once = false;
+                log::error(
+                        logcat,
+                        "Failed to serialize retryable requests to blob: {}",
+                        write.bt.write_payload);
+            }
         }
     }
 }

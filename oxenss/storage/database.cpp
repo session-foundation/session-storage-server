@@ -338,10 +338,12 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
             log::info(logcat, "Upgrading database schema: adding runtime_state");
             db.exec(R"(
 CREATE TABLE runtime_state (
-    sn_blob BLOB
+    swarms_blob BLOB,
+    retryable_requests_blob BLOB
 );
+INSERT INTO runtime_state VALUES (null, null);
+PRAGMA user_version = 1;
             )");
-            db.exec("PRAGMA user_version = 1;");
         }
 
         views_triggers_indices();
@@ -1202,18 +1204,24 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
-std::string Database::runtime_state_sn_blob(Serialise serialise, const std::string& write_blob)
+std::string Database::runtime_state_blob(BlobType type, Serialise serialise, const std::string& write_blob)
 {
+    std::string_view key = {};
+    switch (type) {
+        case BlobType::Swarms: key = "swarms_blob"; break;
+        case BlobType::RetryableRequests: key = "retryable_requests_blob"; break;
+    }
+
     std::string result;
     auto impl = get_impl(serialise == Serialise::Write);
     if (serialise == Serialise::Read) {
-        auto stmt = impl->prepared_st("SELECT sn_blob FROM runtime_state LIMIT 1");
+        auto stmt = impl->prepared_st("SELECT {} FROM runtime_state LIMIT 1"_format(key));
         auto maybe_result = exec_and_maybe_get<std::string>(stmt);
         if (maybe_result)
             result = std::move(*maybe_result);
     } else {
         if (write_blob.size()) {
-            auto stmt = impl->prepared_st("REPLACE INTO runtime_state (sn_blob) VALUES (?)");
+            auto stmt = impl->prepared_st("UPDATE runtime_state SET {} = ?"_format(key));
             exec_query(stmt, write_blob);
         }
     }

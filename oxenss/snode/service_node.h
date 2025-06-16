@@ -71,13 +71,6 @@ constexpr std::string_view to_string(SnodeStatus status) {
     return "Unknown"sv;
 }
 
-struct SNSerialiseResult {
-    BTSerialiseResult bt_serialise;
-    std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;
-    swarms_t network_swarms;
-    swarm_id_t swarm_cur_swarm_id;
-};
-
 enum class RetryReason {
     NON_CONTACTABLE,
     FAILED_TO_SEND,
@@ -92,10 +85,23 @@ struct RequestRetryEntry {
 };
 
 struct RequestRetry {
-    std::string_view cmd;
+    std::string cmd;
     std::string req_payload;
     uint64_t hash;
+    std::chrono::steady_clock::time_point create_time;
     std::vector<RequestRetryEntry> nodes;
+};
+
+struct SerialiseRetryableRequestsResult {
+    SerialiseBTResult bt;
+    std::vector<RequestRetry> retryable_requests;
+};
+
+struct SerialiseSwarmsResult {
+    SerialiseBTResult bt;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;
+    swarms_t network_swarms;
+    swarm_id_t swarm_cur_swarm_id;
 };
 
 /// All service node logic that is not network-specific
@@ -139,7 +145,7 @@ class ServiceNode {
     mutable std::recursive_mutex sn_mutex_;
 
     // Lock to be taken when interacting with the 'retryable_requests' queue
-    std::mutex retryable_requests_mutex;
+    mutable std::mutex retryable_requests_mutex;
 
     // List of requests that will be re-attempted periodically through the
     // 'retryable_requests_thread'
@@ -149,6 +155,10 @@ class ServiceNode {
 
     // The time point at which the next swarm member check should be executed
     std::chrono::steady_clock::time_point swarm_member_check_deadline = {};
+
+    uint64_t last_swarms_serialize_hash = 0;
+
+    uint64_t last_retryable_serialize_hash = 0;
 
     void send_notifies(message m);
 
@@ -211,9 +221,7 @@ class ServiceNode {
             bool force_start,
             bool skip_bootstrap);
 
-    SNSerialiseResult serialize(Serialise serialise, std::string_view serialized_data) const;
-
-    uint64_t last_serialize_hash = 0;
+    SerialiseSwarmsResult serialize_swarms(Serialise serialise, std::string_view read_data) const;
 
     std::unique_ptr<Database> db;
 

@@ -10,7 +10,7 @@ enum class Serialise {
     Write,
 };
 
-struct BTSerialiseResult {
+struct SerialiseBTResult {
     bool success;
     std::string write_payload;
     std::string read_error;

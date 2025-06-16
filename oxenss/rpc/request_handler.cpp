@@ -432,6 +432,7 @@ static void reply_or_fail(snode::ServiceNode& sn, const std::shared_ptr<swarm_re
         retry.nodes = std::move(res->retry_nodes);
         retry.cmd = res->cmd;
         retry.req_payload = std::move(res->req_payload);
+        retry.create_time = std::chrono::steady_clock::now();
         sn.add_retryable_request(std::move(retry));
     }
 }

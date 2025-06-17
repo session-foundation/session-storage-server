@@ -463,7 +463,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
     res->pending += peers.size();
 
     // When a request to a peer fails, set the initial retry to 1s in the future
-    constexpr auto default_deadline_delay = 1s;
+    constexpr auto default_retry_delay = 1s;
 
     for (auto& peer : peers) {
         auto ct = sn.contacts().find(peer.first);
@@ -479,7 +479,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
             snode::RequestRetryEntry entry = {};
             entry.key = peer.first;
             entry.reason = snode::RetryReason::NON_CONTACTABLE;
-            entry.deadline = std::chrono::steady_clock::now() + default_deadline_delay;
+            entry.deadline = std::chrono::steady_clock::now() + default_retry_delay;
             res->retry_nodes.push_back(entry);
             continue;
         }
@@ -487,7 +487,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
         sn.omq_server()->request(
                 ct->pubkey_x25519.view(),
                 "sn.storage_cc",
-                [res, peer, peer_ed = ct->pubkey_ed25519, &sn, default_deadline_delay](
+                [res, peer, peer_ed = ct->pubkey_ed25519, &sn, default_retry_delay](
                         bool success, auto parts) {
                     json peer_result;
                     SNStorageCCResult store_result =
@@ -531,11 +531,13 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                                 timeout ? "will be retried" : "unretryable due to error",
                                 peer_result.dump());
 
-                        snode::RequestRetryEntry entry = {};
-                        entry.key = peer.first;
-                        entry.reason = snode::RetryReason::FAILED_TO_SEND;
-                        entry.deadline = std::chrono::steady_clock::now() + default_deadline_delay;
-                        res->retry_nodes.push_back(entry);
+                        if (timeout) {
+                            snode::RequestRetryEntry entry = {};
+                            entry.key = peer.first;
+                            entry.reason = snode::RetryReason::FAILED_TO_SEND;
+                            entry.deadline = std::chrono::steady_clock::now() + default_retry_delay;
+                            res->retry_nodes.push_back(entry);
+                        }
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");
                             it != peer_result.end() && it->is_string())

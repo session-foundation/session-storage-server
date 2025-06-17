@@ -356,7 +356,7 @@ ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
         server::OMQ& omq_server,
-        const std::filesystem::path& dblocation,
+        const std::filesystem::path& db_location,
         bool force_start,
         bool skip_bootstrap) :
         force_start_{force_start},
@@ -366,7 +366,7 @@ ServiceNode::ServiceNode(
         network_{*omq_server},
         omq_server_{omq_server},
         all_stats_{*omq_server},
-        db{std::make_unique<Database>(dblocation)} {
+        db{std::make_unique<Database>(db_location)} {
     mq_servers_.push_back(&omq_server);
 
     std::string swarms_blob = db->runtime_state_blob(BlobType::Swarms, Serialise::Read, "");

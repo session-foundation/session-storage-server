@@ -163,7 +163,8 @@ static SerialiseRetryableRequestsResult serialize_retryable_requests(
                                 std::chrono::milliseconds(create_time_u64));
                     } catch (const std::exception& e) {
                         result.bt.read_error =
-                                "Failed to read retryable request, create time: {}"_format(e.what());
+                                "Failed to read retryable request, create time: {}"_format(
+                                        e.what());
                         continue;
                     }
 
@@ -234,8 +235,8 @@ static SerialiseRetryableRequestsResult serialize_retryable_requests(
     return result;
 }
 
-SerialiseSwarmsResult ServiceNode::serialize_swarms(Serialise serialise, std::string_view read_data) const
-{
+SerialiseSwarmsResult ServiceNode::serialize_swarms(
+        Serialise serialise, std::string_view read_data) const {
     SerialiseSwarmsResult result = {};
 
     constexpr std::string_view VERSION_KEY = "@";
@@ -331,8 +332,7 @@ SerialiseSwarmsResult ServiceNode::serialize_swarms(Serialise serialise, std::st
                     assert(key == SWARM_MEMBERS_KEY);
                     swarm_members = std::move(list);
                 } catch (const std::exception& e) {
-                    result.bt.read_error =
-                            "Failed to parse swarm members: {}"_format(e.what());
+                    result.bt.read_error = "Failed to parse swarm members: {}"_format(e.what());
                 }
 
                 while (result.bt.read_error.empty() && !swarm_members.is_finished()) {
@@ -434,7 +434,8 @@ ServiceNode::ServiceNode(
             1h);
 
     // Setup the retryable requests thread
-    retryable_requests_thread = std::thread(&ServiceNode::retryable_requests_thread_entry_point, this);
+    retryable_requests_thread =
+            std::thread(&ServiceNode::retryable_requests_thread_entry_point, this);
 }
 
 void ServiceNode::on_oxend_connected() {
@@ -706,11 +707,10 @@ bool ServiceNode::snode_ready(std::string* reason) {
     std::vector<std::string> problems;
 
     if (!hf_at_least(STORAGE_SERVER_HARDFORK))
-        problems.push_back(
-                fmt::format(
-                        "not yet on hardfork {}.{}",
-                        STORAGE_SERVER_HARDFORK.first,
-                        STORAGE_SERVER_HARDFORK.second));
+        problems.push_back(fmt::format(
+                "not yet on hardfork {}.{}",
+                STORAGE_SERVER_HARDFORK.first,
+                STORAGE_SERVER_HARDFORK.second));
     if (syncing_)
         problems.push_back("not done syncing");
 
@@ -940,7 +940,11 @@ void ServiceNode::save_bulk(const std::vector<message>& msgs) {
     log::trace(logcat, "saved messages count: {}", msgs.size());
 }
 
-static void store_swarms_blob_if_changed(uint64_t block_height, const SerialiseSwarmsResult& serialise_result, Database& db, uint64_t& last_hash) {
+static void store_swarms_blob_if_changed(
+        uint64_t block_height,
+        const SerialiseSwarmsResult& serialise_result,
+        Database& db,
+        uint64_t& last_hash) {
     if (serialise_result.bt.success) {
         uint64_t hash = fnv1a64_hasher(serialise_result.bt.write_payload, FNV1A64_SEED);
         if (last_hash != hash) {
@@ -1784,7 +1788,8 @@ void ServiceNode::retryable_requests_thread_entry_point() {
                             node.next_retry_delay = std::min(
                                     std::chrono::milliseconds(delay_ms),
                                     std::chrono::milliseconds(MAX_RETRY_DELAY));
-                            node.deadline = std::chrono::steady_clock::now() + node.next_retry_delay;
+                            node.deadline =
+                                    std::chrono::steady_clock::now() + node.next_retry_delay;
 
                             // Wake up retryable request thread, it will take into consideration the
                             // new deadline for the blocking sleep

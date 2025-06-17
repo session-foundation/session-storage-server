@@ -1204,8 +1204,8 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
-std::string Database::runtime_state_blob(BlobType type, Serialise serialise, const std::string& write_blob)
-{
+std::string Database::runtime_state_blob(
+        BlobType type, Serialise serialise, const std::string& write_blob) {
     std::string_view key = {};
     switch (type) {
         case BlobType::Swarms: key = "swarms_blob"; break;

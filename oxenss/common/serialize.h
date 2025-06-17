@@ -25,4 +25,3 @@ inline uint64_t fnv1a64_hasher(std::string_view bytes, uint64_t hash) {
 }
 
 };  // namespace oxenss
-

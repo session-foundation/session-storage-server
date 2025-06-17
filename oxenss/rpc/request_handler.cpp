@@ -516,7 +516,8 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                         bool timeout = store_result.status == SNStorageCCResultStatus::Timeout;
                         if (timeout) {
                             peer_result["timeout"] = true;
-                        } else if (store_result.status == SNStorageCCResultStatus::ErrorCodeReason) {
+                        } else if (
+                                store_result.status == SNStorageCCResultStatus::ErrorCodeReason) {
                             peer_result["code"] = store_result.error_code;
                             peer_result["reason"] = store_result.error_reason;
                         } else {

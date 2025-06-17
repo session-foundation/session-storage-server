@@ -138,7 +138,7 @@ SwarmEvents Swarm::update_swarms(
             log::info(logswarm, "New network swarm: {}", swarm);
 
         // Remove members that are no longer in the swarm from our runtime state
-        for (auto it = members_.begin(); it != members_.end(); ) {
+        for (auto it = members_.begin(); it != members_.end();) {
             if (events.our_swarm_members.find(it->first) == events.our_swarm_members.end())
                 it = members_.erase(it);
             else
@@ -162,13 +162,13 @@ SwarmEvents Swarm::update_swarms(
             // point onwards they will correctly identify nodes that are leaving and joining their
             // swarm and only do a message dump when necessary.
             if (oxenss::tmp_init_db_version == 0) {
-                pair.new_swarm_member = false; // Prevent the swarm DB dump on newly migrated nodes
+                pair.new_swarm_member = false;  // Prevent the swarm DB dump on newly migrated nodes
             } else {
                 pair.new_swarm_member = true;
             }
         }
     }
-    oxenss::tmp_init_db_version = 1; // Disable after the first swarm update
+    oxenss::tmp_init_db_version = 1;  // Disable after the first swarm update
 
     cur_swarm_id_ = events.our_swarm_id;
 

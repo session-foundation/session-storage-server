@@ -219,7 +219,8 @@ class Database {
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
 
-    std::string runtime_state_blob(BlobType type, Serialise serialise, const std::string& write_blob);
+    std::string runtime_state_blob(
+            BlobType type, Serialise serialise, const std::string& write_blob);
 };
 
 }  // namespace oxenss

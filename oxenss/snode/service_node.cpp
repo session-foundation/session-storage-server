@@ -1733,7 +1733,6 @@ void ServiceNode::retryable_requests_thread_entry_point() {
             for (auto node_it = it->nodes.begin(); node_it != it->nodes.end();) {
                 auto on_request_done = [MIN_RETRY_DELAY,
                                         MAX_RETRY_DELAY,
-                                        RETRY_BACKOFF_COEFF,
                                         this,
                                         hash = it->hash,
                                         key = node_it->key](

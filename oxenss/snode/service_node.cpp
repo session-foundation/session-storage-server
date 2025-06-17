@@ -46,7 +46,7 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 
 // How often to trigger 'check_new_members' which checks for 'data ready' handshakes from
 // swarm members and propagate a DB dump if necessary.
-constexpr auto NEW_SWARM_MEMBER_INTERVAL = 30s;
+constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
 static SerialiseRetryableRequestsResult serialize_retryable_requests(
         Serialise serialise, std::string_view read_data, std::span<RequestRetry> write_data) {

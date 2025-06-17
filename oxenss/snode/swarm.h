@@ -31,17 +31,15 @@ enum struct SwarmMemberStatus {
     // Pubkeys of new members into our swarm who we haven't yet established communications with;
     // once we do, we push all our swarm's messages to them.
     ContactDetailsPending,
-    ContactDetailsReady,
     Ready,
 };
 
 struct SwarmMemberState {
     SwarmMemberStatus status;
 
-    std::chrono::milliseconds newest_msg_timestamp;
-
     // Set if this member joined the swarm. They are assumed to not have any of the messages for
-    // the swarm yet so a full DB will be initiated
+    // the swarm yet so a full DB dump will be initiated for messages we own that belong to the
+    // swarm.
     bool new_swarm_member;
 
     // The earliest timestamp at which the swarm will check if they have received contact
@@ -50,7 +48,6 @@ struct SwarmMemberState {
     // detail has been confirmed.
     std::chrono::steady_clock::time_point check_contact_info_next_retry;
 };
-
 
 // How often we wait, after returning a pending new member, before we return the member again from
 // `extract_new_members()`.

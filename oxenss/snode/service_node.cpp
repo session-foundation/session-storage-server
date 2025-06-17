@@ -1811,9 +1811,7 @@ void ServiceNode::retryable_requests_thread_entry_point() {
                 if (is_member && !node_it->retry_underway) {
                     // Retry request if ready
                     bool is_due = now >= node_it->deadline;
-                    bool ready =
-                            (is_member->status == SwarmMemberStatus::ContactDetailsReady ||
-                             is_member->status == SwarmMemberStatus::Ready);
+                    bool ready = is_member->status == SwarmMemberStatus::Ready;
                     crypto::x25519_pubkey pubkey_x25519 = {};
 
                     if (ready) {

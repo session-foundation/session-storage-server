@@ -249,13 +249,12 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
 
     std::set<crypto::legacy_pubkey> result;
     for (auto& it : members_) {
-        if (it.second.status != SwarmMemberStatus::ContactDetailsReady)
-            continue;
-        const crypto::legacy_pubkey& pk = it.first;
-        it.second.status = SwarmMemberStatus::Ready;
-        if (it.second.new_swarm_member) {
-            it.second.new_swarm_member = false;
-            result.insert(pk);
+        if (it.second.status == SwarmMemberStatus::Ready) {
+            const crypto::legacy_pubkey& pk = it.first;
+            if (it.second.new_swarm_member) {
+                it.second.new_swarm_member = false;
+                result.insert(pk);
+            }
         }
     }
 
@@ -267,6 +266,6 @@ void Swarm::set_member_contact_details_ready(const crypto::legacy_pubkey& pk) {
     auto it = members_.find(pk);
     assert(it != members_.end());
     if (it != members_.end())
-        it->second.status = SwarmMemberStatus::ContactDetailsReady;
+        it->second.status = SwarmMemberStatus::Ready;
 }
 }  // namespace oxenss::snode

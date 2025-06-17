@@ -148,11 +148,12 @@ class ServiceNode {
 
     std::thread retryable_requests_thread;
 
-    // The time point at which the next swarm member check should be executed
-    std::chrono::steady_clock::time_point swarm_member_check_deadline = {};
-
+    // The hash of the last swarms blob that was serialised, used for dirty checks before storing to
+    // the DB.
     uint64_t last_swarms_serialize_hash = 0;
 
+    // The hash of the last retryable requsts blob that was serialised, used for dirty checks before
+    // storing to the DB.
     uint64_t last_retryable_serialize_hash = 0;
 
     void send_notifies(message m);

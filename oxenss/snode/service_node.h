@@ -92,11 +92,6 @@ struct RequestRetry {
     std::vector<RequestRetryEntry> nodes;
 };
 
-struct SerialiseRetryableRequestsResult {
-    SerialiseBTResult bt;
-    std::vector<RequestRetry> retryable_requests;
-};
-
 struct SerialiseSwarmsResult {
     SerialiseBTResult bt;
     std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;

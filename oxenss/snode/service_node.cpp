@@ -48,6 +48,11 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
+struct SerialiseRetryableRequestsResult {
+    SerialiseBTResult bt;
+    std::vector<RequestRetry> retryable_requests;
+};
+
 static SerialiseRetryableRequestsResult serialize_retryable_requests(
         Serialise serialise, std::string_view read_data, std::span<RequestRetry> write_data) {
     SerialiseRetryableRequestsResult result = {};
@@ -62,7 +67,7 @@ static SerialiseRetryableRequestsResult serialize_retryable_requests(
     constexpr std::string_view REQ_PAYLOAD_KEY = "r";
     constexpr std::string_view CREATE_TIME_KEY = "t";
     constexpr std::string_view NODES_KEY = "u";
-    assert(COMMAND_KEY < CREATE_TIME_KEY);
+    assert(COMMAND_KEY < REQ_PAYLOAD_KEY);
     assert(REQ_PAYLOAD_KEY < CREATE_TIME_KEY);
     assert(CREATE_TIME_KEY < NODES_KEY);
 
@@ -276,24 +281,37 @@ SerialiseSwarmsResult ServiceNode::serialize_swarms(Serialise serialise, std::st
             }
 
             if (result.bt.read_error.empty()) {
-                try {  // Network swarms
-                    auto [key, network_swarm_list] = d.next_list_consumer();
+                // Initially a dummy list that we will std::move the real list into
+                oxenc::bt_list_consumer swarm_list("l");
+                try {
+                    auto [key, list] = d.next_list_consumer();
                     assert(key == NETWORK_SWARMS_KEY);
+                    swarm_list = std::move(list);
+                } catch (const std::exception& e) {
+                    result.bt.read_error = "Failed to parse network swarms: {}"_format(e.what());
+                }
 
-                    while (!network_swarm_list.is_finished()) {
-                        auto swarm = network_swarm_list.consume_list_consumer();
-                        uint64_t swarm_id = swarm.consume<uint64_t>();
-
-                        std::set<crypto::legacy_pubkey>& keys = result.network_swarms[swarm_id];
-                        while (!swarm.is_finished()) {
-                            auto bytes = swarm.consume<std::string_view>();
-                            keys.insert(keys.end(), crypto::legacy_pubkey::from_bytes(bytes));
-                        }
+                while (result.bt.read_error.empty() && !swarm_list.is_finished()) {
+                    auto swarm = swarm_list.consume_list_consumer();
+                    uint64_t swarm_id = 0;
+                    try {
+                        swarm_id = swarm.consume<uint64_t>();
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to parse swarm id from swarm list: {}"_format(e.what());
+                        continue;
                     }
 
-                } catch (const std::exception& e) {
-                    result.bt.read_error =
-                            "Failed to parse network swarms: {}"_format(e.what());
+                    std::set<crypto::legacy_pubkey>& keys = result.network_swarms[swarm_id];
+                    while (result.bt.read_error.empty() && !swarm.is_finished()) {
+                        try {
+                            auto bytes = swarm.consume<std::string_view>();
+                            keys.insert(keys.end(), crypto::legacy_pubkey::from_bytes(bytes));
+                        } catch (const std::exception& e) {
+                            result.bt.read_error =
+                                    "Failed to parse swarm pubkey from swarm: {}"_format(e.what());
+                        }
+                    }
                 }
             }
 
@@ -307,17 +325,24 @@ SerialiseSwarmsResult ServiceNode::serialize_swarms(Serialise serialise, std::st
             }
 
             if (result.bt.read_error.empty()) {
-                try {  // Swarm members
+                oxenc::bt_list_consumer swarm_members("l");
+                try {
                     auto [key, list] = d.next_list_consumer();
                     assert(key == SWARM_MEMBERS_KEY);
-
-                    while (!list.is_finished()) {
-                        auto bytes = list.consume<std::string_view>();
-                        result.swarm_members[crypto::legacy_pubkey::from_bytes(bytes)];
-                    }
+                    swarm_members = std::move(list);
                 } catch (const std::exception& e) {
                     result.bt.read_error =
                             "Failed to parse swarm members: {}"_format(e.what());
+                }
+
+                while (result.bt.read_error.empty() && !swarm_members.is_finished()) {
+                    try {
+                        auto bytes = swarm_members.consume<std::string_view>();
+                        result.swarm_members[crypto::legacy_pubkey::from_bytes(bytes)];
+                    } catch (const std::exception& e) {
+                        result.bt.read_error =
+                                "Failed to parse swarm member from list: {}"_format(e.what());
+                    }
                 }
             }
         }

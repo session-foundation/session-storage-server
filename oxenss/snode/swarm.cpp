@@ -129,6 +129,8 @@ SwarmEvents Swarm::update_swarms(
     std::lock_guard lock{network.mut_};
 
     auto events = derive_swarm_events(height, swarms);
+    if (db_was_initially_empty_with_swarm_id == INVALID_SWARM_ID)
+        db_was_initially_empty_with_swarm_id = events.our_swarm_id;
 
     if (events.our_swarm_id != INVALID_SWARM_ID) {
         for (const auto& pk : events.new_swarm_members)
@@ -145,29 +147,62 @@ SwarmEvents Swarm::update_swarms(
                 it++;
         }
 
-        // Add members from the swarm that are missing from our runtime state
+        // TODO: Remove the versions checks below after everyone migrates their SQL DB to v1. The
+        // version checks gate the new behaviour where this SS will request a dump of the swarm
+        // member's DB to synchronise new messages.
+        //
+        // When a SS upgrades to this version, their DB is initially set to v0 and all the prior
+        // active service nodes that upgrade will have the chain synchronised and their SS's sitting
+        // in the correct swarm. We do _not_ want those storage servers to, on upgrade, request a DB
+        // dump of all the messages from each swarm peer as they are (presumably) relatively synced.
+        //
+        // The SS's on v0 don't persist the swarm state to the DB, so on startup they always
+        // re-bootstrap the state of their swarms. This populates the new-swarm-members array and
+        // hence triggers the extraneous swarm dump.
+        //
+        // The version gate protects against that happening to all the individual nodes on upgrade.
+        // Once all v0 SS's upgrade, the DB will be marked v1. From that point, swarms are persisted
+        // onto disk and so any SS's that appear in the new-swarm-members array is _actually_ a new
+        // SS and we _should_ request a DB a dump from them to synchronise messages they might have
+        // for us.
+        //
+        // New incoming nodes in general are going to end up having 0 messages for us if they are
+        // joining the network for the first time.
+        //
+        // If we are joining a swarm, then, all the members of the swarm are in the
+        // new-swarm-members array and we will request a DB dump from them.
+        //
+        // In a swarm dissolving case, then, these new nodes will have a chunk of messages in the
+        // adjacent message space that belong to this swarm they are merging into. That is handled
+        // here.
+
+        // Add members from the swarm that are missing from our runtime state and request a DB dump
+        // from them to ensure we have all the messages they have that we don't.
         for (auto it : events.new_swarm_members) {
             auto& pair = members_[it];
+            if (oxenss::tmp_init_db_version == 1) {
+                if (pair.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil)
+                    pair.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
+            }
+        }
 
-            // TODO: Remove this after everyone migrates their DB version to v1. v1 is when we
-            // started making the nodes store the swarm list and their swarm members to the DB to
-            // persist on restart.
-            //
-            // Before this, on startup they would consider all the nodes in the swarm they loaded
-            // from get_service_nodes as joining the swarm and perform a full message DB dump.
-            // Deploying this onto a live network would cause all the nodes to do a DB dump to each
-            // other the moment they upgraded.
-            //
-            // However after they upgrade and start persisting the swarm state to disk, from that
-            // point onwards they will correctly identify nodes that are leaving and joining their
-            // swarm and only do a message dump when necessary.
-            if (oxenss::tmp_init_db_version == 0) {
-                pair.new_swarm_member = false;  // Prevent the swarm DB dump on newly migrated nodes
-            } else {
-                pair.new_swarm_member = true;
+        // If the DB was empty on startup then we mark all swarm members as peers that we need to
+        // request a DB dump from. Note we only do this if the swarm matches the initial swarm we
+        // were in when the DB was queried. We might have changed swarms since startup, in which
+        // case, the above branch will already initiate a DB dump request for us.
+        //
+        // This also covers the case where someone drops the messages table and restarts the SS, we
+        // need to resync all the messages from everyone in the swarm.
+        if (oxenss::tmp_init_db_version == 1) {
+            if (db_was_initially_empty_with_swarm_id == events.our_swarm_id) {
+                for (auto& it : members_) {
+                    if (it.second.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil)
+                        it.second.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
+                }
             }
         }
     }
+
     oxenss::tmp_init_db_version = 1;  // Disable after the first swarm update
 
     cur_swarm_id_ = events.our_swarm_id;
@@ -218,6 +253,13 @@ std::optional<SwarmMemberState> Swarm::is_member(const crypto::ed25519_pubkey& p
     return result;
 }
 
+SwarmMemberState* Swarm::is_member_locked(const crypto::legacy_pubkey& pk) {
+    SwarmMemberState* result = nullptr;
+    if (auto it = members_.find(pk); it != members_.end())
+        result = &it->second;
+    return result;
+}
+
 size_t Swarm::size() const {
     std::shared_lock lock{network.mut_};
     return members_.size();
@@ -251,21 +293,13 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
     for (auto& it : members_) {
         if (it.second.status == SwarmMemberStatus::Ready) {
             const crypto::legacy_pubkey& pk = it.first;
-            if (it.second.new_swarm_member) {
-                it.second.new_swarm_member = false;
+            if (it.second.their_ss_needs_db_dump) {
+                it.second.their_ss_needs_db_dump = false;
                 result.insert(pk);
             }
         }
     }
 
     return result;
-}
-
-void Swarm::set_member_contact_details_ready(const crypto::legacy_pubkey& pk) {
-    std::lock_guard lock{network.mut_};
-    auto it = members_.find(pk);
-    assert(it != members_.end());
-    if (it != members_.end())
-        it->second.status = SwarmMemberStatus::Ready;
 }
 }  // namespace oxenss::snode

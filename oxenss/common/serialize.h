@@ -13,7 +13,7 @@ enum class Serialise {
 struct SerialiseBTResult {
     bool success;
     std::string write_payload;
-    std::string read_error;
+    std::string error;
 };
 
 constexpr uint64_t FNV1A64_SEED = 14695981039346656037ULL;

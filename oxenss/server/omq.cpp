@@ -11,6 +11,7 @@
 #include <oxenss/snode/service_node.h>
 #include <oxenss/snode/sn_test.h>
 #include <oxenss/utils/string_utils.hpp>
+#include <oxenss/snode/service_node.h>
 
 #include <oxenc/base64.h>
 #include <oxenc/bt_serialize.h>
@@ -45,7 +46,11 @@ std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
 }
 
 void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
-    log::debug(logcat, "[OMQ] handle sn.data_ready from: {}", message.conn.to_string());
+    log::debug(
+            logcat,
+            "[OMQ] handle sn.data_ready from: {} (parts {})",
+            message.conn.to_string(),
+            message.data.size());
 
     auto& xpk_str = message.conn.pubkey();
     if (xpk_str.size() != sizeof(crypto::x25519_pubkey))
@@ -55,6 +60,40 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
     if (!service_node_->is_swarm_peer(xpk))
         return message.send_reply("Swarm mismatch");
+
+    std::optional<oxenss::snode::contact> ct = service_node_->contacts().find(xpk);
+    if (!ct)
+        return message.send_reply("Contact info missing");
+
+    if (ct->version >= snode::SN_DATA_READY_WITH_REQUEST_VERSION) {
+        if (message.data.empty())
+            return message.send_reply("Request payload missing");
+
+        snode::SerialiseDataReadyRequestResult deserialised =
+                snode::serialise_data_ready_request(Serialise::Read, message.data[0], {});
+        if (!deserialised.bt.success)
+            return message.send_reply("Request payload malformed {}"_format(deserialised.bt.error));
+
+        const snode::DataReadyRequest& request = deserialised.request;
+        if (request.needs_db_dump)
+            service_node_->set_member_needs_db_dump(crypto::legacy_pubkey{ct->pubkey_ed25519});
+
+        if (auto level = log::Level::debug; log::get_level(logcat) <= level) {
+            std::string label;
+            if (deserialised.bt.success)
+                label = "rejected, bad request payload. {})"_format(deserialised.bt.error);
+            else
+                label = "rejected due to bad request args";
+
+            log::log(
+                    logcat,
+                    level,
+                    "sn.data ready processed (edpk: {}, db dump: {}): {}",
+                    ct->pubkey_ed25519,
+                    request.needs_db_dump,
+                    label);
+        }
+    }
 
     message.send_reply("OK");
 }

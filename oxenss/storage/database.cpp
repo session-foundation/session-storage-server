@@ -605,8 +605,17 @@ void Database::clean_expired() {
             to_epoch_ms(std::chrono::system_clock::now()));
 }
 
-int64_t Database::get_message_count() {
-    return get_impl(false)->prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
+int64_t Database::get_message_count(GetMessageCount get) {
+    int64_t result = 0;
+    switch (get) {
+        case GetMessageCount::All:
+            result = get_impl(false)->prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
+            break;
+        case GetMessageCount::Owned:
+            result = get_impl(false)->prepared_get<int64_t>("SELECT COUNT(*) FROM owned_messages");
+            break;
+    }
+    return result;
 }
 
 int64_t Database::get_owner_count() {

@@ -58,6 +58,7 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 // The storage server version at which initial handshaking is supported before attempting a swarm
 // message transfer.
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
+inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 10, 0}; // TODO: Bump the version
 
 class Swarm;
 
@@ -322,6 +323,12 @@ class ServiceNode {
     // Called when oxend notifies us of a new block to update swarm info
     void update_swarms(std::promise<bool>* on_completion = nullptr);
 
+    // Mark the swarm member identified by 'pk' as needing a dump of the DB. When the 'check new
+    // members' routine for swarms is periodically executed, swarm members marked with this flag
+    // will then get the entire DB synchronised to them. No-op if the key does not match anyone in
+    // the swarm.
+    void set_member_needs_db_dump(const crypto::legacy_pubkey& pk);
+
     server::OMQ& omq_server() { return omq_server_; }
 
     std::condition_variable retryable_requests_cv;
@@ -329,6 +336,17 @@ class ServiceNode {
     void retryable_requests_thread_entry_point();
 };
 
+struct DataReadyRequest {
+    bool needs_db_dump;
+};
+
+struct SerialiseDataReadyRequestResult {
+    SerialiseBTResult bt;
+    DataReadyRequest request;
+};
+
+SerialiseDataReadyRequestResult serialise_data_ready_request(
+        Serialise serialise, std::string_view read_data, const DataReadyRequest& write_data);
 }  // namespace oxenss::snode
 
 template <>

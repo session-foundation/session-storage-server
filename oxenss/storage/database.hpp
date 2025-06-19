@@ -108,8 +108,13 @@ class Database {
     // Retrieves all messages.
     std::vector<message> retrieve_all();
 
+    enum class GetMessageCount {
+        All,
+        Owned, // Only messages that belong to this node's swarm
+    };
+
     // Return the total number of messages stored
-    int64_t get_message_count();
+    int64_t get_message_count(GetMessageCount get);
 
     // Returns the per-owner counts of stored messages, for storage statistics purposes.
     std::vector<int> get_message_counts();

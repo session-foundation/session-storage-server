@@ -34,13 +34,26 @@ enum struct SwarmMemberStatus {
     Ready,
 };
 
+enum struct SwarmRequestedDBDump {
+    Nil,
+    NeedsToRequest,
+    RequestUnderway,
+    Done,
+};
+
 struct SwarmMemberState {
     SwarmMemberStatus status;
 
-    // Set if this member joined the swarm. They are assumed to not have any of the messages for
-    // the swarm yet so a full DB dump will be initiated for messages we own that belong to the
-    // swarm.
-    bool new_swarm_member;
+    // Flags for if our storage server needs to initiate a request to receive a DB dump from this
+    // member. 'Nil' if no action is to be taken, otherwise this flag transition from
+    // 'NeedsToRequest' to 'RequestUnderway' to 'Done' via the outgoing data ready handshake.
+    SwarmRequestedDBDump our_ss_requested_db_dump;
+
+    // Set if this swarm member has requested a DB dump from us in the data ready handshake. If set
+    // they are assumed to not have any of the messages for the swarm yet so a full DB dump will be
+    // initiated for messages we own that belong to the swarm when the 'check new members' routine
+    // occurs.
+    bool their_ss_needs_db_dump;
 
     // The earliest timestamp at which the swarm will check if they have received contact
     // information for this member yet and can send them data. Only utilised when status is
@@ -63,6 +76,19 @@ class Swarm {
             members_;  // includes `our_pk`, when we are in a swarm.
 
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
+
+    // Track if the DB was empty on startup. It is important to remember this on startup because
+    // if you were active, you may start receiving messages before the server contacts peers to
+    // request a swarm DB dump to synchronise messages which would seed the database and checking
+    // this later would fail.
+    bool db_was_initially_empty = false;
+
+    // Track which swarm we were set to when we determined that the DB was empty. This helps track
+    // which set of peers we should attempt to request a DB dump from since swarms may change during
+    // that asynchronous process. If the swarm does change, the act of joining a new swarm triggers
+    // a DB dump which invalidates the need to request a DB dump from our initial but now,
+    // irrelevant swarm peers, identified by this swarm ID.
+    swarm_id_t db_was_initially_empty_with_swarm_id = INVALID_SWARM_ID;
 
   public:
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :
@@ -94,6 +120,11 @@ class Swarm {
     std::optional<SwarmMemberState> is_member(const crypto::x25519_pubkey& pk) const;
     std::optional<SwarmMemberState> is_member(const crypto::ed25519_pubkey& pk) const;
 
+    // Returns the underlying swarm member's state. Returns a null pointer if 'pk' is not a member
+    // in your swarm. Caller must hold a lock on the network mutex to call this and the pointer is
+    // only valid whilst that lock remains held.
+    SwarmMemberState* is_member_locked(const crypto::legacy_pubkey& pk);
+
     // Returns the size of this swarm (including this node).
     size_t size() const;
 
@@ -105,11 +136,6 @@ class Swarm {
     // Returns the pubkeys of any new swarm members that have joined that we now have contact
     // details for, mark them as ready and need a dump of the DB.
     std::set<crypto::legacy_pubkey> extract_contacts_needing_db_dump();
-
-    // Marks a pending member as ready, so that it is returned by the next call to
-    // `extract_contact_details_ready_members()`, and is no longer returned by
-    // `extract_contract_details_pending_member()`.
-    void set_member_contact_details_ready(const crypto::legacy_pubkey& pk);
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

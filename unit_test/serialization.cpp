@@ -1,9 +1,11 @@
 #include <oxenss/snode/serialization.h>
 #include <oxenss/snode/service_node.h>
 #include <oxenc/hex.h>
+#include <oxenss/utils/string_utils.hpp>
 
 #include <catch2/catch.hpp>
 
+#include <fmt/chrono.h>
 #include <chrono>
 #include <string>
 
@@ -64,9 +66,41 @@ TEST_CASE("v1 serialization - batch serialization", "[serialization]") {
     auto first = serialized.front();
     const size_t num_messages = (SERIALIZATION_BATCH_SIZE / (serialized.front().size() - 2)) + 1;
     msgs = {num_messages, msgs.front()};
-    serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
+    serialized = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
     CHECK(serialized.size() == 1);
     msgs.push_back(msgs.front());
-    serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
+    serialized = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
     CHECK(serialized.size() == 2);
+}
+
+TEST_CASE("v1 serialization - message payload 10GiB", "[serialization]") {
+    oxenss::user_pubkey pub_key;
+    REQUIRE(pub_key.load("054368520005786b249bcd461d28f75e560ea794014eeb17fcf6003f37d876783e"s));
+
+    const std::chrono::system_clock::time_point timestamp{1'622'576'077s};
+    oxenss::message base_msg{
+            pub_key,
+            "hash",
+            oxenss::namespace_id::Default,
+            timestamp,
+            timestamp + 24h,
+            std::string(1 * 1024 * 1024 /*1MiB*/, 'x')};
+    std::vector<oxenss::message> msg_list(10'000, base_msg); // 10 GiB total
+
+    auto begin = std::chrono::high_resolution_clock::now();
+    auto serialized = serialize_messages(msg_list.begin(), msg_list.end(), SERIALIZATION_VERSION_BT);
+    auto elapsed = std::chrono::high_resolution_clock::now() - begin;
+
+    size_t total_bytes          = msg_list.size() * base_msg.data.size();
+    std::string total_bytes_str = oxenss::util::get_human_readable_bytes(total_bytes);
+    double total_gbs            = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
+    double gbs_per_s =
+            total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+    fmt::println(
+            "Messages: {}; Size: {}; Elapsed: {}; Rate: {:.2f} GiB/s",
+            msg_list.size(),
+            oxenss::util::get_human_readable_bytes(total_bytes),
+            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed),
+            gbs_per_s);
 }

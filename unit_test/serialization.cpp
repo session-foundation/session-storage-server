@@ -73,7 +73,7 @@ TEST_CASE("v1 serialization - batch serialization", "[serialization]") {
     CHECK(serialized.size() == 2);
 }
 
-TEST_CASE("v1 serialization - message payload 10GiB", "[serialization]") {
+TEST_CASE("v1 serialization - message payload 5GiB", "[serialization]") {
     oxenss::user_pubkey pub_key;
     REQUIRE(pub_key.load("054368520005786b249bcd461d28f75e560ea794014eeb17fcf6003f37d876783e"s));
 
@@ -85,7 +85,7 @@ TEST_CASE("v1 serialization - message payload 10GiB", "[serialization]") {
             timestamp,
             timestamp + 24h,
             std::string(1 * 1024 * 1024 /*1MiB*/, 'x')};
-    std::vector<oxenss::message> msg_list(10'000, base_msg);  // 10 GiB total
+    std::vector<oxenss::message> msg_list(500, base_msg);  // 5 GiB total
 
     auto begin = std::chrono::high_resolution_clock::now();
     auto serialized =

@@ -110,7 +110,7 @@ class Database {
 
     enum class GetMessageCount {
         All,
-        Owned, // Only messages that belong to this node's swarm
+        Owned,  // Only messages that belong to this node's swarm
     };
 
     // Return the total number of messages stored

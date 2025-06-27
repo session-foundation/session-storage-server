@@ -362,7 +362,7 @@ SerialiseSwarmsResult ServiceNode::serialize_swarms(
                     result.swarm_cur_swarm_id = d.require<uint64_t>(SWARM_CUR_SWARM_ID);
                 } catch (const std::exception& e) {
                     result.bt.error =
-                            "Failed to swarm's current swarm ID: {}"_format(e.what());
+                            "Failed to parse swarm's current swarm ID: {}"_format(e.what());
                 }
             }
 
@@ -1205,7 +1205,7 @@ void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
 }
 
 void ServiceNode::set_member_needs_db_dump(const crypto::legacy_pubkey& pk) {
-    std::lock_guard lock{network().mut_}; // Use the same lock as Swarm member functions
+    std::lock_guard lock{network().mut_};  // Use the same lock as Swarm member functions
     if (SwarmMemberState* state = swarm_.is_member_locked(pk); state)
         state->their_ss_needs_db_dump = true;
 }

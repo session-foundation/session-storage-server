@@ -58,7 +58,7 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 // The storage server version at which initial handshaking is supported before attempting a swarm
 // message transfer.
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
-inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 10, 0}; // TODO: Bump the version
+inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 11, 0};
 
 class Swarm;
 

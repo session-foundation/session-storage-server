@@ -85,15 +85,16 @@ TEST_CASE("v1 serialization - message payload 10GiB", "[serialization]") {
             timestamp,
             timestamp + 24h,
             std::string(1 * 1024 * 1024 /*1MiB*/, 'x')};
-    std::vector<oxenss::message> msg_list(10'000, base_msg); // 10 GiB total
+    std::vector<oxenss::message> msg_list(10'000, base_msg);  // 10 GiB total
 
     auto begin = std::chrono::high_resolution_clock::now();
-    auto serialized = serialize_messages(msg_list.begin(), msg_list.end(), SERIALIZATION_VERSION_BT);
+    auto serialized =
+            serialize_messages(msg_list.begin(), msg_list.end(), SERIALIZATION_VERSION_BT);
     auto elapsed = std::chrono::high_resolution_clock::now() - begin;
 
-    size_t total_bytes          = msg_list.size() * base_msg.data.size();
+    size_t total_bytes = msg_list.size() * base_msg.data.size();
     std::string total_bytes_str = oxenss::util::get_human_readable_bytes(total_bytes);
-    double total_gbs            = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
+    double total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
     double gbs_per_s =
             total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 

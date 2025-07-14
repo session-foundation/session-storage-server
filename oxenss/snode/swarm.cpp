@@ -193,11 +193,12 @@ SwarmEvents Swarm::update_swarms(
         //
         // This also covers the case where someone drops the messages table and restarts the SS, we
         // need to resync all the messages from everyone in the swarm.
-        if (oxenss::tmp_init_db_version == 1) {
-            if (db_was_initially_empty_with_swarm_id == events.our_swarm_id) {
-                for (auto& it : members_) {
-                    if (it.second.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil)
-                        it.second.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
+        if (db_was_initially_empty_with_swarm_id == events.our_swarm_id &&
+            !db_was_initially_empty_handled) {
+            db_was_initially_empty_handled = true;
+            for (auto& it : members_) {
+                if (it.second.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil) {
+                    it.second.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
                 }
             }
         }

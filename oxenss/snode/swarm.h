@@ -77,18 +77,19 @@ class Swarm {
 
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
-    // Track if the DB was empty on startup. It is important to remember this on startup because
-    // if you were active, you may start receiving messages before the server contacts peers to
-    // request a swarm DB dump to synchronise messages which would seed the database and checking
-    // this later would fail.
-    bool db_was_initially_empty = false;
-
     // Track which swarm we were set to when we determined that the DB was empty. This helps track
     // which set of peers we should attempt to request a DB dump from since swarms may change during
     // that asynchronous process. If the swarm does change, the act of joining a new swarm triggers
     // a DB dump which invalidates the need to request a DB dump from our initial but now,
     // irrelevant swarm peers, identified by this swarm ID.
+    //
+    // It is important to remember this on startup because if you were active, you may start
+    // receiving messages before the server contacts peers to request a swarm DB dump to synchronise
+    // messages which would seed the database and checking this later would fail.
     swarm_id_t db_was_initially_empty_with_swarm_id = INVALID_SWARM_ID;
+
+    // Flag that stops the DB initially empty w/ swarm ID from executing more than once.
+    bool db_was_initially_empty_handled = false;
 
   public:
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :

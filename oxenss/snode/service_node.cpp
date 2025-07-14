@@ -454,8 +454,6 @@ ServiceNode::ServiceNode(
     // where there _are_ 0 messages, this will request a DB dump of 0 messages and essentially
     // no-op.
     if (db->get_message_count(Database::GetMessageCount::Owned) == 0) {
-        swarm_.db_was_initially_empty = true;
-
         // The 'cur_swarm_id' might be INVALID_SWARM_ID. This will be the case if the DB was deletd
         // (and so the blobs storing our swarms were also deleted). The swarm is then
         // bootstrapped to a proper swarm when we process the first handshake from a swarm member.

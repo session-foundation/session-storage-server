@@ -12,7 +12,10 @@ local submodule_update(submodules, chdir=null) =
   + std.join(' ', submodules);
 
 local submodules_top = ['external/cpr', 'external/uWebSockets', 'external/oxen-logging', 'external/SQLiteCpp', 'external/CLI11', 'external/nlohmann_json'];
-local submodules_nested = [{ path: 'external/uWebSockets', submodules: ['uSockets'] }];
+local submodules_nested = [
+  { path: 'external/uWebSockets', submodules: ['uSockets'] },
+  { path: 'external/oxen-logging', submodules: ['fmt', 'spdlog'] },
+];
 local submodules = {
   name: 'submodules',
   image: 'drone/git',

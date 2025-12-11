@@ -11,7 +11,7 @@ local submodule_update(submodules, chdir=null) =
   + ' submodule update --init --depth=1 --jobs=4 '
   + std.join(' ', submodules);
 
-local submodules_top = ['external/cpr', 'external/uWebSockets', 'external/oxen-logging', 'external/SQLiteCpp'];
+local submodules_top = ['external/cpr', 'external/uWebSockets', 'external/oxen-logging', 'external/SQLiteCpp', 'external/CLI11'];
 local submodules_nested = [{ path: 'external/uWebSockets', submodules: ['uSockets'] }];
 local submodules = {
   name: 'submodules',

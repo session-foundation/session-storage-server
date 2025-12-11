@@ -6,10 +6,23 @@ local apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -q';
 
 local repo_suffix = '/staging';  // can be /beta or /staging for non-primary repo deps
 
+local submodule_update(submodules, chdir=null) =
+  'git' + (if chdir == null then '' else ' -C ' + chdir)
+  + ' submodule update --init --depth=1 --jobs=4 '
+  + std.join(' ', submodules);
+
+local submodules_top = ['external/cpr', 'external/uWebSockets', 'external/oxen-logging', 'external/SQLiteCpp'];
+local submodules_nested = [{ path: 'external/uWebSockets', submodules: ['uSockets'] }];
 local submodules = {
   name: 'submodules',
   image: 'drone/git',
-  commands: ['git fetch --tags', 'git submodule update --init --recursive --depth=1'],
+  commands: [
+    'git fetch --tags',
+    submodule_update(submodules_top),
+  ] + [
+    submodule_update(chdir=x.path, submodules=x.submodules)
+    for x in submodules_nested
+  ],
 };
 
 local deb_pipeline(image, buildarch='amd64', debarch='amd64', jobs=6) = {
@@ -18,7 +31,7 @@ local deb_pipeline(image, buildarch='amd64', debarch='amd64', jobs=6) = {
   name: distro_name + ' (' + debarch + ')',
   platform: { arch: buildarch },
   steps: [
-    //submodules,
+    submodules,
     {
       name: 'build',
       image: image,
@@ -37,7 +50,7 @@ local deb_pipeline(image, buildarch='amd64', debarch='amd64', jobs=6) = {
         'cd debian',
         'eatmydata mk-build-deps -i -r --tool="' + apt_get_quiet + ' -o Debug::pkgProblemResolver=yes --no-install-recommends -y" control',
         'cd ..',
-        "eatmydata gbp buildpackage --git-no-pbuilder --git-builder='debuild --prepend-path=/usr/lib/ccache --preserve-envvar=CCACHE_*' --git-upstream-tag=HEAD -us -uc -j" + jobs,
+        "eatmydata gbp buildpackage --git-no-pbuilder --git-builder='debuild --prepend-path=/usr/lib/ccache --preserve-envvar=CCACHE_*' --git-verbose --git-no-submodules --git-upstream-tag=HEAD -us -uc -j" + jobs,
         './debian/ci-upload.sh ' + distro + ' ' + debarch,
       ],
     },

@@ -22,6 +22,7 @@ endif
 
 override_dh_auto_configure:
 	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release \
+		-DMANUAL_SUBMODULES=ON \
 		$(DEB_CMAKE_ARCH_OPTIONS) \
 		-DOXENSS_VERSIONTAG=$(call dpkg_late_eval,OXENSS_VERSIONTAG,echo '$(DEB_VERSION)' | sed -e 's/.*-/-/')
 

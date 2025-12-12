@@ -1,3 +1,11 @@
+oxen-storage-server (2.11.2-2~deb12) bookworm; urgency=medium
+
+  * Speed up submodule cloning for deb build
+  * use external/CLI11 submodule with older distros
+  * Fix some versions of cli11 not liking ip= in config file
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 11 Dec 2025 20:04:45 -0400
+
 oxen-storage-server (2.11.2-1~deb12) bookworm; urgency=medium
 
   * Make both HTTPS and QUIC listen on IPv6

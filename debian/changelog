@@ -1,3 +1,11 @@
+oxen-storage-server (2.11.2-2~ubuntu2404) noble; urgency=medium
+
+  * add missing cli11-dev dep
+  * Speed up submodule cloning for deb build
+  * Fix some versions of cli11 not liking ip= in config file
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 11 Dec 2025 20:04:58 -0400
+
 oxen-storage-server (2.11.2-1~ubuntu2404) noble; urgency=medium
 
   * Make both HTTPS and QUIC listen on IPv6

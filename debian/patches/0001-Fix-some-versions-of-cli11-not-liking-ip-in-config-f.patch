@@ -1,0 +1,21 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Thu, 11 Dec 2025 19:53:06 -0400
+Subject: Fix some versions of cli11 not liking ip= in config file
+
+---
+ oxenss/daemon/command_line.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/oxenss/daemon/command_line.cpp b/oxenss/daemon/command_line.cpp
+index 7e4cdba..5400089 100644
+--- a/oxenss/daemon/command_line.cpp
++++ b/oxenss/daemon/command_line.cpp
+@@ -169,7 +169,7 @@ parse_result parse_cli_args(int argc, char* argv[]) {
+                "Deprecated port argument; use --https-port option instead")
+             ->capture_default_str()
+             ->type_name("PORT");
+-    cli.add_option("--bind-ip", options.ip_ignored, "Deprecated and ignored.");
++    cli.add_option("--bind-ip,--ip", options.ip_ignored, "Deprecated and ignored.");
+     cli.add_flag("--testnet", options.testnet, "Start storage server in testnet mode");
+     cli.add_flag(
+             "--force-start",

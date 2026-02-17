@@ -78,16 +78,15 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
         if (request.needs_db_dump)
             service_node_->set_member_needs_db_dump(crypto::legacy_pubkey{ct->pubkey_ed25519});
 
-        if (auto level = log::Level::debug; log::get_level(logcat) <= level) {
+        if (log::get_level(logcat) <= log::Level::debug) {
             std::string label;
             if (deserialised.bt.success)
                 label = "rejected, bad request payload. {})"_format(deserialised.bt.error);
             else
                 label = "rejected due to bad request args";
 
-            log::log(
+            log::debug(
                     logcat,
-                    level,
                     "sn.data ready processed (edpk: {}, db dump: {}): {}",
                     ct->pubkey_ed25519,
                     request.needs_db_dump,

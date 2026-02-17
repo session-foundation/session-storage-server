@@ -60,8 +60,6 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
 inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 11, 0};
 
-class Swarm;
-
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
         case SnodeStatus::UNSTAKED: return "Unstaked"sv;
@@ -114,6 +112,13 @@ class ServiceNode {
     std::string block_hash_;
     std::weak_ptr<http::Client> http_;
 
+  public:
+
+    // bit messy, but Swarm needs db startup version, so db has to init before Swarm
+    std::unique_ptr<Database> db;
+
+  private:
+
     SnodeStatus status_ = SnodeStatus::UNKNOWN;
 
     const crypto::legacy_keypair our_keys_;
@@ -121,7 +126,7 @@ class ServiceNode {
 
     Network network_;
 
-    Swarm swarm_{network_, our_keys_.pub};
+    Swarm swarm_;
 
     server::OMQ& omq_server_;
     std::vector<server::MQBase*> mq_servers_;
@@ -142,10 +147,6 @@ class ServiceNode {
 
     // Lock to be taken when interacting with the 'retryable_requests' queue
     mutable std::mutex retryable_requests_mutex;
-
-    // List of requests that will be re-attempted periodically through the
-    // 'retryable_requests_thread'
-    std::vector<RequestRetry> retryable_requests;
 
     std::thread retryable_requests_thread;
 
@@ -220,8 +221,6 @@ class ServiceNode {
 
     SerialiseSwarmsResult serialize_swarms(Serialise serialise, std::string_view read_data) const;
 
-    std::unique_ptr<Database> db;
-
     const Network& network() { return network_; }
 
     const Swarm& swarm() { return swarm_; }
@@ -231,9 +230,6 @@ class ServiceNode {
     const Contacts& contacts() const { return network_.contacts; }
 
     const contact& own_address() { return our_contact_; }
-
-    // Enqueue a request to be re-attempted
-    void add_retryable_request(RequestRetry&& item);
 
     // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
     // should not be added.
@@ -334,6 +330,8 @@ class ServiceNode {
     std::condition_variable retryable_requests_cv;
 
     void retryable_requests_thread_entry_point();
+
+    void check_retry_requests();
 };
 
 struct DataReadyRequest {

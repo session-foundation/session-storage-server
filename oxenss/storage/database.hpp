@@ -17,6 +17,7 @@
 #include <stack>
 #include <string>
 #include <vector>
+#include "oxenss/crypto/keys.h"
 
 namespace oxenss {
 
@@ -57,6 +58,9 @@ class Database {
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
+    // database version at startup (before any migration/upgrade)
+    int _startup_version = 0;
+
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
@@ -68,6 +72,8 @@ class Database {
     explicit Database(std::filesystem::path db_path);
 
     ~Database();
+
+    int startup_version() const { return _startup_version; }
 
     // if the database is full then print an error only once ever N errors
     static constexpr int DB_FULL_FREQUENCY = 100;
@@ -226,6 +232,19 @@ class Database {
 
     std::string runtime_state_blob(
             BlobType type, Serialise serialise, const std::string& write_blob);
+
+    // Adds a request retry to the database, to be retried later.  If req_id is specified, this
+    // is a subsequent failure on the same request.  It's not great to leak database table indices
+    // into the rest of the code if avoidable, but deduplication would be otherwise tedious.
+    int64_t add_retry_request(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id = 0);
+
+    // executes the provided callback for each request retry in the database which ready to retry.
+    // The table id is provided so the callback can call remove_retry_request on success.
+    void foreach_ready_retry_request(std::function<void(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id)>);
+
+    // Remove the specified request retry.  This is one node's retry request, not the request
+    // itself -- if no more nodes need the request retried it will be removed as well.
+    void remove_node_retry_request(int64_t req_id);
 };
 
 }  // namespace oxenss

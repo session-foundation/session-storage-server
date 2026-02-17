@@ -5,6 +5,7 @@
 
 #include "network.h"
 #include "oxenss/crypto/keys.h"
+#include "oxenss/storage/database.hpp"
 
 namespace oxenss::snode {
 
@@ -91,9 +92,13 @@ class Swarm {
     // Flag that stops the DB initially empty w/ swarm ID from executing more than once.
     bool db_was_initially_empty_handled = false;
 
+    Database& _db;
+
+    bool did_startup_version_check = false;
+
   public:
-    Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :
-            network{network}, our_pk{our_pk} {}
+    Swarm(Network& network, const crypto::legacy_pubkey& our_pk, Database& db) :
+            _db(db), network{network}, our_pk{our_pk} {}
 
     ~Swarm();
 

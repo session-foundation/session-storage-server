@@ -406,6 +406,7 @@ struct swarm_response {
     std::vector<snode::RequestRetryEntry> retry_nodes;
     std::string cmd;
     std::string req_payload;
+    int64_t db_req_id{0};
 };
 
 // Replies to a swarm request via its callback; sends an http::OK unless all of the
@@ -426,15 +427,6 @@ static void reply_or_fail(snode::ServiceNode& sn, const std::shared_ptr<swarm_re
     }
 
     res->cb(Response{res_code, std::move(res->result)});
-
-    if (res->retry_nodes.size()) {
-        snode::RequestRetry retry = {};
-        retry.nodes = std::move(res->retry_nodes);
-        retry.cmd = res->cmd;
-        retry.req_payload = std::move(res->req_payload);
-        retry.create_time = std::chrono::steady_clock::now();
-        sn.add_retryable_request(std::move(retry));
-    }
 }
 
 SNStorageCCResult interpret_sn_storage_cc_response_parts(
@@ -462,9 +454,6 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
     auto peers = sn.swarm().peers();
     res->pending += peers.size();
 
-    // When a request to a peer fails, set the initial retry to 1s in the future
-    constexpr auto default_retry_delay = 1s;
-
     for (auto& peer : peers) {
         auto ct = sn.contacts().find(peer.first);
         if (!ct || !*ct) {
@@ -476,18 +465,14 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                     ct ? "is non-contactable" : "not found");
             res->pending--;
 
-            snode::RequestRetryEntry entry = {};
-            entry.key = peer.first;
-            entry.reason = snode::RetryReason::NON_CONTACTABLE;
-            entry.deadline = std::chrono::steady_clock::now() + default_retry_delay;
-            res->retry_nodes.push_back(entry);
+            res->db_req_id = sn.db->add_retry_request(peer.first, res->cmd, res->req_payload, res->db_req_id);
             continue;
         }
 
         sn.omq_server()->request(
                 ct->pubkey_x25519.view(),
                 "sn.storage_cc",
-                [res, peer, peer_ed = ct->pubkey_ed25519, &sn, default_retry_delay](
+                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](
                         bool success, auto parts) {
                     json peer_result;
                     SNStorageCCResult store_result =
@@ -533,11 +518,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                                 peer_result.dump());
 
                         if (timeout) {
-                            snode::RequestRetryEntry entry = {};
-                            entry.key = peer.first;
-                            entry.reason = snode::RetryReason::FAILED_TO_SEND;
-                            entry.deadline = std::chrono::steady_clock::now() + default_retry_delay;
-                            res->retry_nodes.push_back(entry);
+                            res->db_req_id = sn.db->add_retry_request(peer.first, res->cmd, res->req_payload, res->db_req_id);
                         }
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");

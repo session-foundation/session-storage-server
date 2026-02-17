@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include "oxenss/crypto/keys.h"
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <sqlite3.h>
@@ -283,7 +284,7 @@ class DatabaseImpl {
     }
 
     void initialize_database() {
-        tmp_init_db_version = db.execAndGet("PRAGMA user_version").getInt();
+        parent._startup_version = db.execAndGet("PRAGMA user_version").getInt();
 
         if (!db.tableExists("owners")) {
             create_schema();
@@ -334,14 +335,71 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
             )");
         }
 
-        if (!db.tableExists("runtime_state")) {
-            log::info(logcat, "Upgrading database schema: adding runtime_state");
+        // use version for schema changes from now
+        if (parent._startup_version == 0) {
+            log::info(logcat,
+                "Upgrading database schema: adding runtime state and retryable requests");
             db.exec(R"(
-CREATE TABLE runtime_state (
-    swarms_blob BLOB,
-    retryable_requests_blob BLOB
+CREATE TABLE retry_requests (
+    id INTEGER PRIMARY KEY,
+    command TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    created DOUBLE PRECISION NOT NULL DEFAULT (unixepoch('now', 'subsec'))
 );
-INSERT INTO runtime_state VALUES (null, null);
+CREATE TABLE retry_pubkeys (
+    id INTEGER PRIMARY KEY,
+    pubkey BLOB NOT NULL,
+    UNIQUE(pubkey)
+);
+CREATE TABLE retry_node_requests (
+    id INTEGER PRIMARY KEY,
+    rr_id INTEGER NOT NULL REFERENCES retry_requests(id) ON DELETE CASCADE,
+    pk_id INTEGER NOT NULL REFERENCES retry_pubkeys(id) ON DELETE CASCADE,
+    next_retry DOUBLE PRECISION NOT NULL,
+    UNIQUE(rr_id, pk_id)
+);
+CREATE INDEX retry_node_requests_pk_idx ON retry_node_requests(pk_id);
+
+CREATE VIEW retry_node_reqs AS
+    SELECT retry_node_requests.id, retry_requests.command, retry_reqeusts.payload, retry_pubkeys.pubkey, next_retry
+    FROM retry_node_requests JOIN retry_requests ON rr_id = retry_requests.id JOIN retry_pubkeys ON pk_id = retry_pubkeys.id;
+
+CREATE TRIGGER retry_node_add
+INSTEAD OF INSERT ON retry_node_reqs
+BEGIN
+    -- Allows insertion into the view (with the raw pubkey value) to automatically do the pubkey
+    -- lookup (with autovivification) for you.
+    INSERT INTO retry_pubkeys (pubkey) VALUES (NEW.pubkey) ON CONFLICT(pubkey) DO NOTHING;
+    INSERT INTO retry_node_requests (rr_id, pk_id, next_retry)
+    VALUES (NEW.rr_id, (SELECT id FROM retry_pubkeys WHERE pubkey = NEW.pubkey), NEW.next_retry);
+END;
+
+CREATE TRIGGER rr_cleanup
+AFTER DELETE ON retry_node_requests
+BEGIN
+    -- After deleting a node request record this trigger handles cleaning up any pubkeys or request
+    -- commands that are no longer referenced.
+    DELETE FROM retry_pubkeys
+    WHERE id = OLD.pk_id
+        AND NOT EXISTS (
+            SELECT 1 FROM retry_node_requests WHERE pk_id = OLD.pk_id
+        );
+    DELETE FROM retry_requests
+    WHERE id = OLD.rr_id
+        AND NOT EXISTS (
+            SELECT 1 FROM retry_node_requests WHERE rr_id = OLD.rr_id
+        );
+END;
+
+-- Generic key->value store for the database
+-- in future, we may explicitly require TEXT for keys, but arbitrary type for values.
+-- store arbitrary persistent state, e.g. which swarm were we in before restart
+CREATE TABLE state_kv (
+    key TEXT NOT NULL,
+    value TEXT,
+    UNIQUE(key)
+);
+
 PRAGMA user_version = 1;
             )");
         }
@@ -1236,4 +1294,52 @@ std::string Database::runtime_state_blob(
     }
     return result;
 }
+
+int64_t Database::add_retry_request(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id) {
+    auto impl = get_impl(/*write =*/ true);
+
+    // insert into request table if not present
+    if (req_id == 0) {
+        req_id = impl->prepared_get<int64_t>(
+                "INSERT INTO retry_requests (command, payload) values (?,?) RETURNING id",
+                cmd,
+                payload
+                );
+    }
+
+    // first retry 5 seconds after insertion, subsequent retries will be 60 seconds after the last.
+    impl->prepared_exec("INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, unixepoch('now', 'subsec') + 5);", req_id, key.str());
+
+    return req_id;
+}
+
+void Database::foreach_ready_retry_request(std::function<void(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id)> callback) {
+    auto impl = get_impl(/*write =*/ true);
+
+    auto stmt = impl->prepared_st(
+                "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
+
+    using sql_duration = std::chrono::duration<double, std::ratio<1>>;
+    double now = std::chrono::duration_cast<sql_duration>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // retry 60 seconds after this retry.  Initial retries are staggered (5sec after timeout),
+    // but it doesn't seem useful to stagger here.  Further, it would be a pain to do so after
+    // restart.  Could update this time if/when the retry fails, but here seems more convenient.
+    auto next_time = now + 60;
+    while (stmt->executeStep()) {
+        auto [req_id, key_str, cmd, payload, next_retry] =
+                get<int64_t, std::string, std::string, std::string, double>(stmt);
+        auto key = crypto::legacy_pubkey::from_bytes(key_str);
+        impl->prepared_exec("UPDATE retry_nodes_requests SET next_retry = ?", next_time);
+
+        callback(key, cmd, payload, req_id);
+    }
+
+}
+
+void Database::remove_node_retry_request(int64_t req_id) {
+    auto impl = get_impl(/*write =*/ true);
+    impl->prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
+}
+
 }  // namespace oxenss

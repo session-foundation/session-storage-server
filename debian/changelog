@@ -1,3 +1,15 @@
+oxen-storage-server (2.11.3-1~deb13) trixie; urgency=medium
+
+  * Fix some versions of cli11 not liking ip= in config file
+  * fix contrib/onion-request debug build
+  * Remove unhelpful issue template
+  * Slim repo cloning & repo key updates
+  * Fix missing namespace on bulk message serialization
+  * bump drone to clang-19
+  * Rediff patches
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 03 Mar 2026 13:17:28 -0400
+
 oxen-storage-server (2.11.2-2~deb13) trixie; urgency=medium
 
   * add missing cli11-dev dep

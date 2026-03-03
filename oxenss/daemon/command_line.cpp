@@ -169,7 +169,7 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "Deprecated port argument; use --https-port option instead")
             ->capture_default_str()
             ->type_name("PORT");
-    cli.add_option("--bind-ip", options.ip_ignored, "Deprecated and ignored.");
+    cli.add_option("--bind-ip,--ip", options.ip_ignored, "Deprecated and ignored.");
     cli.add_flag("--testnet", options.testnet, "Start storage server in testnet mode");
     cli.add_flag(
             "--force-start",

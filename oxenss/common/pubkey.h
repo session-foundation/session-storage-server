@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace oxenss {
@@ -13,13 +14,13 @@ class user_pubkey {
     int network_ = -1;
     std::string pubkey_;
 
-    user_pubkey(int network, std::string raw_pk) : network_{network}, pubkey_{std::move(raw_pk)} {}
-
     friend class DatabaseImpl;
 
   public:
     // Default constructor; constructs an invalid pubkey
     user_pubkey() = default;
+
+    user_pubkey(int network, std::string raw_pk) : network_{network}, pubkey_{std::move(raw_pk)} {}
 
     // bool conversion: returns true if this object contains a valid pubkey
     explicit operator bool() const { return !pubkey_.empty(); }
@@ -56,6 +57,11 @@ class user_pubkey {
     // Returns an empty string for an invalid (default constructed) pubkey.
     std::string prefixed_raw() const;
 };
+
+
+/// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
+/// has a swarm id closest to this pubkey-derived value.
+uint64_t pubkey_to_swarm_space(const user_pubkey& pk);
 
 }  // namespace oxenss
 

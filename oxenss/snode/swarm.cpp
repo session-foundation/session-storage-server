@@ -207,6 +207,7 @@ SwarmEvents Swarm::update_swarms(
     }
 
     cur_swarm_id_ = events.our_swarm_id;
+    _db.update_current_swarm(cur_swarm_id_);
 
     network.update_swarms(std::move(swarms), new_contacts);
 

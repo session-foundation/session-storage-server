@@ -39,6 +39,7 @@ class Network {
 
     friend class ServiceNode;
 
+    std::pair<uint64_t, uint64_t> get_swarm_boundaries(const uint64_t swarm) const;
     swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
 
     // Cached value of the all_nodes_blob() return value.  The cache is cleared whenever swarms or
@@ -61,10 +62,6 @@ class Network {
 
     // Holds all current contact information for network nodes.
     Contacts contacts;
-
-    /// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
-    /// has a swarm id closest to this pubkey-derived value.
-    static uint64_t pubkey_to_swarm_space(const user_pubkey& pk);
 
     // Looks up the swarm for a pubkey and returns the swarm_id.  Returns nullopt on error (which
     // will only happen if there are no swarms at all).
@@ -99,6 +96,8 @@ class Network {
     // This value is cached and recomputed whenever swarms or contact info of any active node
     // changes.
     std::shared_ptr<std::vector<std::byte>> all_nodes_blob() const;
+
+    std::set<swarm_id_t> get_all_swarm_ids() const;
 };
 
 }  // namespace oxenss::snode

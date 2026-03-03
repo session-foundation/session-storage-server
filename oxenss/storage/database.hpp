@@ -141,9 +141,6 @@ class Database {
     // bound on actual stored size as there may be partially filled pages.
     int64_t get_used_bytes();
 
-    // Get random message. Returns nullopt if there are no messages.
-    std::optional<message> retrieve_random();
-
     // Get message by `msg_hash`, return true if found.  Note that this does *not* filter by
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
@@ -230,9 +227,6 @@ class Database {
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
 
-    std::string runtime_state_blob(
-            BlobType type, Serialise serialise, const std::string& write_blob);
-
     // Adds a request retry to the database, to be retried later.  If req_id is specified, this
     // is a subsequent failure on the same request.  It's not great to leak database table indices
     // into the rest of the code if avoidable, but deduplication would be otherwise tedious.
@@ -242,9 +236,20 @@ class Database {
     // The table id is provided so the callback can call remove_retry_request on success.
     void foreach_ready_retry_request(std::function<void(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id)>);
 
+    // executes the provided callback for every swarm message (in batches) for the swarm with the
+    // given swarm space boundaries.  The lower bound is exclusive; the upper inclusive.
+    // if the lower bound is higher than the upper bound (i.e. overflow wrapping), will be called
+    // recursively on both sides of the overflow.  In this case, zero as the lower bound *will*
+    // be inclusive
+    void foreach_swarm_message(std::function<void(const std::vector<message>&)> callback, uint64_t lower_bound, uint64_t upper_bound, bool zero_inclusive=false);
+
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);
+
+    void update_current_swarm(uint64_t swarm_id);
+
+    std::optional<uint64_t> get_current_swarm();
 };
 
 }  // namespace oxenss

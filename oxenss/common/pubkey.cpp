@@ -1,10 +1,22 @@
 #include "pubkey.h"
 #include "mainnet.h"
+#include "oxenc/endian.h"
 #include <oxenc/hex.h>
 #include <charconv>
 #include <cassert>
 
 namespace oxenss {
+
+uint64_t pubkey_to_swarm_space(const user_pubkey& pk) {
+    const auto bytes = pk.raw();
+    assert(bytes.size() == 32);
+
+    uint64_t res = 0;
+    for (size_t i = 0; i < bytes.size(); i += 8)
+        res ^= oxenc::load_big_to_host<uint64_t>(bytes.data() + i);
+
+    return res;
+}
 
 user_pubkey& user_pubkey::load(std::string_view pk) {
     if (pk.size() == USER_PUBKEY_SIZE_HEX && oxenc::is_hex(pk)) {

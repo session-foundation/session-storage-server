@@ -11,15 +11,45 @@ namespace oxenss::snode {
 
 Network::Network(oxenmq::OxenMQ& omq) : contacts{omq} {}
 
-uint64_t Network::pubkey_to_swarm_space(const user_pubkey& pk) {
-    const auto bytes = pk.raw();
-    assert(bytes.size() == 32);
+std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm) const {
+    if (swarms_.size() <= 1) return {0,0};
 
-    uint64_t res = 0;
-    for (size_t i = 0; i < bytes.size(); i += 8)
-        res ^= oxenc::load_big_to_host<uint64_t>(bytes.data() + i);
+    const auto it = swarms_.find(swarm);
+    if (it == swarms_.end())
+        throw std::logic_error{"This function should only be called with a current swarm id."};
 
-    return res;
+    // FIXME: this logic is a little weird, but should work.
+    uint64_t prev_swarm, next_swarm;
+    if (it == swarms_.begin()) {
+        next_swarm = std::next(it)->first;
+        prev_swarm = std::prev(swarms_.end())->first;
+    }
+    else {
+        prev_swarm = std::prev(it)->first;
+        auto it2 = std::next(it);
+        if (it2 == swarms_.end())
+            it2 = swarms_.begin();
+        next_swarm = it2->first;
+    }
+
+    // now have target swarm id, the one before it, and the one after it
+    //
+    // in the event of a distance tie in swarm space (e.g. id 1 and 7 with swarm space 4),
+    // the "right" (next) swarm loses.  This means when querying with what we return here,
+    // we should do x > lower_bound AND x <= upper_bound
+
+    // if there are only 2 swarms somehow, return the average and the average + 1<<63,
+    // with the average as the lower bound if target is the larger swarm id
+    if (prev_swarm == next_swarm) {
+        uint64_t avg = (swarm + prev_swarm) / 2;
+        uint64_t shift = (uint64_t)1<<63;
+        if (swarm > prev_swarm)
+            return {avg, avg + shift};
+        else
+            return {avg + shift, avg};
+    }
+
+    return {(swarm + prev_swarm)/2, (swarm + next_swarm)/2};
 }
 
 swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
@@ -151,6 +181,14 @@ std::shared_ptr<std::vector<std::byte>> Network::all_nodes_blob() const {
 
     all_nodes_blob_ = blob;
     return blob;
+}
+
+std::set<swarm_id_t> Network::get_all_swarm_ids() const {
+    std::set<swarm_id_t> ret;
+
+    for (const auto& [id, swarm] : swarms_)
+        ret.emplace(id);
+    return ret;
 }
 
 }  // namespace oxenss::snode

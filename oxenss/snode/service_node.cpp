@@ -231,6 +231,10 @@ ServiceNode::ServiceNode(
         all_stats_{*omq_server} {
     mq_servers_.push_back(&omq_server);
 
+    if (auto id = db->get_current_swarm()) {
+        swarm_.cur_swarm_id_ = *id;
+    }
+
     // Check if the DB was empty and remember if so for later when talking to swarm members on
     // handshake that we need to request a DB dump from them to populate our DB. In the edge case
     // where there _are_ 0 messages, this will request a DB dump of 0 messages and essentially
@@ -689,13 +693,16 @@ void ServiceNode::check_new_members() {
     }
 
     if (auto send_now = swarm_.extract_contacts_needing_db_dump(); !send_now.empty()) {
-        auto msgs = db->retrieve_all();
         log::debug(
                 logcat,
-                "Initiating swarm message dump ({} message) to swarm member(s): {}",
-                msgs.size(),
+                "Initiating swarm message dump to swarm member(s): {}",
                 fmt::join(send_now, ", "));
-        relay_messages(std::move(msgs), send_now);
+        auto boundaries = network_.get_swarm_boundaries(swarm_.cur_swarm_id_);
+        db->foreach_swarm_message([&send_now, this](const std::vector<message>& messages) {
+                relay_messages(messages, send_now);
+                },
+                boundaries.first,
+                boundaries.second);
     }
 }
 
@@ -805,8 +812,6 @@ static void store_swarms_blob_if_changed(
                     hash,
                     util::get_human_readable_bytes(serialise_result.bt.write_payload.size()));
             last_hash = hash;
-            db.runtime_state_blob(
-                    BlobType::Swarms, Serialise::Write, serialise_result.bt.write_payload);
         }
     } else {
         if (static bool once = true; once) {
@@ -1247,36 +1252,31 @@ void ServiceNode::report_reachability(
 void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) const {
     std::lock_guard guard(sn_mutex_);
 
-    if (swarms.empty())
+    const std::set<swarm_id_t>* swarms_ptr = &swarms;
+    std::optional<std::set<swarm_id_t>> all_swarms;
+
+    if (swarms.empty()) {
         log::info(logcat, "Bootstrapping all swarms");
-    else if (logcat->level() <= log::Level::info)
-        log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(swarms, ", "));
-
-    std::unordered_map<user_pubkey, swarm_id_t> pk_swarm_cache;
-    std::unordered_map<swarm_id_t, std::vector<message>> to_relay;
-
-    std::vector<message> all_msgs = db->retrieve_all();
-    log::debug(logcat, "We have {} messages", all_msgs.size());
-    for (auto& entry : all_msgs) {
-        if (!entry.pubkey) {
-            log::error(logcat, "Invalid pubkey in a message while bootstrapping other nodes");
-            continue;
+        all_swarms = network_.get_all_swarm_ids();
+        if (all_swarms->empty()) {
+            log::warning(logcat, "Bootstrapping all swarms, but there are none?");
+            return;
         }
-
-        auto [it, ins] = pk_swarm_cache.try_emplace(entry.pubkey);
-        if (ins)
-            it->second = network_.get_swarm_id_for(entry.pubkey).value_or(INVALID_SWARM_ID);
-        auto swarm_id = it->second;
-
-        if (swarms.empty() || swarms.count(swarm_id))
-            to_relay[swarm_id].push_back(std::move(entry));
+        swarms_ptr = &*all_swarms;
     }
+    else if (logcat->level() <= log::Level::info)
+        log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(*swarms_ptr, ", "));
 
-    log::trace(logcat, "Bootstrapping {} swarms", to_relay.size());
-
-    for (const auto& [swarm_id, items] : to_relay)
-        if (auto swarm = network_.get_swarm(swarm_id))
-            relay_messages(items, *swarm);
+    for (const auto& swarm_id : *swarms_ptr) {
+        if (auto swarm = network_.get_swarm(swarm_id)) {
+            auto boundaries = network_.get_swarm_boundaries(swarm_id);
+            db->foreach_swarm_message([&swarm, this](const std::vector<message>& messages) {
+                    relay_messages(messages, *swarm);
+                    },
+                    boundaries.first,
+                    boundaries.second);
+        }
+    }
 }
 
 void ServiceNode::relay_messages(

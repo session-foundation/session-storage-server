@@ -17,7 +17,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
     const std::chrono::system_clock::time_point timestamp{12'345'678ms};
     const auto expiry = timestamp + 3456s;
     std::vector<oxenss::message> msgs;
-    msgs.emplace_back(pub_key, hash, oxenss::namespace_id::Default, timestamp, expiry, data);
+    msgs.emplace_back(pub_key, hash, oxenss::namespace_id::UserProfile, timestamp, expiry, data);
     auto serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
     REQUIRE(serialized.size() == 1);
     const auto expected_serialized =
@@ -28,6 +28,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
             "i12345678e"              // timestamp
             "i15801678e"              // expiry
             "5:da\x00ta"              // data
+            "i2e"                     // namespace
             "e"s;
     CHECK(serialized.front() == "\x01l"s + expected_serialized + "e");
 
@@ -44,6 +45,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
         CHECK(messages[i].hash == hash);
         CHECK(messages[i].timestamp == timestamp);
         CHECK(messages[i].expiry == expiry);
+        CHECK(messages[i].msg_namespace == oxenss::namespace_id::UserProfile);
     }
 }
 
@@ -56,7 +58,7 @@ TEST_CASE("v1 serialization - batch serialization", "[serialization]") {
     const auto ttl = 24h;
     std::vector<oxenss::message> msgs;
     msgs.emplace_back(
-            pub_key, hash, oxenss::namespace_id::Default, timestamp, timestamp + ttl, data);
+            pub_key, hash, oxenss::namespace_id::GroupInfo, timestamp, timestamp + ttl, data);
     auto serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
     REQUIRE(serialized.size() == 1);
     auto first = serialized.front();

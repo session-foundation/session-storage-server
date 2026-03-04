@@ -48,169 +48,30 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
-struct SerialiseRetryableRequestsResult {
-    SerialiseBTResult bt;
-    std::vector<RequestRetry> retryable_requests;
-};
-
-SerialiseDataReadyRequestResult serialise_data_ready_request(
-        Serialise serialise, std::string_view read_data, const DataReadyRequest& write_data) {
-    SerialiseDataReadyRequestResult result = {};
-    uint32_t version = 0;
+// TODO: if these *are* going to be named constants rather than just existing in 2 places
+//       (where this is serialized and where it is deserialized), they should live in the header
+//       or something.
+namespace data_ready_req {
     constexpr std::string_view VERSION_KEY = "@";
     constexpr std::string_view STATUS_KEY = "s";
     constexpr std::string_view NEED_DB_DUMP_KEY = "t";
-    static_assert(VERSION_KEY < STATUS_KEY);
-    static_assert(STATUS_KEY < NEED_DB_DUMP_KEY);
+}  // namespace data_ready_req
 
-    if (serialise == Serialise::Write) {
-        oxenc::bt_dict_producer d;
-        d.append(VERSION_KEY, version);
-        d.append(NEED_DB_DUMP_KEY, write_data.needs_db_dump);
-        result.bt.write_payload = d.view();
-        result.bt.success = result.bt.error.empty();
-    } else {
-        if (read_data.size()) {
-            oxenc::bt_dict_consumer d{read_data};
-            try {
-                version = d.require<uint8_t>(VERSION_KEY);
-            } catch (const std::exception& e) {
-                result.bt.error =
-                        "Failed to parse sn data ready request version: {}"_format(e.what());
-            }
+std::string serialise_data_ready_request(bool needs_db_dump) {
+    uint32_t version = 0;
+    static_assert(data_ready_req::VERSION_KEY < data_ready_req::STATUS_KEY);
+    static_assert(data_ready_req::STATUS_KEY < data_ready_req::NEED_DB_DUMP_KEY);
 
-            if (result.bt.error.empty()) {
-                try {
-                    result.request.needs_db_dump = d.require<bool>(NEED_DB_DUMP_KEY);
-                } catch (const std::exception& e) {
-                    result.bt.error =
-                            "Failed to parse sn data ready db dump flag: {}"_format(e.what());
-                }
-            }
-        } else {
-            result.bt.error = "Failed to parse data ready payload: no bytes given";
-        }
-
-        result.bt.success = result.bt.error.empty();
-    }
-    return result;
+    oxenc::bt_dict_producer d;
+    d.append(data_ready_req::VERSION_KEY, version);
+    d.append(data_ready_req::NEED_DB_DUMP_KEY, needs_db_dump);
+    return std::move(d).str();
 }
 
-SerialiseSwarmsResult ServiceNode::serialize_swarms(
-        Serialise serialise, std::string_view read_data) const {
-    SerialiseSwarmsResult result = {};
-
-    constexpr std::string_view VERSION_KEY = "@";
-    constexpr std::string_view NETWORK_SWARMS_KEY = "network.swarms";
-    constexpr std::string_view SWARM_CUR_SWARM_ID = "swarm.cur_swarm_id";
-    constexpr std::string_view SWARM_MEMBERS_KEY = "swarm.members";
-
-    uint32_t version = 0;
-    if (serialise == Serialise::Write) {
-        oxenc::bt_dict_producer d;
-        d.append(VERSION_KEY, version);
-
-        {
-            oxenc::bt_list_producer network_swarm_list = d.append_list(NETWORK_SWARMS_KEY);
-            for (auto it : network_.swarms_) {
-                auto swarm = network_swarm_list.append_list();
-                swarm.append<uint64_t>(it.first);  // swarm_id_t
-
-                {  // Append list of pubkeys for this swarm
-                    for (const crypto::legacy_pubkey& pk : it.second)
-                        swarm.append<std::string_view>(pk.view());
-                }
-            }
-        }
-
-        d.append(SWARM_CUR_SWARM_ID, swarm_.cur_swarm_id_);
-
-        {  // Append list of _our_ swarm members
-            oxenc::bt_list_producer swarm_member_list = d.append_list(SWARM_MEMBERS_KEY);
-            for (auto it : swarm_.members_)
-                swarm_member_list.append(it.first);  // pk
-        }
-
-        result.bt.success = true;
-        result.bt.write_payload = d.view();
-    } else {
-        if (read_data.size()) {
-            oxenc::bt_dict_consumer d{read_data};
-            try {
-                version = d.require<uint8_t>(VERSION_KEY);
-            } catch (const std::exception& e) {
-                result.bt.error = "Failed to parse version: {}"_format(e.what());
-            }
-
-            if (result.bt.error.empty()) {
-                // Initially a dummy list that we will std::move the real list into
-                oxenc::bt_list_consumer swarm_list("l");
-                try {
-                    auto [key, list] = d.next_list_consumer();
-                    assert(key == NETWORK_SWARMS_KEY);
-                    swarm_list = std::move(list);
-                } catch (const std::exception& e) {
-                    result.bt.error = "Failed to parse network swarms: {}"_format(e.what());
-                }
-
-                while (result.bt.error.empty() && !swarm_list.is_finished()) {
-                    auto swarm = swarm_list.consume_list_consumer();
-                    uint64_t swarm_id = 0;
-                    try {
-                        swarm_id = swarm.consume<uint64_t>();
-                    } catch (const std::exception& e) {
-                        result.bt.error =
-                                "Failed to parse swarm id from swarm list: {}"_format(e.what());
-                        continue;
-                    }
-
-                    std::set<crypto::legacy_pubkey>& keys = result.network_swarms[swarm_id];
-                    while (result.bt.error.empty() && !swarm.is_finished()) {
-                        try {
-                            auto bytes = swarm.consume<std::string_view>();
-                            keys.insert(keys.end(), crypto::legacy_pubkey::from_bytes(bytes));
-                        } catch (const std::exception& e) {
-                            result.bt.error =
-                                    "Failed to parse swarm pubkey from swarm: {}"_format(e.what());
-                        }
-                    }
-                }
-            }
-
-            if (result.bt.error.empty()) {
-                try {
-                    result.swarm_cur_swarm_id = d.require<uint64_t>(SWARM_CUR_SWARM_ID);
-                } catch (const std::exception& e) {
-                    result.bt.error =
-                            "Failed to parse swarm's current swarm ID: {}"_format(e.what());
-                }
-            }
-
-            if (result.bt.error.empty()) {
-                oxenc::bt_list_consumer swarm_members("l");
-                try {
-                    auto [key, list] = d.next_list_consumer();
-                    assert(key == SWARM_MEMBERS_KEY);
-                    swarm_members = std::move(list);
-                } catch (const std::exception& e) {
-                    result.bt.error = "Failed to parse swarm members: {}"_format(e.what());
-                }
-
-                while (result.bt.error.empty() && !swarm_members.is_finished()) {
-                    try {
-                        auto bytes = swarm_members.consume<std::string_view>();
-                        result.swarm_members[crypto::legacy_pubkey::from_bytes(bytes)] = {};
-                    } catch (const std::exception& e) {
-                        result.bt.error =
-                                "Failed to parse swarm member from list: {}"_format(e.what());
-                    }
-                }
-            }
-        }
-        result.bt.success = result.bt.error.empty();
-    }
-
-    return result;
+bool deserialise_data_ready_request(std::string_view data) {
+    oxenc::bt_dict_consumer d{data};
+    auto version = d.require<uint8_t>(data_ready_req::VERSION_KEY);
+    return d.require<bool>(data_ready_req::NEED_DB_DUMP_KEY);
 }
 
 ServiceNode::ServiceNode(
@@ -239,7 +100,7 @@ ServiceNode::ServiceNode(
     // handshake that we need to request a DB dump from them to populate our DB. In the edge case
     // where there _are_ 0 messages, this will request a DB dump of 0 messages and essentially
     // no-op.
-    if (db->get_message_count(Database::GetMessageCount::Owned) == 0) {
+    if (db->get_message_count() == 0) {
         // The 'cur_swarm_id' might be INVALID_SWARM_ID. This will be the case if the DB was deletd
         // (and so the blobs storing our swarms were also deleted). The swarm is then
         // bootstrapped to a proper swarm when we process the first handshake from a swarm member.
@@ -658,33 +519,30 @@ void ServiceNode::check_new_members() {
 
         if (c->version >= SN_DATA_READY_WITH_REQUEST_VERSION) {
             // Build 'data ready' request
-            snode::DataReadyRequest request = {};
+            bool needs_db_dump{false};
             {
                 std::lock_guard network_lock{network().mut_};
                 if (SwarmMemberState* member = swarm_.is_member_locked(pk); member) {
                     SwarmRequestedDBDump& status = member->our_ss_requested_db_dump;
                     if (status == SwarmRequestedDBDump::NeedsToRequest) {
                         status = SwarmRequestedDBDump::RequestUnderway;
-                        request.needs_db_dump = true;
+                        needs_db_dump = true;
                     }
                 }
             }
 
             // Serialise our response and send it off
-            snode::SerialiseDataReadyRequestResult serialised =
-                    snode::serialise_data_ready_request(Serialise::Write, "", request);
-            assert(serialised.bt.success);
-
+            auto serialised = snode::serialise_data_ready_request(needs_db_dump);
             log::debug(
                     logcat,
                     "Initiating contact with new swarm member {}{}",
                     pk,
-                    request.needs_db_dump ? " (requesting DB dump)" : "");
+                    needs_db_dump ? " (requesting DB dump)" : "");
             omq_server_->request(
                     c->pubkey_x25519.view(),
                     "sn.data_ready",
                     on_sn_data_ready_response,
-                    std::move(serialised.bt.write_payload));
+                    std::move(serialised));
         } else {
             log::debug(logcat, "Initiating contact with new swarm member {}", pk);
             omq_server_->request(
@@ -796,40 +654,9 @@ void ServiceNode::save_bulk(const std::vector<message>& msgs) {
     log::trace(logcat, "saved messages count: {}", msgs.size());
 }
 
-static void store_swarms_blob_if_changed(
-        uint64_t block_height,
-        const SerialiseSwarmsResult& serialise_result,
-        Database& db,
-        uint64_t& last_hash) {
-    if (serialise_result.bt.success) {
-        uint64_t hash = fnv1a64_hasher(serialise_result.bt.write_payload, FNV1A64_SEED);
-        if (last_hash != hash) {
-            log::debug(
-                    logcat,
-                    "Swarm state dirtied at blk {}; #{:x} => #{:x}, saving {} to DB",
-                    block_height,
-                    last_hash,
-                    hash,
-                    util::get_human_readable_bytes(serialise_result.bt.write_payload.size()));
-            last_hash = hash;
-        }
-    } else {
-        if (static bool once = true; once) {
-            once = false;
-            log::error(
-                    logcat,
-                    "Failed to serialize swarms to blob: {}",
-                    serialise_result.bt.write_payload);
-        }
-    }
-}
-
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
     swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
-
-    snode::SerialiseSwarmsResult write = serialize_swarms(Serialise::Write, "");
-    store_swarms_blob_if_changed(block_height_, write, *db, last_swarms_serialize_hash);
 }
 
 void ServiceNode::on_snodes_update(block_update&& bu) {
@@ -871,10 +698,6 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
     }
 
     auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
-
-    // Serialise state to blob and store into DB if dirtied
-    snode::SerialiseSwarmsResult write = serialize_swarms(Serialise::Write, "");
-    store_swarms_blob_if_changed(block_height_, write, *db, last_swarms_serialize_hash);
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED
@@ -1446,7 +1269,7 @@ std::string ServiceNode::get_status_line() const {
             STORAGE_SERVER_VERSION_STRING,
             oxenss::is_mainnet ? "" : " (TESTNET)",
             syncing_ ? "; SYNCING" : "",
-            db->get_message_count(Database::GetMessageCount::All),
+            db->get_message_count(),
             util::get_human_readable_bytes(db->get_used_bytes()),
             db->get_owner_count(),
             stats.client_store_requests,

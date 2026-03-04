@@ -12,7 +12,6 @@
 
 #include <oxenss/crypto/keys.h>
 #include <oxenss/common/message.h>
-#include <oxenss/common/serialize.h>
 #include <oxenss/storage/database.hpp>
 #include "network.h"
 #include "swarm.h"
@@ -89,13 +88,6 @@ struct RequestRetry {
     uint64_t hash;
     std::chrono::steady_clock::time_point create_time;
     std::vector<RequestRetryEntry> nodes;
-};
-
-struct SerialiseSwarmsResult {
-    SerialiseBTResult bt;
-    std::map<crypto::legacy_pubkey, SwarmMemberState> swarm_members;
-    swarms_t network_swarms;
-    swarm_id_t swarm_cur_swarm_id;
 };
 
 /// All service node logic that is not network-specific
@@ -219,8 +211,6 @@ class ServiceNode {
             bool force_start,
             bool skip_bootstrap);
 
-    SerialiseSwarmsResult serialize_swarms(Serialise serialise, std::string_view read_data) const;
-
     const Network& network() { return network_; }
 
     const Swarm& swarm() { return swarm_; }
@@ -334,17 +324,9 @@ class ServiceNode {
     void check_retry_requests();
 };
 
-struct DataReadyRequest {
-    bool needs_db_dump;
-};
+// at the moment we only care about the "needs_db_dump" boolean
+bool deserialise_data_ready_request(std::string_view data);
 
-struct SerialiseDataReadyRequestResult {
-    SerialiseBTResult bt;
-    DataReadyRequest request;
-};
-
-SerialiseDataReadyRequestResult serialise_data_ready_request(
-        Serialise serialise, std::string_view read_data, const DataReadyRequest& write_data);
 }  // namespace oxenss::snode
 
 template <>

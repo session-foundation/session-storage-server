@@ -10,7 +10,6 @@
 #include <nlohmann/json_fwd.hpp>
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/oxenmq.h>
-#include <oxenss/common/serialize.h>
 
 namespace oxenss {
 

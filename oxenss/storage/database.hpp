@@ -1,7 +1,6 @@
 #pragma once
 
 #include <oxenss/common/subaccount_token.h>
-#include <oxenss/common/serialize.h>
 #include <oxenss/common/message.h>
 #include <oxenss/common/pubkey.h>
 
@@ -120,7 +119,7 @@ class Database {
     };
 
     // Return the total number of messages stored
-    int64_t get_message_count(GetMessageCount get);
+    int64_t get_message_count();
 
     // Returns the per-owner counts of stored messages, for storage statistics purposes.
     std::vector<int> get_message_counts();

@@ -69,28 +69,24 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
         if (message.data.empty())
             return message.send_reply("Request payload missing");
 
-        snode::SerialiseDataReadyRequestResult deserialised =
-                snode::serialise_data_ready_request(Serialise::Read, message.data[0], {});
-        if (!deserialised.bt.success)
-            return message.send_reply("Request payload malformed {}"_format(deserialised.bt.error));
+        bool needs_db_dump{false};
+        try {
+            needs_db_dump = snode::deserialise_data_ready_request(message.data[0]);
+        }
+        catch (const std::exception& e) {
+            log::info(logcat,  "DataReadyRequest deserialization error: {}", e.what());
+            return message.send_reply("Request payload malformed.");
+        }
 
-        const snode::DataReadyRequest& request = deserialised.request;
-        if (request.needs_db_dump)
+        if (needs_db_dump)
             service_node_->set_member_needs_db_dump(crypto::legacy_pubkey{ct->pubkey_ed25519});
 
         if (log::get_level(logcat) <= log::Level::debug) {
-            std::string label;
-            if (deserialised.bt.success)
-                label = "rejected, bad request payload. {})"_format(deserialised.bt.error);
-            else
-                label = "rejected due to bad request args";
-
             log::debug(
                     logcat,
-                    "sn.data ready processed (edpk: {}, db dump: {}): {}",
+                    "sn.data ready processed (edpk: {}, needs db dump: {})",
                     ct->pubkey_ed25519,
-                    request.needs_db_dump,
-                    label);
+                    needs_db_dump);
         }
     }
 

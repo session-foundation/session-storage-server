@@ -811,9 +811,22 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             owner_id = impl->prepared_get<int64_t>(
                     "INSERT INTO owners (pubkey, type) VALUES (?, ?) RETURNING id", msg.pubkey);
 
-        // When storing to a public namespace we clear anything there (except for a duplicate, to
-        // avoid unnecessary storage churn).
+        // When storing to a public namespace we replace any earlier message (except for a
+        // duplicate, to avoid unnecessary storage churn).  If the stored message is newer, return
+        // early
         if (is_public_outbox_namespace(msg.msg_namespace)) {
+            if (auto maybe_times = exec_and_maybe_get<int64_t, int64_t>(
+                        impl->prepared_st("SELECT timestamp, expiry FROM messages"
+                                          " WHERE owner = ? AND namespace = ?"),
+                        owner_id,
+                        msg.msg_namespace)) {
+                if (maybe_times->first > to_epoch_ms(msg.timestamp)) {
+                    log::trace(logcat, "Not storing message; newer public outbox message present.");
+                    if (expiry)
+                        *expiry = from_epoch_ms(maybe_times->second);
+                    return StoreResult::Obsolete;
+                }
+            }
             impl->prepared_exec(
                     "DELETE FROM messages"
                     " WHERE owner = ? AND namespace = ? AND hash != ?",

@@ -30,6 +30,7 @@ enum class StoreResult {
     New,       // Message did not exist and was inserted.
     Extended,  // Message existed, but the expiry was extended to match the stored timestamp.
     Exists,    // Message exists and already has an expiry >= the stored one.
+    Obsolete,  // Newer message exists and message type is singleton (e.g. public outbox)
     Full,      // Can't insert right now because the database is full.
 };
 

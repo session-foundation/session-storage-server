@@ -817,7 +817,8 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
         if (is_public_outbox_namespace(msg.msg_namespace)) {
             if (auto maybe_times = exec_and_maybe_get<int64_t, int64_t>(
                         impl->prepared_st("SELECT timestamp, expiry FROM messages"
-                                          " WHERE owner = ? AND namespace = ?"),
+                                          " WHERE owner = ? AND namespace = ?"
+                                          " ORDER BY timestamp DESC LIMIT 1;"),
                         owner_id,
                         msg.msg_namespace)) {
                 if (maybe_times->first > to_epoch_ms(msg.timestamp)) {

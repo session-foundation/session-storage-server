@@ -375,8 +375,8 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
         if (parent._startup_version == 0) {
             log::info(
                     logcat,
-                    "Upgrading database schema: adding swarm space cache, runtime state and "
-                    "retryable requests");
+                    "Upgrading database schema: adding swarm space cache, runtime state, "
+                    "retryable requests, and public namespace unique constraint");
 
             // swarm space is 64-bit unsigned, which means unfortunately we can't do queries
             // on it with arithmetic properly (sqlite INTEGER is 64-bit signed).  As such, we
@@ -470,6 +470,14 @@ CREATE TABLE state_kv (
     value TEXT,
     UNIQUE(key)
 );
+
+-- public namespaces are at most used for testing before this migration, so clear them before
+-- adding the unique owner/namespace index
+DELETE FROM messages WHERE namespace < 0 AND namespace % 20 = -1;
+
+CREATE UNIQUE INDEX message_outbox_singleton
+ON messages(owner, namespace)
+WHERE namespace < 0 AND namespace % 20 = -1;
 
 PRAGMA user_version = 1;
             )");
@@ -811,31 +819,6 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             owner_id = impl->prepared_get<int64_t>(
                     "INSERT INTO owners (pubkey, type) VALUES (?, ?) RETURNING id", msg.pubkey);
 
-        // When storing to a public namespace we replace any earlier message (except for a
-        // duplicate, to avoid unnecessary storage churn).  If the stored message is newer, return
-        // early
-        if (is_public_outbox_namespace(msg.msg_namespace)) {
-            if (auto maybe_times = exec_and_maybe_get<int64_t, int64_t>(
-                        impl->prepared_st("SELECT timestamp, expiry FROM messages"
-                                          " WHERE owner = ? AND namespace = ?"
-                                          " ORDER BY timestamp DESC LIMIT 1;"),
-                        owner_id,
-                        msg.msg_namespace)) {
-                if (maybe_times->first > to_epoch_ms(msg.timestamp)) {
-                    log::trace(logcat, "Not storing message; newer public outbox message present.");
-                    if (expiry)
-                        *expiry = from_epoch_ms(maybe_times->second);
-                    return StoreResult::Obsolete;
-                }
-            }
-            impl->prepared_exec(
-                    "DELETE FROM messages"
-                    " WHERE owner = ? AND namespace = ? AND hash != ?",
-                    owner_id,
-                    msg.msg_namespace,
-                    msg.hash);
-        }
-
         auto new_exp = to_epoch_ms(msg.expiry);
 
         if (auto existing = exec_and_maybe_get<int64_t, int64_t>(
@@ -852,15 +835,25 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             if (expiry)
                 *expiry = from_epoch_ms(exp);
         } else {
-            impl->prepared_exec(
+            auto rows = impl->prepared_exec(
                     "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
+                    " DO UPDATE SET"
+                    " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
+                    " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
+                    " WHERE EXCLUDED.timestamp > messages.timestamp;",
                     owner_id,
                     msg.hash,
                     msg.msg_namespace,
                     to_epoch_ms(msg.timestamp),
                     to_epoch_ms(msg.expiry),
                     blob_binder{msg.data});
+
+            // did not insert, which means public namespace and not newer
+            if (rows == 0)
+                return StoreResult::Obsolete;
+
             ret = StoreResult::New;
 
             if (expiry)
@@ -914,7 +907,11 @@ void Database::bulk_store(const std::vector<message>& items) {
     auto insert_message = impl->prepared_st(
             "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
             " VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT DO NOTHING");
+            " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
+            " DO UPDATE SET"
+            " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
+            " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
+            " WHERE EXCLUDED.timestamp > messages.timestamp;");
 
     for (auto& m : items) {
         if (!m.pubkey)

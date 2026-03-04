@@ -12,7 +12,8 @@ namespace oxenss::snode {
 Network::Network(oxenmq::OxenMQ& omq) : contacts{omq} {}
 
 std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm) const {
-    if (swarms_.size() <= 1) return {0,0};
+    if (swarms_.size() <= 1)
+        return {0, 0};
 
     const auto it = swarms_.find(swarm);
     if (it == swarms_.end())
@@ -23,8 +24,7 @@ std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm
     if (it == swarms_.begin()) {
         next_swarm = std::next(it)->first;
         prev_swarm = std::prev(swarms_.end())->first;
-    }
-    else {
+    } else {
         prev_swarm = std::prev(it)->first;
         auto it2 = std::next(it);
         if (it2 == swarms_.end())
@@ -42,14 +42,14 @@ std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm
     // with the average as the lower bound if target is the larger swarm id
     if (prev_swarm == next_swarm) {
         uint64_t avg = (swarm + prev_swarm) / 2;
-        uint64_t shift = (uint64_t)1<<63;
+        uint64_t shift = (uint64_t)1 << 63;
         if (swarm > prev_swarm)
             return {avg, avg + shift};
         else
             return {avg + shift, avg};
     }
 
-    return {(swarm + prev_swarm)/2, (swarm + next_swarm)/2};
+    return {(swarm + prev_swarm) / 2, (swarm + next_swarm) / 2};
 }
 
 swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {

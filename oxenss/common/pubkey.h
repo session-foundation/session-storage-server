@@ -58,7 +58,6 @@ class user_pubkey {
     std::string prefixed_raw() const;
 };
 
-
 /// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
 /// has a swarm id closest to this pubkey-derived value.
 uint64_t pubkey_to_swarm_space(const user_pubkey& pk);

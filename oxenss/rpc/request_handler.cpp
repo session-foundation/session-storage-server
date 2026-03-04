@@ -465,15 +465,15 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                     ct ? "is non-contactable" : "not found");
             res->pending--;
 
-            res->db_req_id = sn.db->add_retry_request(peer.first, res->cmd, res->req_payload, res->db_req_id);
+            res->db_req_id = sn.db->add_retry_request(
+                    peer.first, res->cmd, res->req_payload, res->db_req_id);
             continue;
         }
 
         sn.omq_server()->request(
                 ct->pubkey_x25519.view(),
                 "sn.storage_cc",
-                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](
-                        bool success, auto parts) {
+                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](bool success, auto parts) {
                     json peer_result;
                     SNStorageCCResult store_result =
                             interpret_sn_storage_cc_response_parts(success, parts);
@@ -518,7 +518,8 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                                 peer_result.dump());
 
                         if (timeout) {
-                            res->db_req_id = sn.db->add_retry_request(peer.first, res->cmd, res->req_payload, res->db_req_id);
+                            res->db_req_id = sn.db->add_retry_request(
+                                    peer.first, res->cmd, res->req_payload, res->db_req_id);
                         }
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");

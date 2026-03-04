@@ -72,9 +72,8 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
         bool needs_db_dump{false};
         try {
             needs_db_dump = snode::deserialise_data_ready_request(message.data[0]);
-        }
-        catch (const std::exception& e) {
-            log::info(logcat,  "DataReadyRequest deserialization error: {}", e.what());
+        } catch (const std::exception& e) {
+            log::info(logcat, "DataReadyRequest deserialization error: {}", e.what());
             return message.send_reply("Request payload malformed.");
         }
 

@@ -229,18 +229,30 @@ class Database {
     // Adds a request retry to the database, to be retried later.  If req_id is specified, this
     // is a subsequent failure on the same request.  It's not great to leak database table indices
     // into the rest of the code if avoidable, but deduplication would be otherwise tedious.
-    int64_t add_retry_request(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id = 0);
+    int64_t add_retry_request(
+            const crypto::legacy_pubkey& key,
+            const std::string& cmd,
+            const std::string& payload,
+            int64_t req_id = 0);
 
     // executes the provided callback for each request retry in the database which ready to retry.
     // The table id is provided so the callback can call remove_retry_request on success.
-    void foreach_ready_retry_request(std::function<void(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id)>);
+    void foreach_ready_retry_request(std::function<
+                                     void(const crypto::legacy_pubkey& key,
+                                          const std::string& cmd,
+                                          const std::string& payload,
+                                          int64_t req_id)>);
 
     // executes the provided callback for every swarm message (in batches) for the swarm with the
     // given swarm space boundaries.  The lower bound is exclusive; the upper inclusive.
     // if the lower bound is higher than the upper bound (i.e. overflow wrapping), will be called
     // recursively on both sides of the overflow.  In this case, zero as the lower bound *will*
     // be inclusive
-    void foreach_swarm_message(std::function<void(const std::vector<message>&)> callback, uint64_t lower_bound, uint64_t upper_bound, bool zero_inclusive=false);
+    void foreach_swarm_message(
+            std::function<void(const std::vector<message>&)> callback,
+            uint64_t lower_bound,
+            uint64_t upper_bound,
+            bool zero_inclusive = false);
 
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.

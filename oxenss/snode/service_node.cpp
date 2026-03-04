@@ -556,8 +556,9 @@ void ServiceNode::check_new_members() {
                 "Initiating swarm message dump to swarm member(s): {}",
                 fmt::join(send_now, ", "));
         auto boundaries = network_.get_swarm_boundaries(swarm_.cur_swarm_id_);
-        db->foreach_swarm_message([&send_now, this](const std::vector<message>& messages) {
-                relay_messages(messages, send_now);
+        db->foreach_swarm_message(
+                [&send_now, this](const std::vector<message>& messages) {
+                    relay_messages(messages, send_now);
                 },
                 boundaries.first,
                 boundaries.second);
@@ -1086,15 +1087,15 @@ void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) const {
             return;
         }
         swarms_ptr = &*all_swarms;
-    }
-    else if (logcat->level() <= log::Level::info)
+    } else if (logcat->level() <= log::Level::info)
         log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(*swarms_ptr, ", "));
 
     for (const auto& swarm_id : *swarms_ptr) {
         if (auto swarm = network_.get_swarm(swarm_id)) {
             auto boundaries = network_.get_swarm_boundaries(swarm_id);
-            db->foreach_swarm_message([&swarm, this](const std::vector<message>& messages) {
-                    relay_messages(messages, *swarm);
+            db->foreach_swarm_message(
+                    [&swarm, this](const std::vector<message>& messages) {
+                        relay_messages(messages, *swarm);
                     },
                     boundaries.first,
                     boundaries.second);
@@ -1304,37 +1305,40 @@ void ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
 }
 
 void ServiceNode::check_retry_requests() {
-    db->foreach_ready_retry_request([this](const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id) {
-            //FIXME: non-swarm-member retries should be purged automatically
-            //std::optional<SwarmMemberState> is_member = swarm_.is_member(key);
+    db->foreach_ready_retry_request([this](const crypto::legacy_pubkey& key,
+                                           const std::string& cmd,
+                                           const std::string& payload,
+                                           int64_t req_id) {
+        // FIXME: non-swarm-member retries should be purged automatically
+        // std::optional<SwarmMemberState> is_member = swarm_.is_member(key);
 
-            crypto::x25519_pubkey pubkey_x25519 = {};
+        crypto::x25519_pubkey pubkey_x25519 = {};
 
-            auto ct = contacts().find(key);
-            if (ct && *ct)
-                pubkey_x25519 = ct->pubkey_x25519;
+        auto ct = contacts().find(key);
+        if (ct && *ct)
+            pubkey_x25519 = ct->pubkey_x25519;
 
-            if (pubkey_x25519) {
-                auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
-                    // We cleanup the request in all situations except timeout (timeout
-                    // indicating that the node was non-responsive, maybe offline). In an error
-                    // state we don't know what state the recipient's storage server is in and
-                    // we default to deleting it and ending the retry attempts.
-                    rpc::SNStorageCCResult store_result =
-                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
-                    if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
-                        db->remove_node_retry_request(req_id);
-                    }
-                };
-                omq_server()->request(
-                        pubkey_x25519.view(),
-                        "sn.storage_cc",
-                        on_request_done,
-                        cmd,
-                        payload,
-                        oxenmq::send_option::request_timeout{5s});
-            }
-            });
+        if (pubkey_x25519) {
+            auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
+                // We cleanup the request in all situations except timeout (timeout
+                // indicating that the node was non-responsive, maybe offline). In an error
+                // state we don't know what state the recipient's storage server is in and
+                // we default to deleting it and ending the retry attempts.
+                rpc::SNStorageCCResult store_result =
+                        rpc::interpret_sn_storage_cc_response_parts(success, parts);
+                if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+                    db->remove_node_retry_request(req_id);
+                }
+            };
+            omq_server()->request(
+                    pubkey_x25519.view(),
+                    "sn.storage_cc",
+                    on_request_done,
+                    cmd,
+                    payload,
+                    oxenmq::send_option::request_timeout{5s});
+        }
+    });
 }
 
 void ServiceNode::retryable_requests_thread_entry_point() {

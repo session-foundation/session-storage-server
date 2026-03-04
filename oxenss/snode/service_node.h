@@ -105,12 +105,10 @@ class ServiceNode {
     std::weak_ptr<http::Client> http_;
 
   public:
-
     // bit messy, but Swarm needs db startup version, so db has to init before Swarm
     std::unique_ptr<Database> db;
 
   private:
-
     SnodeStatus status_ = SnodeStatus::UNKNOWN;
 
     const crypto::legacy_keypair our_keys_;

@@ -234,9 +234,11 @@ namespace {
 
 }  // namespace
 
-user_pubkey load_pubkey(uint8_t type, std::string pk) { return {type, std::move(pk)}; }
+user_pubkey load_pubkey(uint8_t type, std::string pk) {
+    return {type, std::move(pk)};
+}
 
-void sqlite_swarm_space(sqlite3_context *sqlite_context, int argc, sqlite3_value **argv, bool hi) {
+void sqlite_swarm_space(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv, bool hi) {
     assert(argc == 1);
     auto sz = sqlite3_value_bytes(argv[0]);
     assert(sz == 32);
@@ -244,20 +246,21 @@ void sqlite_swarm_space(sqlite3_context *sqlite_context, int argc, sqlite3_value
     auto pubkey = load_pubkey(0 /* irrelevant */, {reinterpret_cast<const char*>(key_blob), 32});
     auto swarm_space = pubkey_to_swarm_space(pubkey);
 
-    if (hi) swarm_space = swarm_space >> 32;
-    else swarm_space = swarm_space & 0xffffffff;
+    if (hi)
+        swarm_space = swarm_space >> 32;
+    else
+        swarm_space = swarm_space & 0xffffffff;
 
     sqlite3_result_int64(sqlite_context, swarm_space);
 }
 
-void sqlite_swarm_space_hi(sqlite3_context *sqlite_context, int argc, sqlite3_value **argv) {
+void sqlite_swarm_space_hi(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv) {
     sqlite_swarm_space(sqlite_context, argc, argv, true);
 }
 
-void sqlite_swarm_space_lo(sqlite3_context *sqlite_context, int argc, sqlite3_value **argv) {
+void sqlite_swarm_space_lo(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv) {
     sqlite_swarm_space(sqlite_context, argc, argv, false);
 }
-
 
 class DatabaseImpl {
   public:
@@ -370,8 +373,10 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
 
         // use version for schema changes from now
         if (parent._startup_version == 0) {
-            log::info(logcat,
-                "Upgrading database schema: adding swarm space cache, runtime state and retryable requests");
+            log::info(
+                    logcat,
+                    "Upgrading database schema: adding swarm space cache, runtime state and "
+                    "retryable requests");
 
             // swarm space is 64-bit unsigned, which means unfortunately we can't do queries
             // on it with arithmetic properly (sqlite INTEGER is 64-bit signed).  As such, we
@@ -402,8 +407,8 @@ swarm_space_lo = func_swarm_space_lo(pubkey)
 WHERE swarm_space_hi = -1;
             )");
 
-        auto stmt = prepared_st(
-                "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
+            auto stmt = prepared_st(
+                    "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
 
             db.exec(R"(
 CREATE TABLE retry_requests (
@@ -1318,32 +1323,45 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
-int64_t Database::add_retry_request(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id) {
-    auto impl = get_impl(/*write =*/ true);
+int64_t Database::add_retry_request(
+        const crypto::legacy_pubkey& key,
+        const std::string& cmd,
+        const std::string& payload,
+        int64_t req_id) {
+    auto impl = get_impl(/*write =*/true);
 
     // insert into request table if not present
     if (req_id == 0) {
         req_id = impl->prepared_get<int64_t>(
                 "INSERT INTO retry_requests (command, payload) values (?,?) RETURNING id",
                 cmd,
-                payload
-                );
+                payload);
     }
 
     // first retry 5 seconds after insertion, subsequent retries will be 60 seconds after the last.
-    impl->prepared_exec("INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, unixepoch('now', 'subsec') + 5);", req_id, key.str());
+    impl->prepared_exec(
+            "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, unixepoch('now', "
+            "'subsec') + 5);",
+            req_id,
+            key.str());
 
     return req_id;
 }
 
-void Database::foreach_ready_retry_request(std::function<void(const crypto::legacy_pubkey& key, const std::string& cmd, const std::string& payload, int64_t req_id)> callback) {
-    auto impl = get_impl(/*write =*/ true);
+void Database::foreach_ready_retry_request(std::function<
+                                           void(const crypto::legacy_pubkey& key,
+                                                const std::string& cmd,
+                                                const std::string& payload,
+                                                int64_t req_id)> callback) {
+    auto impl = get_impl(/*write =*/true);
 
     auto stmt = impl->prepared_st(
-                "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
+            "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
 
     using sql_duration = std::chrono::duration<double, std::ratio<1>>;
-    double now = std::chrono::duration_cast<sql_duration>(std::chrono::system_clock::now().time_since_epoch()).count();
+    double now = std::chrono::duration_cast<sql_duration>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
 
     // retry 60 seconds after this retry.  Initial retries are staggered (5sec after timeout),
     // but it doesn't seem useful to stagger here.  Further, it would be a pain to do so after
@@ -1357,10 +1375,13 @@ void Database::foreach_ready_retry_request(std::function<void(const crypto::lega
 
         callback(key, cmd, payload, req_id);
     }
-
 }
 
-void Database::foreach_swarm_message(std::function<void(const std::vector<message>&)> callback, uint64_t lower_bound, uint64_t upper_bound, bool zero_inclusive) {
+void Database::foreach_swarm_message(
+        std::function<void(const std::vector<message>&)> callback,
+        uint64_t lower_bound,
+        uint64_t upper_bound,
+        bool zero_inclusive) {
 
     if (lower_bound > upper_bound) {
         foreach_swarm_message(callback, lower_bound, std::numeric_limits<uint64_t>::max());
@@ -1368,7 +1389,7 @@ void Database::foreach_swarm_message(std::function<void(const std::vector<messag
         return;
     }
 
-    auto impl = get_impl(/*write =*/ false);
+    auto impl = get_impl(/*write =*/false);
 
     constexpr size_t batch_size = 100;
 
@@ -1376,11 +1397,11 @@ void Database::foreach_swarm_message(std::function<void(const std::vector<messag
 
     // weird case of their exists exactly one swarm, which should be impossible
     if (lower_bound == upper_bound) {
-        statement = SQLite::Statement{impl->db,
+        statement = SQLite::Statement{
+                impl->db,
                 "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
                 " FROM owned_messages ORDER BY mid"};
-    }
-    else {
+    } else {
         // there's probably a better way to do this, but it should be fine
         std::string query = R"(
 SELECT type, pubkey, hash, namespace, timestamp, expiry, data
@@ -1426,24 +1447,25 @@ WHERE
 }
 
 void Database::remove_node_retry_request(int64_t req_id) {
-    auto impl = get_impl(/*write =*/ true);
+    auto impl = get_impl(/*write =*/true);
     impl->prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {
     auto as_hex = oxenc::bt_serialize<uint64_t>(swarm_id);
-    auto impl = get_impl(/*write =*/ true);
-    impl->prepared_exec("INSERT INTO state_kv (key, value) VALUES ('swarm_id', ?) ON CONFLICT REPLACE;",
+    auto impl = get_impl(/*write =*/true);
+    impl->prepared_exec(
+            "INSERT INTO state_kv (key, value) VALUES ('swarm_id', ?) ON CONFLICT REPLACE;",
             as_hex);
 }
 
 std::optional<uint64_t> Database::get_current_swarm() {
-    auto impl = get_impl(/*write =*/ false);
+    auto impl = get_impl(/*write =*/false);
     try {
-        auto as_hex = impl->prepared_get<std::string>("SELECT value FROM state_kv WHERE key = 'swarm_id';");
+        auto as_hex = impl->prepared_get<std::string>(
+                "SELECT value FROM state_kv WHERE key = 'swarm_id';");
         return oxenc::bt_deserialize<uint64_t>(as_hex);
-    }
-    catch (const std::exception& e) {
+    } catch (const std::exception& e) {
         return std::nullopt;
     }
     return std::nullopt;

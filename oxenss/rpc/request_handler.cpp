@@ -413,7 +413,7 @@ struct swarm_response {
 // swarm entries returned things with "failed" in them or in the case of a non-recursive request,
 // the top-level object has a "failed" in it then we send back an INTERNAL_SERVER_ERROR
 // along with the response.
-static void reply_or_fail(snode::ServiceNode& sn, const std::shared_ptr<swarm_response>& res) {
+static void reply_or_fail(const std::shared_ptr<swarm_response>& res) {
     auto res_code = http::INTERNAL_SERVER_ERROR;
     if (auto swarm_obj = res->result.find("swarm"); swarm_obj != res->result.end()) {
         for (const auto& [sn_pkey, obj] : swarm_obj->items()) {
@@ -529,7 +529,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
 
                     res->result["swarm"][peer_ed.hex()] = std::move(peer_result);
                     if (send_reply)
-                        reply_or_fail(sn, res);
+                        reply_or_fail(res);
                 },
                 res->cmd,
                 res->req_payload,
@@ -681,7 +681,7 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
             obfuscate_pubkey(req.pubkey));
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -954,7 +954,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<void(Response)> cb) {
@@ -1016,7 +1016,7 @@ void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<vo
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1067,7 +1067,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1121,7 +1121,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(
@@ -1248,7 +1248,7 @@ void RequestHandler::process_client_req(
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<void(Response)> cb) {
@@ -1314,7 +1314,7 @@ void RequestHandler::process_client_req(rpc::expire_all&& req, std::function<voi
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<void(Response)> cb) {
@@ -1455,7 +1455,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
         add_misc_response_fields(res->result, service_node_, now);
 
     if (--res->pending == 0)
-        reply_or_fail(service_node_, std::move(res));
+        reply_or_fail(std::move(res));
 }
 
 void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<void(Response)> cb) {

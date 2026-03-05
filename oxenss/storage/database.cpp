@@ -389,14 +389,13 @@ ALTER TABLE owners ADD COLUMN swarm_space_hi INTEGER NOT NULL DEFAULT -1;
 ALTER TABLE owners ADD COLUMN swarm_space_lo INTEGER NOT NULL DEFAULT -1;
 
 CREATE TRIGGER swarm_space_trigger
-BEFORE INSERT ON owners
+AFTER INSERT ON owners
 FOR EACH ROW
-WHEN NEW.swarm_space_lo = -1
+WHEN NEW.swarm_space_hi = -1 OR NEW.swarm_space_lo = -1
 BEGIN
-    INSERT INTO owners (id, type, pubkey, swarm_space_hi, swarm_space_lo)
-    VALUES (NEW.id, NEW.type, NEW.pubkey, func_swarm_space_hi(NEW.pubkey), func_swarm_space_lo(NEW.pubkey);
-
-    SELECT RAISE(IGNORE); -- skips the original insert since we replaced it
+    UPDATE owners SET
+    swarm_space_hi = func_swarm_space_hi(NEW.pubkey), swarm_space_lo = func_swarm_space_lo(NEW.pubkey)
+    WHERE owners.id = NEW.id;
 END;
             )");
 
@@ -406,9 +405,6 @@ SET swarm_space_hi = func_swarm_space_hi(pubkey),
 swarm_space_lo = func_swarm_space_lo(pubkey)
 WHERE swarm_space_hi = -1;
             )");
-
-            auto stmt = prepared_st(
-                    "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
 
             db.exec(R"(
 CREATE TABLE retry_requests (
@@ -838,7 +834,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                     " DO UPDATE SET"
                     " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
                     " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
-                    " WHERE EXCLUDED.timestamp > messages.timestamp;",
+                    " WHERE EXCLUDED.timestamp > messages.timestamp",
                     owner_id,
                     msg.hash,
                     msg.msg_namespace,
@@ -903,11 +899,14 @@ void Database::bulk_store(const std::vector<message>& items) {
     auto insert_message = impl->prepared_st(
             "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
             " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (hash)"
+            " DO UPDATE SET"
+            " expiry = MAX(EXCLUDED.expiry, messages.expiry)"
             " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
             " DO UPDATE SET"
             " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
             " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
-            " WHERE EXCLUDED.timestamp > messages.timestamp;");
+            " WHERE EXCLUDED.timestamp > messages.timestamp");
 
     for (auto& m : items) {
         if (!m.pubkey)
@@ -1348,7 +1347,7 @@ int64_t Database::add_retry_request(
     // first retry 5 seconds after insertion, subsequent retries will be 60 seconds after the last.
     impl->prepared_exec(
             "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, unixepoch('now', "
-            "'subsec') + 5);",
+            "'subsec') + 5)",
             req_id,
             key.str());
 
@@ -1462,15 +1461,14 @@ void Database::update_current_swarm(uint64_t swarm_id) {
     auto as_hex = oxenc::bt_serialize<uint64_t>(swarm_id);
     auto impl = get_impl(/*write =*/true);
     impl->prepared_exec(
-            "INSERT INTO state_kv (key, value) VALUES ('swarm_id', ?) ON CONFLICT REPLACE;",
-            as_hex);
+            "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)", as_hex);
 }
 
 std::optional<uint64_t> Database::get_current_swarm() {
     auto impl = get_impl(/*write =*/false);
     try {
         auto as_hex = impl->prepared_get<std::string>(
-                "SELECT value FROM state_kv WHERE key = 'swarm_id';");
+                "SELECT value FROM state_kv WHERE key = 'swarm_id'");
         return oxenc::bt_deserialize<uint64_t>(as_hex);
     } catch (const std::exception& e) {
         return std::nullopt;

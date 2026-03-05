@@ -238,10 +238,10 @@ user_pubkey load_pubkey(uint8_t type, std::string pk) {
     return {type, std::move(pk)};
 }
 
-void sqlite_swarm_space(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv, bool hi) {
+void sqlite_swarm_space(
+        sqlite3_context* sqlite_context, [[maybe_unused]] int argc, sqlite3_value** argv, bool hi) {
     assert(argc == 1);
-    auto sz = sqlite3_value_bytes(argv[0]);
-    assert(sz == 32);
+    assert(sqlite3_value_bytes(argv[0]));
     auto* key_blob = sqlite3_value_blob(argv[0]);
     auto pubkey = load_pubkey(0 /* irrelevant */, {reinterpret_cast<const char*>(key_blob), 32});
     auto swarm_space = pubkey_to_swarm_space(pubkey);
@@ -774,9 +774,14 @@ int64_t Database::get_used_bytes() {
            impl->prepared_get<int64_t>("PRAGMA freelist_count") * impl->page_size;
 }
 
-static std::optional<message> get_message(DatabaseImpl& impl, SQLite::Statement& st) {
+std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
+    auto impl = get_impl(false);
+    auto st = impl->prepared_st(
+            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
+            " FROM owned_messages WHERE hash = ?");
+    st->bindNoCopy(1, msg_hash);
     std::optional<message> msg;
-    while (st.executeStep()) {
+    while (st->executeStep()) {
         assert(!msg);
         auto [hash, otype, opubkey, ns, ts, exp, data] =
                 get<std::string, uint8_t, std::string, namespace_id, int64_t, int64_t, std::string>(
@@ -790,15 +795,6 @@ static std::optional<message> get_message(DatabaseImpl& impl, SQLite::Statement&
                 std::move(data));
     }
     return msg;
-}
-
-std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
-            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
-            " FROM owned_messages WHERE hash = ?");
-    st->bindNoCopy(1, msg_hash);
-    return get_message(*impl, st);
 }
 
 StoreResult Database::store(const message& msg, std::chrono::system_clock::time_point* expiry) {

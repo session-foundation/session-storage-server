@@ -70,7 +70,7 @@ std::string serialise_data_ready_request(bool needs_db_dump) {
 
 bool deserialise_data_ready_request(std::string_view data) {
     oxenc::bt_dict_consumer d{data};
-    auto version = d.require<uint8_t>(data_ready_req::VERSION_KEY);
+    [[maybe_unused]] auto version = d.require<uint8_t>(data_ready_req::VERSION_KEY);
     return d.require<bool>(data_ready_req::NEED_DB_DUMP_KEY);
 }
 

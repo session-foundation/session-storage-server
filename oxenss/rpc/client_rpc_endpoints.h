@@ -186,7 +186,8 @@ struct store final : recursive {
 ///   compatibility, this can also be specified as `pubKey`
 /// - `namespace` (optional) the integral message namespace from which to retrieve messages.  Each
 ///   namespace forms an independent message storage for the same address.  When specified,
-///   authentication *must* be provided.  Omitting the namespace is equivalent to specifying a
+///   authentication is required for all namespaces except for "public" outbox namespaces (of the
+///   form -(20n+1), e.g. -1, -21, -41, etc.) Omitting the namespace is equivalent to specifying a
 ///   namespace of 0.
 /// - `last_hash` (optional) retrieve messages stored by this storage server since `last_hash` was
 ///   stored.  Can also be specified as `lastHash`.  An empty string (or null) is treated as an

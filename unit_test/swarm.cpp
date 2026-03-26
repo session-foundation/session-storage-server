@@ -173,6 +173,11 @@ TEST_CASE("service nodes - pubkey to swarm id") {
     CHECK(network.get_swarm_id_for(pk).value() == 0);
 }
 
+// A round-trip test against "service nodes - pubkey to swarm id" is not needed here.
+// Both get_swarm_boundaries and _find_swarm_for_swarm_space use consistent uint64_t modular
+// arithmetic, and the wrapping range case (lo > hi, crossing UINT64_MAX) is already exercised
+// by swarm 100's boundaries below.  UINT64_MAX is a valid swarm space position but is assumed
+// (and enforced elsewhere) to never be a swarm id, so no additional edge cases exist.
 TEST_CASE("service nodes - swarm id to swarm space (pubkey range)") {
     const auto fake_pk = oxenss::crypto::legacy_pubkey::from_hex(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -191,7 +196,7 @@ TEST_CASE("service nodes - swarm id to swarm space (pubkey range)") {
 
     auto boundaries = network.get_swarm_boundaries(200);
     REQUIRE(boundaries.first == 150);
-    REQUIRE(boundaries.second == 250);  // we lose this tie, but this boundary is exclusive
+    REQUIRE(boundaries.second == 250);  // swarm 300 loses this tie; 250 is inclusive for swarm 200
 
     boundaries = network.get_swarm_boundaries(300);
     REQUIRE(boundaries.first == 250);
@@ -201,7 +206,24 @@ TEST_CASE("service nodes - swarm id to swarm space (pubkey range)") {
     REQUIRE(boundaries.first == 349);
     REQUIRE(boundaries.second == 448);
 
-    boundaries = network.get_swarm_boundaries(100);
-    REQUIRE(boundaries.first == (0x18d + 0x8000000000000000));
-    REQUIRE(boundaries.second == 150);
+    boundaries = network.get_swarm_boundaries(498);
+    REQUIRE(boundaries.first == 448);   // left_diff=99 (odd, rounded up to 100), so lo = 498 - 50
+    REQUIRE(boundaries.second == 547);  // right_diff=98, so hi = 498 + 49
+
+    boundaries = network.get_swarm_boundaries(596);
+    REQUIRE(boundaries.first == 547);
+    REQUIRE(boundaries.second == 645);
+
+    auto boundaries_100 = network.get_swarm_boundaries(100);
+    REQUIRE(boundaries_100.first == (0x18d + 0x8000000000000000));
+    REQUIRE(boundaries_100.second == 150);
+
+    // 694 is the last element; its successor wraps around to 100.
+    // right_diff = 100 - 694 (uint64 wraparound) = 0xFFFFFFFFFFFFFDAE
+    // hi = 694 + 0x7FFFFFFFFFFFFED7 = 0x800000000000018D
+    // 694's upper bound and 100's lower bound must be the same value (shared boundary).
+    auto boundaries_694 = network.get_swarm_boundaries(694);
+    REQUIRE(boundaries_694.first == 645);
+    REQUIRE(boundaries_694.second == (0x18d + 0x8000000000000000));
+    REQUIRE(boundaries_694.second == boundaries_100.first);
 }

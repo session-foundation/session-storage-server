@@ -172,3 +172,36 @@ TEST_CASE("service nodes - pubkey to swarm id") {
     REQUIRE(pk.load("05000000000000000000000000000000000000000000000000fffffffffffffffe"));
     CHECK(network.get_swarm_id_for(pk).value() == 0);
 }
+
+TEST_CASE("service nodes - swarm id to swarm space (pubkey range)") {
+    const auto fake_pk = oxenss::crypto::legacy_pubkey::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    oxenmq::OxenMQ omq;
+    Network network{omq};
+    oxenss::Database db{"."};  // unused here, but required by Swarm
+    Swarm swarm{network, fake_pk, db};
+
+    using oxenss::snode::swarms_t;
+    swarms_t swarms;
+    for (oxenss::snode::swarm_id_t s : {100, 200, 300, 399, 498, 596, 694})
+        swarms[s];
+    swarm.update_swarms(0, swarms_t{swarms}, {});
+
+    oxenss::user_pubkey pk;
+
+    auto boundaries = network.get_swarm_boundaries(200);
+    REQUIRE(boundaries.first == 150);
+    REQUIRE(boundaries.second == 250);  // we lose this tie, but this boundary is exclusive
+
+    boundaries = network.get_swarm_boundaries(300);
+    REQUIRE(boundaries.first == 250);
+    REQUIRE(boundaries.second == 349);
+
+    boundaries = network.get_swarm_boundaries(399);
+    REQUIRE(boundaries.first == 349);
+    REQUIRE(boundaries.second == 448);
+
+    boundaries = network.get_swarm_boundaries(100);
+    REQUIRE(boundaries.first == (0x18d + 0x8000000000000000));
+    REQUIRE(boundaries.second == 150);
+}

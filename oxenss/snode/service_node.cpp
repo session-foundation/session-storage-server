@@ -1305,6 +1305,8 @@ void ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
 }
 
 void ServiceNode::check_retry_requests() {
+    db->remove_expired_retry_requests();
+
     db->foreach_ready_retry_request([this](const crypto::legacy_pubkey& key,
                                            const std::string& cmd,
                                            const std::string& payload,

@@ -37,19 +37,11 @@ std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm
     // in the event of a distance tie in swarm space (e.g. id 1 and 7 with swarm space 4),
     // the "right" (next) swarm loses.  This means when querying with what we return here,
     // we should do x > lower_bound AND x <= upper_bound
-
-    // if there are only 2 swarms somehow, return the average and the average + 1<<63,
-    // with the average as the lower bound if target is the larger swarm id
-    if (prev_swarm == next_swarm) {
-        uint64_t avg = (swarm + prev_swarm) / 2;
-        uint64_t shift = (uint64_t)1 << 63;
-        if (swarm > prev_swarm)
-            return {avg, avg + shift};
-        else
-            return {avg + shift, avg};
-    }
-
-    return {(swarm + prev_swarm) / 2, (swarm + next_swarm) / 2};
+    auto left_diff = swarm - prev_swarm;
+    if (left_diff % 2)
+        left_diff += 1;  // round the average up on the left side
+    auto right_diff = next_swarm - swarm;
+    return {swarm - (left_diff / 2), swarm + (right_diff / 2)};
 }
 
 swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
@@ -59,6 +51,10 @@ swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
         return swarms_.begin();
 
     const uint64_t swarm_pos = pubkey_to_swarm_space(pk);
+    return _find_swarm_for_swarm_space(swarm_pos);
+}
+
+swarms_t::const_iterator Network::_find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const {
 
     // Find the right boundary, i.e. first swarm with swarm_id >= res
     auto right_it = swarms_.lower_bound(swarm_pos);

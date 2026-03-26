@@ -403,9 +403,9 @@ struct swarm_response {
     bool b64;
     nlohmann::json result;
     std::function<void(rpc::Response)> cb;
-    std::vector<snode::RequestRetryEntry> retry_nodes;
     std::string cmd;
     std::string req_payload;
+    std::chrono::system_clock::time_point expiry;
     int64_t db_req_id{0};
 };
 

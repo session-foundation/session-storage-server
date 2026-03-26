@@ -413,11 +413,13 @@ CREATE TABLE retry_requests (
     payload BLOB NOT NULL,
     created DOUBLE PRECISION NOT NULL DEFAULT (unixepoch('now', 'subsec'))
 );
+
 CREATE TABLE retry_pubkeys (
     id INTEGER PRIMARY KEY,
     pubkey BLOB NOT NULL,
     UNIQUE(pubkey)
 );
+
 CREATE TABLE retry_node_requests (
     id INTEGER PRIMARY KEY,
     rr_id INTEGER NOT NULL REFERENCES retry_requests(id) ON DELETE CASCADE,
@@ -425,20 +427,24 @@ CREATE TABLE retry_node_requests (
     next_retry DOUBLE PRECISION NOT NULL,
     UNIQUE(rr_id, pk_id)
 );
+
 CREATE INDEX retry_node_requests_pk_idx ON retry_node_requests(pk_id);
 
 CREATE VIEW retry_node_reqs AS
-    SELECT retry_node_requests.id, retry_requests.command, retry_reqeusts.payload, retry_pubkeys.pubkey, next_retry
-    FROM retry_node_requests JOIN retry_requests ON rr_id = retry_requests.id JOIN retry_pubkeys ON pk_id = retry_pubkeys.id;
+    SELECT retry_node_requests.id AS rr_id, retry_requests.command, retry_requests.payload,
+    retry_pubkeys.pubkey AS pubkey, next_retry
+    FROM retry_node_requests
+    JOIN retry_requests ON retry_node_requests.rr_id = retry_requests.id
+    JOIN retry_pubkeys ON pk_id = retry_pubkeys.id;
 
 CREATE TRIGGER retry_node_add
 INSTEAD OF INSERT ON retry_node_reqs
 BEGIN
     -- Allows insertion into the view (with the raw pubkey value) to automatically do the pubkey
     -- lookup (with autovivification) for you.
-    INSERT INTO retry_pubkeys (pubkey) VALUES (NEW.pubkey) ON CONFLICT(pubkey) DO NOTHING;
+    INSERT OR IGNORE INTO retry_pubkeys (pubkey) VALUES (NEW.pubkey);
     INSERT INTO retry_node_requests (rr_id, pk_id, next_retry)
-    VALUES (NEW.rr_id, (SELECT id FROM retry_pubkeys WHERE pubkey = NEW.pubkey), NEW.next_retry);
+    VALUES (NEW.rr_id, (SELECT id FROM retry_pubkeys WHERE retry_pubkeys.pubkey = NEW.pubkey), NEW.next_retry);
 END;
 
 CREATE TRIGGER rr_cleanup
@@ -1383,6 +1389,11 @@ void Database::foreach_ready_retry_request(std::function<
     }
 }
 
+int64_t Database::retry_request_count() {
+    auto impl = get_impl(/*write =*/false);
+    return impl->prepared_get<int64_t>("SELECT COUNT(*) from retry_node_reqs");
+}
+
 void Database::foreach_swarm_message(
         std::function<void(const std::vector<message>&)> callback,
         uint64_t lower_bound,
@@ -1455,6 +1466,15 @@ WHERE
 void Database::remove_node_retry_request(int64_t req_id) {
     auto impl = get_impl(/*write =*/true);
     impl->prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
+}
+
+void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
+    auto impl = get_impl(/*write =*/true);
+
+    // FIXME: retry requests don't have an expiry, so we need to pick a good expiration time
+    //        for these retries.  For now, using 4 hours ago.  Tests will pass 4 hours from
+    //        now.
+    impl->prepared_exec("DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - 4h));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {

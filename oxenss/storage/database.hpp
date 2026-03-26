@@ -244,6 +244,10 @@ class Database {
                                           const std::string& payload,
                                           int64_t req_id)>);
 
+    // This is just for the test suite, as using "ready retry requests" as above would require it
+    // to take several seconds longer to execute, per call.
+    int64_t retry_request_count();
+
     // executes the provided callback for every swarm message (in batches) for the swarm with the
     // given swarm space boundaries.  The lower bound is exclusive; the upper inclusive.
     // if the lower bound is higher than the upper bound (i.e. overflow wrapping), will be called
@@ -258,6 +262,10 @@ class Database {
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);
+
+    // the `now` argument here only exists for the test suite; do not use it.
+    void remove_expired_retry_requests(
+            std::chrono::system_clock::time_point now = std::chrono::system_clock::now());
 
     void update_current_swarm(uint64_t swarm_id);
 

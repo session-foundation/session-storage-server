@@ -1,3 +1,4 @@
+#include <limits>
 #include <oxenss/storage/database.hpp>
 
 #include <oxenss/logging/oxen_logger.h>
@@ -10,14 +11,19 @@
 #include <future>
 
 #include <catch2/catch.hpp>
+#include "oxenss/utils/time.hpp"
 
 using namespace oxenss;
 
 using namespace std::literals;
 
 struct StorageDeleter {
+    bool delete_it = true;
     StorageDeleter() { std::filesystem::remove("storage.db"); }
-    ~StorageDeleter() { std::filesystem::remove("storage.db"); }
+    ~StorageDeleter() {
+        if (delete_it)
+            std::filesystem::remove("storage.db");
+    }
 };
 
 TEST_CASE("storage - database file creation", "[storage]") {
@@ -426,4 +432,61 @@ TEST_CASE("storage - connection pool", "[storage][pool]") {
     // Now we've waited for the blocking threads to finish, so the blocked conns should have been
     // returned to the pool:
     CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1 + n_blocked_threads);
+}
+
+TEST_CASE("storage - current swarm", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    // new db has no current swarm
+    CHECK(storage.get_current_swarm() == std::nullopt);
+
+    storage.update_current_swarm(12345);
+
+    CHECK(*(storage.get_current_swarm()) == 12345);
+}
+
+TEST_CASE("storage - retry requests", "[storage]") {
+    StorageDeleter fixture;
+    fixture.delete_it = false;
+    oxenss::crypto::legacy_pubkey pubkey, pubkey2;
+    pubkey.load_from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    pubkey2.load_from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde0");
+
+    Database storage{"."};
+
+    // first row id = 1
+    CHECK(storage.add_retry_request(pubkey, "foo", "bar") == 1);
+
+    // unique on retry id and pubkey
+    CHECK_THROWS(storage.add_retry_request(pubkey, "foo", "bar", 1));
+    // this will silently fail, but also should never be done.
+    CHECK_THROWS(storage.add_retry_request(pubkey, "foo", "bar", 2));
+
+    auto req_count = storage.retry_request_count();
+    CHECK(req_count == 1);
+
+    storage.add_retry_request(pubkey2, "foo", "bar");
+    req_count = storage.retry_request_count();
+    CHECK(req_count == 2);
+
+    storage.add_retry_request(pubkey, "bits", "bits");
+    req_count = storage.retry_request_count();
+    CHECK(req_count == 3);
+
+    std::this_thread::sleep_for(500ms);
+    // FIXME: "expiry" is currently 4h, this is incredibly arbitrary and should be considered
+    // further.
+    auto the_future = std::chrono::system_clock::now() + 4h;
+
+    std::this_thread::sleep_for(
+            500ms);  // the following insert should *not* be considered "expired"
+    CHECK_NOTHROW(storage.add_retry_request(pubkey, "fools", "barred") == 4);
+    req_count = storage.retry_request_count();
+    CHECK(req_count == 4);
+    // remove expired, pretending it's 4h (minus the sleep) from now
+    CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
+    req_count = storage.retry_request_count();
+    CHECK(req_count == 1);
 }

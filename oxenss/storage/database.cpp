@@ -320,7 +320,7 @@ class DatabaseImpl {
     }
 
     void initialize_database() {
-        parent._startup_version = db.execAndGet("PRAGMA user_version").getInt();
+        parent._had_swarm_state_on_open = db.tableExists("state_kv");
 
         if (!db.tableExists("owners")) {
             create_schema();
@@ -371,8 +371,7 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
             )");
         }
 
-        // use version for schema changes from now
-        if (parent._startup_version == 0) {
+        if (!parent._had_swarm_state_on_open) {
             log::info(
                     logcat,
                     "Upgrading database schema: adding swarm space cache, runtime state, "
@@ -481,7 +480,6 @@ CREATE UNIQUE INDEX message_outbox_singleton
 ON messages(owner, namespace)
 WHERE namespace < 0 AND namespace % 20 = -1;
 
-PRAGMA user_version = 1;
             )");
         }
 

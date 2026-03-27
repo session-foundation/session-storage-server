@@ -58,8 +58,11 @@ class Database {
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
-    // database version at startup (before any migration/upgrade)
-    int _startup_version = 0;
+    // True if swarm state was already persisted in the database when it was opened.
+    // On the first swarm update after startup, this prevents spurious DB dump requests
+    // to peers who only appear as new members because swarm state was not persisted
+    // in pre-migration databases.
+    bool _had_swarm_state_on_open = false;
 
   public:
     // Recommended period for calling clean_expired()
@@ -73,7 +76,7 @@ class Database {
 
     ~Database();
 
-    int startup_version() const { return _startup_version; }
+    bool had_swarm_state_on_open() const { return _had_swarm_state_on_open; }
 
     // if the database is full then print an error only once ever N errors
     static constexpr int DB_FULL_FREQUENCY = 100;

@@ -180,13 +180,13 @@ SwarmEvents Swarm::update_swarms(
         // from them to ensure we have all the messages they have that we don't.
         for (auto it : events.new_swarm_members) {
             auto& pair = members_[it];
-            if (!did_startup_version_check && _db.startup_version() == 1) {
+            if (!did_swarm_space_check && _db.had_swarm_state_on_open()) {
                 if (pair.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil)
                     pair.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
             }
         }
 
-        did_startup_version_check = true;
+        did_swarm_space_check = true;
 
         // If the DB was empty on startup then we mark all swarm members as peers that we need to
         // request a DB dump from. Note we only do this if the swarm matches the initial swarm we

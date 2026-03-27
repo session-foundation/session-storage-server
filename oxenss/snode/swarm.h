@@ -94,7 +94,7 @@ class Swarm {
 
     Database& _db;
 
-    bool did_startup_version_check = false;
+    bool did_swarm_space_check = false;
 
   public:
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk, Database& db) :

@@ -1381,7 +1381,7 @@ void Database::foreach_ready_retry_request(std::function<
         auto [req_id, key_str, cmd, payload, next_retry] =
                 get<int64_t, std::string, std::string, std::string, double>(stmt);
         auto key = crypto::legacy_pubkey::from_bytes(key_str);
-        impl->prepared_exec("UPDATE retry_nodes_requests SET next_retry = ?", next_time);
+        impl->prepared_exec("UPDATE retry_node_requests SET next_retry = ?", next_time);
 
         callback(key, cmd, payload, req_id);
     }
@@ -1420,14 +1420,15 @@ void Database::foreach_swarm_message(
         // there's probably a better way to do this, but it should be fine
         std::string query = R"(
 SELECT type, pubkey, hash, namespace, timestamp, expiry, data
-FROM owned_messages ORDER BY mid
+FROM owned_messages
 JOIN owners ON oid = id
 WHERE
         )";
         query += R"(
     (owners.swarm_space_hi >{0} ?1 OR (owners.swarm_space_hi == ?1 AND owners.swarm_space_lo >{0} ?2))
     AND
-    (owners.swarm_space_hi <= ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4));
+    (owners.swarm_space_hi <= ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4))
+ORDER BY mid;
         )"_format(zero_inclusive ? "=" : "");
 
         statement = SQLite::Statement{impl->db, query};

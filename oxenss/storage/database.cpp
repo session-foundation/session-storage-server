@@ -1365,25 +1365,21 @@ void Database::foreach_ready_retry_request(std::function<
                                                 int64_t req_id)> callback) {
     auto impl = get_impl(/*write =*/true);
 
-    auto stmt = impl->prepared_st(
-            "SELECT * from retry_node_reqs WHERE next_retry < unixepoch('now', 'subsec')");
-
-    using sql_duration = std::chrono::duration<double, std::ratio<1>>;
-    double now = std::chrono::duration_cast<sql_duration>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
+    // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
+    // if the table it is reading is updated on the same connection mid-iteration.
+    auto ready = get_all<int64_t, std::string, std::string, std::string>(impl->prepared_st(
+            "SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
+            " WHERE next_retry < unixepoch('now', 'subsec')"));
 
     // retry 60 seconds after this retry.  Initial retries are staggered (5sec after timeout),
     // but it doesn't seem useful to stagger here.  Further, it would be a pain to do so after
     // restart.  Could update this time if/when the retry fails, but here seems more convenient.
-    auto next_time = now + 60;
-    while (stmt->executeStep()) {
-        auto [req_id, key_str, cmd, payload, next_retry] =
-                get<int64_t, std::string, std::string, std::string, double>(stmt);
-        auto key = crypto::legacy_pubkey::from_bytes(key_str);
-        impl->prepared_exec("UPDATE retry_node_requests SET next_retry = ?", next_time);
+    auto next_time = to_epoch_double(std::chrono::system_clock::now() + 60s);
 
-        callback(key, cmd, payload, req_id);
+    for (auto& [req_id, key_str, cmd, payload] : ready) {
+        impl->prepared_exec(
+                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?", next_time, req_id);
+        callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
     }
 }
 

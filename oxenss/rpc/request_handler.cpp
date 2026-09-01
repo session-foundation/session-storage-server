@@ -13,6 +13,7 @@
 #include <oxenss/crypto/subaccount.h>
 #include <oxenss/crypto/channel_encryption.hpp>
 
+#include <atomic>
 #include <chrono>
 
 #include <nlohmann/json.hpp>
@@ -1494,23 +1495,32 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
     return cb(Response{http::OK, std::move(res)});
 }
 
+namespace {
+    struct batch_state {
+        json results = json::array();
+        std::atomic<int> remaining;
+    };
+}  // namespace
+
 void RequestHandler::process_client_req(rpc::batch&& req, std::function<void(rpc::Response)> cb) {
 
     assert(!req.subreqs.empty());
 
-    // `cb` expects to be invoked once with the full response, but we have a vector of requests to
-    // initiate and many possible subrequests (like `store`) are asynchronous because they recurse
-    // through the swarm.  Responses thus may arrive at random times, so we need to fully populate
-    // our subresults initially (with nulls) them fill in the values as they arrive.  Once we get a
-    // full set of non-null values, we can then pass the final response back to `cb`.
+    // `cb` expects to be invoked once with the full response, but many subrequests (like `store`)
+    // complete asynchronously on OMQ worker threads because they recurse through the swarm, so
+    // several handlers below can run concurrently.  Each one writes only its own pre-allocated
+    // element of `results`, and the last one to decrement `remaining` sends the reply; the atomic
+    // decrement is what guarantees it sees the other handlers' completed writes.  The results
+    // array must not be resized after this point.
 
-    auto subresults = std::make_shared<json>(json::array());
+    auto state = std::make_shared<batch_state>();
+    state->remaining = req.subreqs.size();
     for (size_t i = 0; i < req.subreqs.size(); i++)
-        subresults->emplace_back();
+        state->results.emplace_back();
 
     for (size_t i = 0; i < req.subreqs.size(); i++) {
-        auto handler = [b64 = req.b64, subresults, i, cb](Response r) {
-            json& subres = (*subresults)[i];
+        auto handler = [b64 = req.b64, state, i, cb](Response r) {
+            json& subres = state->results[i];
             subres["code"] = r.status.first;
             if (auto* j = std::get_if<json>(&r.body))
                 subres["body"] = std::move(*j);
@@ -1520,14 +1530,8 @@ void RequestHandler::process_client_req(rpc::batch&& req, std::function<void(rpc
                             : std::string{reinterpret_cast<const char*>(b->data()), b->size()};
             else
                 subres["body"] = std::string{view_body(r)};
-            bool done = true;
-            for (auto& sr : *subresults)
-                if (sr.is_null()) {
-                    done = false;
-                    break;
-                }
-            if (done)
-                cb(Response{http::OK, json({{"results", std::move(*subresults)}})});
+            if (--state->remaining == 0)
+                cb(Response{http::OK, json({{"results", std::move(state->results)}})});
         };
         std::visit(
                 [this, handler = std::move(handler)](auto&& s) {

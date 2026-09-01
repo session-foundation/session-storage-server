@@ -464,8 +464,10 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                     res->cmd,
                     peer.first,
                     ct ? "is non-contactable" : "not found");
-            res->pending--;
 
+            // Replies to peers we already sent to in this loop may be arriving on worker threads.
+            std::lock_guard lock{res->mutex};
+            res->pending--;
             res->db_req_id = sn.db->add_retry_request(
                     peer.first, res->cmd, res->req_payload, res->db_req_id);
             continue;

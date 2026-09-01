@@ -135,11 +135,6 @@ class ServiceNode {
 
     mutable std::recursive_mutex sn_mutex_;
 
-    // Lock to be taken when interacting with the 'retryable_requests' queue
-    mutable std::mutex retryable_requests_mutex;
-
-    std::thread retryable_requests_thread;
-
     // The hash of the last swarms blob that was serialised, used for dirty checks before storing to
     // the DB.
     uint64_t last_swarms_serialize_hash = 0;
@@ -314,10 +309,6 @@ class ServiceNode {
     void set_member_needs_db_dump(const crypto::legacy_pubkey& pk);
 
     server::OMQ& omq_server() { return omq_server_; }
-
-    std::condition_variable retryable_requests_cv;
-
-    void retryable_requests_thread_entry_point();
 
     void check_retry_requests();
 };

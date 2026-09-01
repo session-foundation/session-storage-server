@@ -48,6 +48,10 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
+// How often to look for stored swarm requests that are due to be retried.  A retry is never due
+// sooner than 5s after the original request timed out, so there is no need to poll faster.
+constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
+
 // TODO: if these *are* going to be named constants rather than just existing in 2 places
 //       (where this is serialized and where it is deserialized), they should live in the header
 //       or something.
@@ -132,9 +136,7 @@ ServiceNode::ServiceNode(
             },
             1h);
 
-    // Setup the retryable requests thread
-    retryable_requests_thread =
-            std::thread(&ServiceNode::retryable_requests_thread_entry_point, this);
+    omq_server_->add_timer([this] { check_retry_requests(); }, RETRY_REQUEST_CHECK_INTERVAL);
 }
 
 void ServiceNode::on_oxend_connected() {
@@ -384,8 +386,6 @@ void ServiceNode::bootstrap_fallback() {
 
 void ServiceNode::shutdown() {
     shutting_down_ = true;
-    retryable_requests_cv.notify_all();
-    retryable_requests_thread.join();
 }
 
 bool ServiceNode::snode_ready(std::string* reason) {
@@ -1343,28 +1343,4 @@ void ServiceNode::check_retry_requests() {
     });
 }
 
-void ServiceNode::retryable_requests_thread_entry_point() {
-    while (!shutting_down_) {
-        // FIXME: is this extra wakeup necessary/useful?  If a retry is pending, the initial
-        //        request must have timed out (5 seconds), so presumably just checking on retries
-        //        every 5 seconds (maybe slightly more frequently?) should be fine.
-        //
-        // At longest, we timeout on the blocking sleep every 5s, or, as soon as someone wakes up
-        // the thread by notifying the condition var
-        //  - when a new retryable request is added
-        //  - we're shutting down
-        //  - or we know there's an earlier deadline in the list of requests to be retried
-        //  - a node's contact detail was updated
-        //  - a retryable request failed and a new deadline was posted
-        auto earliest_deadline = std::chrono::steady_clock::now() + 5s;
-
-        std::unique_lock lock{retryable_requests_mutex};
-        retryable_requests_cv.wait_until(lock, earliest_deadline);
-
-        if (shutting_down_)
-            break;
-
-        check_retry_requests();
-    }
-}
 }  // namespace oxenss::snode

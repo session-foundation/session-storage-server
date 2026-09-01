@@ -1348,21 +1348,21 @@ int64_t Database::add_retry_request(
                 payload);
     }
 
-    // first retry 5 seconds after insertion, subsequent retries will be 60 seconds after the last.
     impl->prepared_exec(
-            "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, unixepoch('now', "
-            "'subsec') + 5)",
+            "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, ?)",
             req_id,
-            key.str());
+            key.str(),
+            to_epoch_double(std::chrono::system_clock::now() + RETRY_INITIAL_DELAY));
 
     return req_id;
 }
 
-void Database::foreach_ready_retry_request(std::function<
-                                           void(const crypto::legacy_pubkey& key,
-                                                const std::string& cmd,
-                                                const std::string& payload,
-                                                int64_t req_id)> callback) {
+void Database::foreach_ready_retry_request(
+        std::function<
+                bool(const crypto::legacy_pubkey& key,
+                     const std::string& cmd,
+                     const std::string& payload,
+                     int64_t req_id)> callback) {
     auto impl = get_impl(/*write =*/true);
 
     // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
@@ -1371,15 +1371,19 @@ void Database::foreach_ready_retry_request(std::function<
             "SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
             " WHERE next_retry < unixepoch('now', 'subsec')"));
 
-    // retry 60 seconds after this retry.  Initial retries are staggered (5sec after timeout),
-    // but it doesn't seem useful to stagger here.  Further, it would be a pain to do so after
-    // restart.  Could update this time if/when the retry fails, but here seems more convenient.
-    auto next_time = to_epoch_double(std::chrono::system_clock::now() + 60s);
+    // The next retry time is set here, before the outcome of the request is known, rather than
+    // when the request times out: a successful or definitively failed request deletes the row
+    // (making this update moot), and doing it here avoids a second write on every timeout.
+    auto now = std::chrono::system_clock::now();
+    auto sent_retry = to_epoch_double(now + RETRY_INTERVAL);
+    auto unsent_retry = to_epoch_double(now + RETRY_NO_CONTACT_INTERVAL);
 
     for (auto& [req_id, key_str, cmd, payload] : ready) {
+        bool sent = callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
         impl->prepared_exec(
-                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?", next_time, req_id);
-        callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
+                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?",
+                sent ? sent_retry : unsent_retry,
+                req_id);
     }
 }
 

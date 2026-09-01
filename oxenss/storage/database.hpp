@@ -70,6 +70,14 @@ class Database {
 
     static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
 
+    // How long after a swarm request to a peer times out before we first retry it.
+    static constexpr auto RETRY_INITIAL_DELAY = 5s;
+    // How long to wait between retry attempts once a retry has been sent.
+    static constexpr auto RETRY_INTERVAL = 60s;
+    // How long to wait before re-checking a retry that could not be sent because we had no contact
+    // details for the peer.
+    static constexpr auto RETRY_NO_CONTACT_INTERVAL = 15s;
+
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().
     explicit Database(std::filesystem::path db_path);
@@ -240,12 +248,16 @@ class Database {
             int64_t req_id = 0);
 
     // executes the provided callback for each request retry in the database which ready to retry.
-    // The table id is provided so the callback can call remove_retry_request on success.
-    void foreach_ready_retry_request(std::function<
-                                     void(const crypto::legacy_pubkey& key,
-                                          const std::string& cmd,
-                                          const std::string& payload,
-                                          int64_t req_id)>);
+    // The table id is provided so the callback can call remove_retry_request on success.  The
+    // callback returns true if it sent the request, in which case the next retry is scheduled
+    // RETRY_INTERVAL out, or false if it could not send it (e.g. no contact details yet), in which
+    // case the next retry is scheduled RETRY_NO_CONTACT_INTERVAL out.
+    void foreach_ready_retry_request(
+            std::function<
+                    bool(const crypto::legacy_pubkey& key,
+                         const std::string& cmd,
+                         const std::string& payload,
+                         int64_t req_id)>);
 
     // This is just for the test suite, as using "ready retry requests" as above would require it
     // to take several seconds longer to execute, per call.

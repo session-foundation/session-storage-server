@@ -1314,32 +1314,29 @@ void ServiceNode::check_retry_requests() {
         // FIXME: non-swarm-member retries should be purged automatically
         // std::optional<SwarmMemberState> is_member = swarm_.is_member(key);
 
-        crypto::x25519_pubkey pubkey_x25519 = {};
-
         auto ct = contacts().find(key);
-        if (ct && *ct)
-            pubkey_x25519 = ct->pubkey_x25519;
+        if (!ct || !*ct)
+            return false;
 
-        if (pubkey_x25519) {
-            auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
-                // We cleanup the request in all situations except timeout (timeout
-                // indicating that the node was non-responsive, maybe offline). In an error
-                // state we don't know what state the recipient's storage server is in and
-                // we default to deleting it and ending the retry attempts.
-                rpc::SNStorageCCResult store_result =
-                        rpc::interpret_sn_storage_cc_response_parts(success, parts);
-                if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
-                    db->remove_node_retry_request(req_id);
-                }
-            };
-            omq_server()->request(
-                    pubkey_x25519.view(),
-                    "sn.storage_cc",
-                    on_request_done,
-                    cmd,
-                    payload,
-                    oxenmq::send_option::request_timeout{5s});
-        }
+        auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
+            // We cleanup the request in all situations except timeout (timeout
+            // indicating that the node was non-responsive, maybe offline). In an error
+            // state we don't know what state the recipient's storage server is in and
+            // we default to deleting it and ending the retry attempts.
+            rpc::SNStorageCCResult store_result =
+                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
+            if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+                db->remove_node_retry_request(req_id);
+            }
+        };
+        omq_server()->request(
+                ct->pubkey_x25519.view(),
+                "sn.storage_cc",
+                on_request_done,
+                cmd,
+                payload,
+                oxenmq::send_option::request_timeout{5s});
+        return true;
     });
 }
 

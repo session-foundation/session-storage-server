@@ -71,7 +71,7 @@ class Database {
     static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
 
     // How long after a swarm request to a peer times out before we first retry it.
-    static constexpr auto RETRY_INITIAL_DELAY = 5s;
+    static constexpr auto RETRY_INITIAL_DELAY = 15s;
     // How long to wait between retry attempts once a retry has been sent.
     static constexpr auto RETRY_INTERVAL = 60s;
     // How long to wait before re-checking a retry that could not be sent because we had no contact

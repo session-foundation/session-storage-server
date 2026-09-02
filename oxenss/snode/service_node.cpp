@@ -48,8 +48,8 @@ constexpr auto OXEND_PING_INTERVAL = 30s;
 // swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 
-// How often to look for stored swarm requests that are due to be retried.  A retry is never due
-// sooner than 5s after the original request timed out, so there is no need to poll faster.
+// How often to look for stored swarm requests that are due to be retried.  This bounds how late a
+// retry can go out past its Database::RETRY_INITIAL_DELAY / RETRY_INTERVAL schedule.
 constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
 
 // How long to wait for a reply to a retried swarm request.  This is longer than the timeout on the

@@ -69,27 +69,6 @@ constexpr std::string_view to_string(SnodeStatus status) {
     return "Unknown"sv;
 }
 
-enum class RetryReason {
-    NON_CONTACTABLE,
-    FAILED_TO_SEND,
-};
-
-struct RequestRetryEntry {
-    crypto::legacy_pubkey key;
-    RetryReason reason;
-    bool retry_underway;
-    std::chrono::steady_clock::time_point deadline;
-    std::chrono::milliseconds next_retry_delay;
-};
-
-struct RequestRetry {
-    std::string cmd;
-    std::string req_payload;
-    uint64_t hash;
-    std::chrono::steady_clock::time_point create_time;
-    std::vector<RequestRetryEntry> nodes;
-};
-
 /// All service node logic that is not network-specific
 class ServiceNode {
     bool syncing_ = true;

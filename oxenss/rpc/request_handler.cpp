@@ -27,6 +27,7 @@
 #include <sodium/crypto_scalarmult_ed25519.h>
 #include <sodium/crypto_sign.h>
 #include <type_traits>
+#include <utility>
 #include <variant>
 
 using nlohmann::json;
@@ -1590,7 +1591,9 @@ void RequestHandler::process_client_req(
             subres["body"] = std::string{view_body(r)};
 
         if (status < 200 || status > 299 || manager->subresults.size() >= manager->subreqs.size()) {
-            manager->subresult_callback = nullptr;
+            // Break the manager's self-ownership cycle, but keep the lambda alive until we return
+            // in case this invocation is running from the manager's own copy.
+            auto self = std::exchange(manager->subresult_callback, nullptr);
             cb(Response{http::OK, json({{"results", std::move(manager->subresults)}})});
         } else {
             // subrequest was successful and we're not done, so fire off the next one

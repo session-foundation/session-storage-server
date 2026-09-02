@@ -52,6 +52,10 @@ constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
 // sooner than 5s after the original request timed out, so there is no need to poll faster.
 constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
 
+// How long to wait for a reply to a retried swarm request.  This is longer than the timeout on the
+// original request since the peer has already failed to answer within that once.
+constexpr auto RETRY_REQUEST_TIMEOUT = 10s;
+
 // TODO: if these *are* going to be named constants rather than just existing in 2 places
 //       (where this is serialized and where it is deserialized), they should live in the header
 //       or something.
@@ -1335,7 +1339,7 @@ void ServiceNode::check_retry_requests() {
                 on_request_done,
                 cmd,
                 payload,
-                oxenmq::send_option::request_timeout{5s});
+                oxenmq::send_option::request_timeout{RETRY_REQUEST_TIMEOUT});
         return true;
     });
 }

@@ -158,7 +158,7 @@ local static_check_and_upload = [
   debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386', werror=false),
   debian_pipeline('Ubuntu LTS (amd64)', docker_base + 'ubuntu-lts', oxen_repo=true),
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
-  debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm'),
+  debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm', oxen_repo=true),
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),

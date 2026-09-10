@@ -124,47 +124,6 @@ local clang(version, lto=false) = debian_pipeline(
   lto=lto
 );
 
-// Macos build
-local mac_builder(name,
-                  build_type='Release',
-                  lto=false,
-                  werror=true,
-                  build_tests=true,
-                  run_tests=true,
-                  test_oxen_storage=true,  // Makes sure oxen-storage --version runs
-                  cmake_extra='',
-                  extra_cmds=[],
-                  extra_steps=[],
-                  jobs=6,
-                  allow_fail=false) = {
-  kind: 'pipeline',
-  type: 'exec',
-  name: name,
-  platform: { os: 'darwin', arch: 'amd64' },
-  steps: [
-    { name: 'submodules', commands: submodules_commands },
-    {
-      name: 'build',
-      environment: { SSH_KEY: { from_secret: 'SSH_KEY' } },
-      commands: [
-                  // If you don't do this then the C compiler doesn't have an include path containing
-                  // basic system headers.  WTF apple:
-                  'export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"',
-                  'mkdir build',
-                  'cd build',
-                  'cmake .. -G Ninja -DCMAKE_CXX_FLAGS=-fcolor-diagnostics -DCMAKE_BUILD_TYPE=' + build_type
-                  + ' -DLOCAL_MIRROR=https://oxen.rocks/deps -DEXTRA_WARNINGS=ON '
-                  + cmake_options({ USE_LTO: lto, WARNINGS_AS_ERRORS: werror, BUILD_TESTS: build_tests || run_tests })
-                  + cmake_extra,
-                  'ninja -j' + jobs + ' -v',
-                ] +
-                (if test_oxen_storage then ['./oxen-storage --version'] else []) +
-                (if run_tests then ['./unit_test/Test'] else []) +
-                extra_cmds,
-    },
-  ] + extra_steps,
-};
-
 local static_check_and_upload = [
   '../contrib/drone-check-static-libs.sh',
   'ninja strip',
@@ -199,31 +158,17 @@ local static_check_and_upload = [
   debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386', werror=false),
   debian_pipeline('Ubuntu LTS (amd64)', docker_base + 'ubuntu-lts', oxen_repo=true),
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
-  debian_pipeline('Debian 11 bullseye (amd64)',
-                  docker_base + 'debian-bullseye',
-                  deps=default_deps_base,
-                  oxen_repo=true,
-                  extra_setup=kitware_repo('focal'),
-                  cmake_extra='-DDOWNLOAD_SODIUM=ON'),
+  debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm', oxen_repo=true),
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),
   debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false),
 
   // Static build (on bionic) which gets uploaded to oxen.rocks:
-  debian_pipeline('Static (focal amd64)',
-                  docker_base + 'ubuntu-focal',
-                  extra_setup=kitware_repo('focal'),
-                  deps=['autoconf', 'automake', 'file', 'g++-10', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
-                  cmake_extra='-DBUILD_STATIC_DEPS=ON -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10',
+  debian_pipeline('Static (jammy amd64)',
+                  docker_base + 'ubuntu-jammy',
+                  deps=['autoconf', 'automake', 'file', 'g++', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
+                  cmake_extra='-DBUILD_STATIC_DEPS=ON',
                   lto=true,
                   extra_cmds=static_check_and_upload),
-
-  // Macos builds:
-  mac_builder('macOS (Static)',
-              cmake_extra='-DBUILD_STATIC_DEPS=ON',
-              lto=true,
-              extra_cmds=static_check_and_upload),
-  mac_builder('macOS (Release)'),
-  mac_builder('macOS (Debug)', build_type='Debug'),
 ]

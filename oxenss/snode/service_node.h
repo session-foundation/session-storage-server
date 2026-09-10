@@ -57,11 +57,7 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 // The storage server version at which initial handshaking is supported before attempting a swarm
 // message transfer.
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
-
-class Swarm;
-
-/// WRONG_REQ - request was ignored as not valid (e.g. incorrect tester)
-enum class MessageTestStatus { SUCCESS, RETRY, ERROR, WRONG_REQ };
+inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 11, 0};
 
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
@@ -79,21 +75,27 @@ class ServiceNode {
     bool active_ = false;
     std::atomic<bool> got_first_response_ = false;
     bool force_start_ = false;
+    bool skip_bootstrap_ = false;
     std::atomic<bool> shutting_down_ = false;
     hf_revision hardfork_ = {0, 0};
     uint64_t block_height_ = 0;
     uint64_t target_height_ = 0;
     std::string block_hash_;
-    std::unique_ptr<Database> db_;
     std::weak_ptr<http::Client> http_;
 
+  public:
+    // bit messy, but Swarm needs db startup version, so db has to init before Swarm
+    std::unique_ptr<Database> db;
+
+  private:
     SnodeStatus status_ = SnodeStatus::UNKNOWN;
 
     const crypto::legacy_keypair our_keys_;
     const contact our_contact_;
 
     Network network_;
-    Swarm swarm_{network_, our_keys_.pub};
+
+    Swarm swarm_;
 
     server::OMQ& omq_server_;
     std::vector<server::MQBase*> mq_servers_;
@@ -111,6 +113,14 @@ class ServiceNode {
     mutable all_stats all_stats_;
 
     mutable std::recursive_mutex sn_mutex_;
+
+    // The hash of the last swarms blob that was serialised, used for dirty checks before storing to
+    // the DB.
+    uint64_t last_swarms_serialize_hash = 0;
+
+    // The hash of the last retryable requsts blob that was serialised, used for dirty checks before
+    // storing to the DB.
+    uint64_t last_retryable_serialize_hash = 0;
 
     void send_notifies(message m);
 
@@ -170,16 +180,15 @@ class ServiceNode {
             const contact& contact,
             server::OMQ& omq_server,
             const std::filesystem::path& db_location,
-            bool force_start);
-
-    Database& get_db() { return *db_; }
-    const Database& get_db() const { return *db_; }
+            bool force_start,
+            bool skip_bootstrap);
 
     const Network& network() { return network_; }
 
     const Swarm& swarm() { return swarm_; }
 
     Contacts& contacts() { return network_.contacts; }
+
     const Contacts& contacts() const { return network_.contacts; }
 
     const contact& own_address() { return our_contact_; }
@@ -210,8 +219,9 @@ class ServiceNode {
             rpc::OnionRequestMetadata&& data,
             std::function<void(bool success, std::vector<std::string> data)> cb) const;
 
-    // Returns true if the given x pubkey is recognized as one of our current swarm members
-    bool is_swarm_peer(const crypto::x25519_pubkey& xpk);
+    // Returns the peer's state if the given x pubkey is recognized as one of our current swarm
+    // members
+    std::optional<SwarmMemberState> is_swarm_peer(const crypto::x25519_pubkey& xpk);
 
     const hf_revision& hf() const { return hardfork_; }
 
@@ -271,8 +281,19 @@ class ServiceNode {
     // Called when oxend notifies us of a new block to update swarm info
     void update_swarms(std::promise<bool>* on_completion = nullptr);
 
+    // Mark the swarm member identified by 'pk' as needing a dump of the DB. When the 'check new
+    // members' routine for swarms is periodically executed, swarm members marked with this flag
+    // will then get the entire DB synchronised to them. No-op if the key does not match anyone in
+    // the swarm.
+    void set_member_needs_db_dump(const crypto::legacy_pubkey& pk);
+
     server::OMQ& omq_server() { return omq_server_; }
+
+    void check_retry_requests();
 };
+
+// at the moment we only care about the "needs_db_dump" boolean
+bool deserialise_data_ready_request(std::string_view data);
 
 }  // namespace oxenss::snode
 

@@ -11,15 +11,37 @@ namespace oxenss::snode {
 
 Network::Network(oxenmq::OxenMQ& omq) : contacts{omq} {}
 
-uint64_t Network::pubkey_to_swarm_space(const user_pubkey& pk) {
-    const auto bytes = pk.raw();
-    assert(bytes.size() == 32);
+std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm) const {
+    if (swarms_.size() <= 1)
+        return {0, 0};
 
-    uint64_t res = 0;
-    for (size_t i = 0; i < bytes.size(); i += 8)
-        res ^= oxenc::load_big_to_host<uint64_t>(bytes.data() + i);
+    const auto it = swarms_.find(swarm);
+    if (it == swarms_.end())
+        throw std::logic_error{"This function should only be called with a current swarm id."};
 
-    return res;
+    // FIXME: this logic is a little weird, but should work.
+    uint64_t prev_swarm, next_swarm;
+    if (it == swarms_.begin()) {
+        next_swarm = std::next(it)->first;
+        prev_swarm = std::prev(swarms_.end())->first;
+    } else {
+        prev_swarm = std::prev(it)->first;
+        auto it2 = std::next(it);
+        if (it2 == swarms_.end())
+            it2 = swarms_.begin();
+        next_swarm = it2->first;
+    }
+
+    // now have target swarm id, the one before it, and the one after it
+    //
+    // in the event of a distance tie in swarm space (e.g. id 1 and 7 with swarm space 4),
+    // the "right" (next) swarm loses.  This means when querying with what we return here,
+    // we should do x > lower_bound AND x <= upper_bound
+    auto left_diff = swarm - prev_swarm;
+    if (left_diff % 2)
+        left_diff += 1;  // round the average up on the left side
+    auto right_diff = next_swarm - swarm;
+    return {swarm - (left_diff / 2), swarm + (right_diff / 2)};
 }
 
 swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
@@ -29,6 +51,10 @@ swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
         return swarms_.begin();
 
     const uint64_t swarm_pos = pubkey_to_swarm_space(pk);
+    return _find_swarm_for_swarm_space(swarm_pos);
+}
+
+swarms_t::const_iterator Network::_find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const {
 
     // Find the right boundary, i.e. first swarm with swarm_id >= res
     auto right_it = swarms_.lower_bound(swarm_pos);
@@ -151,6 +177,14 @@ std::shared_ptr<std::vector<std::byte>> Network::all_nodes_blob() const {
 
     all_nodes_blob_ = blob;
     return blob;
+}
+
+std::set<swarm_id_t> Network::get_all_swarm_ids() const {
+    std::set<swarm_id_t> ret;
+
+    for (const auto& [id, swarm] : swarms_)
+        ret.emplace(id);
+    return ret;
 }
 
 }  // namespace oxenss::snode

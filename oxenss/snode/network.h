@@ -37,7 +37,7 @@ class Network {
 
     friend class Swarm;
 
-    swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
+    friend class ServiceNode;
 
     // Cached value of the all_nodes_blob() return value.  The cache is cleared whenever swarms or
     // any contact info changes.
@@ -53,16 +53,16 @@ class Network {
             swarms_t&& new_swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts);
 
   public:
+    std::pair<uint64_t, uint64_t> get_swarm_boundaries(const uint64_t swarm) const;
+    swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
+    swarms_t::const_iterator _find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const;
+
     /// Constructs a Network object.  The omq instance will be passed to `contacts` so that any
     /// x25519 pubkey list changes are automatically propagated to oxenmq for SN authentication.
     Network(oxenmq::OxenMQ& omq);
 
     // Holds all current contact information for network nodes.
     Contacts contacts;
-
-    /// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
-    /// has a swarm id closest to this pubkey-derived value.
-    static uint64_t pubkey_to_swarm_space(const user_pubkey& pk);
 
     // Looks up the swarm for a pubkey and returns the swarm_id.  Returns nullopt on error (which
     // will only happen if there are no swarms at all).
@@ -97,6 +97,8 @@ class Network {
     // This value is cached and recomputed whenever swarms or contact info of any active node
     // changes.
     std::shared_ptr<std::vector<std::byte>> all_nodes_blob() const;
+
+    std::set<swarm_id_t> get_all_swarm_ids() const;
 };
 
 }  // namespace oxenss::snode

@@ -153,7 +153,12 @@ int main(int argc, char* argv[]) {
         auto& oxenmq_server = *oxenmq_server_ptr;
 
         snode::ServiceNode service_node{
-                l_keys, me, oxenmq_server, options.data_dir, options.force_start};
+                l_keys,
+                me,
+                oxenmq_server,
+                options.data_dir,
+                options.force_start,
+                options.skip_bootstrap};
 
         rpc::RequestHandler request_handler{service_node, channel_encryption, ed_keys.sec};
 

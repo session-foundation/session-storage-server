@@ -4,6 +4,7 @@
 #include <SQLiteCpp/Statement.h>
 #include <SQLiteCpp/Transaction.h>
 #include <oxenss/logging/oxen_logger.h>
+#include <limits>
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 #include <oxenss/common/format.h>
@@ -18,6 +19,9 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include "oxenc/bt_serialize.h"
+#include "oxenc/bt_value.h"
+#include "oxenss/crypto/keys.h"
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <sqlite3.h>
@@ -230,6 +234,34 @@ namespace {
 
 }  // namespace
 
+user_pubkey load_pubkey(uint8_t type, std::string pk) {
+    return {type, std::move(pk)};
+}
+
+void sqlite_swarm_space(
+        sqlite3_context* sqlite_context, [[maybe_unused]] int argc, sqlite3_value** argv, bool hi) {
+    assert(argc == 1);
+    assert(sqlite3_value_bytes(argv[0]));
+    auto* key_blob = sqlite3_value_blob(argv[0]);
+    auto pubkey = load_pubkey(0 /* irrelevant */, {reinterpret_cast<const char*>(key_blob), 32});
+    auto swarm_space = pubkey_to_swarm_space(pubkey);
+
+    if (hi)
+        swarm_space = swarm_space >> 32;
+    else
+        swarm_space = swarm_space & 0xffffffff;
+
+    sqlite3_result_int64(sqlite_context, swarm_space);
+}
+
+void sqlite_swarm_space_hi(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv) {
+    sqlite_swarm_space(sqlite_context, argc, argv, true);
+}
+
+void sqlite_swarm_space_lo(sqlite3_context* sqlite_context, int argc, sqlite3_value** argv) {
+    sqlite_swarm_space(sqlite_context, argc, argv, false);
+}
+
 class DatabaseImpl {
   public:
     oxenss::Database& parent;
@@ -245,6 +277,11 @@ class DatabaseImpl {
                SQLite::OPEN_READWRITE | (initialize ? SQLite::OPEN_CREATE : 0) |
                        SQLite::OPEN_NOMUTEX,
                SQLite_busy_timeout.count()} {
+
+        // intialize sqlite application-defined functions (must be set up per-connection).
+        db.createFunction("func_swarm_space_hi", 1, true, nullptr, &sqlite_swarm_space_hi);
+        db.createFunction("func_swarm_space_lo", 1, true, nullptr, &sqlite_swarm_space_lo);
+
         // Don't fail on these because we can still work even if they fail
         if (int rc = db.tryExec("PRAGMA journal_mode = WAL"); rc != SQLITE_OK)
             log::error(logcat, "Failed to set journal mode to WAL: {}", sqlite3_errstr(rc));
@@ -283,6 +320,8 @@ class DatabaseImpl {
     }
 
     void initialize_database() {
+        parent._had_swarm_state_on_open = db.tableExists("state_kv");
+
         if (!db.tableExists("owners")) {
             create_schema();
         }
@@ -332,8 +371,124 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
             )");
         }
 
-        views_triggers_indices();
+        if (!parent._had_swarm_state_on_open) {
+            log::info(
+                    logcat,
+                    "Upgrading database schema: adding swarm space cache, runtime state, "
+                    "retryable requests, and public namespace unique constraint");
 
+            // swarm space is 64-bit unsigned, which means unfortunately we can't do queries
+            // on it with arithmetic properly (sqlite INTEGER is 64-bit signed).  As such, we
+            // store it as two separate columns so we can query on it.
+            //
+            // The added trigger will automatically populate these two columns on insert, and the
+            // existing rows will have these columns populated by the UPDATE query after this.
+            db.exec(R"(
+ALTER TABLE owners ADD COLUMN swarm_space_hi INTEGER NOT NULL DEFAULT -1;
+ALTER TABLE owners ADD COLUMN swarm_space_lo INTEGER NOT NULL DEFAULT -1;
+
+CREATE TRIGGER swarm_space_trigger
+AFTER INSERT ON owners
+FOR EACH ROW
+WHEN NEW.swarm_space_hi = -1 OR NEW.swarm_space_lo = -1
+BEGIN
+    UPDATE owners SET
+    swarm_space_hi = func_swarm_space_hi(NEW.pubkey), swarm_space_lo = func_swarm_space_lo(NEW.pubkey)
+    WHERE owners.id = NEW.id;
+END;
+            )");
+
+            db.exec(R"(
+UPDATE owners
+SET swarm_space_hi = func_swarm_space_hi(pubkey),
+swarm_space_lo = func_swarm_space_lo(pubkey)
+WHERE swarm_space_hi = -1;
+            )");
+
+            db.exec(R"(
+CREATE TABLE retry_requests (
+    id INTEGER PRIMARY KEY,
+    command TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    -- 2440587.5 is the julian day of the unix epoch, so this is unix time with the subsecond part
+    -- retained.  Switch to the more legible `unixepoch('now', 'subsec')` once we require sqlite
+    -- 3.42+: `subsec` arrived in 3.42, and Debian bookworm has 3.40, where an unrecognized date
+    -- modifier makes the whole expression NULL rather than raising, so the breakage would surface
+    -- only as a NOT NULL failure at insertion time.
+    created DOUBLE PRECISION NOT NULL DEFAULT ((julianday('now') - 2440587.5) * 86400.0)
+);
+
+CREATE TABLE retry_pubkeys (
+    id INTEGER PRIMARY KEY,
+    pubkey BLOB NOT NULL,
+    UNIQUE(pubkey)
+);
+
+CREATE TABLE retry_node_requests (
+    id INTEGER PRIMARY KEY,
+    rr_id INTEGER NOT NULL REFERENCES retry_requests(id) ON DELETE CASCADE,
+    pk_id INTEGER NOT NULL REFERENCES retry_pubkeys(id) ON DELETE CASCADE,
+    next_retry DOUBLE PRECISION NOT NULL,
+    UNIQUE(rr_id, pk_id)
+);
+
+CREATE INDEX retry_node_requests_pk_idx ON retry_node_requests(pk_id);
+
+CREATE VIEW retry_node_reqs AS
+    SELECT retry_node_requests.id AS rr_id, retry_requests.command, retry_requests.payload,
+    retry_pubkeys.pubkey AS pubkey, next_retry
+    FROM retry_node_requests
+    JOIN retry_requests ON retry_node_requests.rr_id = retry_requests.id
+    JOIN retry_pubkeys ON pk_id = retry_pubkeys.id;
+
+CREATE TRIGGER retry_node_add
+INSTEAD OF INSERT ON retry_node_reqs
+BEGIN
+    -- Allows insertion into the view (with the raw pubkey value) to automatically do the pubkey
+    -- lookup (with autovivification) for you.
+    INSERT OR IGNORE INTO retry_pubkeys (pubkey) VALUES (NEW.pubkey);
+    INSERT INTO retry_node_requests (rr_id, pk_id, next_retry)
+    VALUES (NEW.rr_id, (SELECT id FROM retry_pubkeys WHERE retry_pubkeys.pubkey = NEW.pubkey), NEW.next_retry);
+END;
+
+CREATE TRIGGER rr_cleanup
+AFTER DELETE ON retry_node_requests
+BEGIN
+    -- After deleting a node request record this trigger handles cleaning up any pubkeys or request
+    -- commands that are no longer referenced.
+    DELETE FROM retry_pubkeys
+    WHERE id = OLD.pk_id
+        AND NOT EXISTS (
+            SELECT 1 FROM retry_node_requests WHERE pk_id = OLD.pk_id
+        );
+    DELETE FROM retry_requests
+    WHERE id = OLD.rr_id
+        AND NOT EXISTS (
+            SELECT 1 FROM retry_node_requests WHERE rr_id = OLD.rr_id
+        );
+END;
+
+-- Generic key->value store for the database
+-- in future, we may explicitly require TEXT for keys, but arbitrary type for values.
+-- store arbitrary persistent state, e.g. which swarm were we in before restart
+CREATE TABLE state_kv (
+    key TEXT NOT NULL,
+    value TEXT,
+    UNIQUE(key)
+);
+
+-- public namespaces are at most used for testing before this migration, so clear them before
+-- adding the unique owner/namespace index
+DELETE FROM messages WHERE namespace < 0 AND namespace % 20 = -1;
+
+CREATE UNIQUE INDEX message_outbox_singleton
+ON messages(owner, namespace)
+WHERE namespace < 0 AND namespace % 20 = -1;
+
+            )");
+        }
+
+        views_triggers_indices();
         log::info(logcat, "Database setup complete");
     }
 
@@ -462,6 +617,9 @@ CREATE INDEX IF NOT EXISTS messages_expiry ON messages(expiry);
 CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, namespace, timestamp);
 CREATE INDEX IF NOT EXISTS messages_hash ON messages(hash);
 
+CREATE INDEX IF NOT EXISTS owners_swarm_hi ON owners(swarm_space_hi);
+CREATE INDEX IF NOT EXISTS owners_swarm_lo ON owners(swarm_space_lo);
+
 CREATE VIEW IF NOT EXISTS owned_messages AS
     SELECT owners.id AS oid, type, pubkey, messages.id AS mid, hash, namespace, timestamp, expiry, data
     FROM messages JOIN owners ON messages.owner = owners.id;
@@ -507,8 +665,6 @@ DROP TRIGGER IF EXISTS owned_messages_upsert;
     auto prepared_get(const std::string& query, const Bind&... bind) {
         return exec_and_get<T...>(prepared_st(query), bind...);
     }
-
-    user_pubkey load_pubkey(uint8_t type, std::string pk) { return {type, std::move(pk)}; }
 };
 
 Database::Database(std::filesystem::path db_path) : db_path_{std::move(db_path)} {
@@ -623,15 +779,20 @@ int64_t Database::get_used_bytes() {
            impl->prepared_get<int64_t>("PRAGMA freelist_count") * impl->page_size;
 }
 
-static std::optional<message> get_message(DatabaseImpl& impl, SQLite::Statement& st) {
+std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
+    auto impl = get_impl(false);
+    auto st = impl->prepared_st(
+            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
+            " FROM owned_messages WHERE hash = ?");
+    st->bindNoCopy(1, msg_hash);
     std::optional<message> msg;
-    while (st.executeStep()) {
+    while (st->executeStep()) {
         assert(!msg);
         auto [hash, otype, opubkey, ns, ts, exp, data] =
                 get<std::string, uint8_t, std::string, namespace_id, int64_t, int64_t, std::string>(
                         st);
         msg.emplace(
-                impl.load_pubkey(otype, std::move(opubkey)),
+                load_pubkey(otype, std::move(opubkey)),
                 std::move(hash),
                 ns,
                 from_epoch_ms(ts),
@@ -639,26 +800,6 @@ static std::optional<message> get_message(DatabaseImpl& impl, SQLite::Statement&
                 std::move(data));
     }
     return msg;
-}
-
-std::optional<message> Database::retrieve_random() {
-    clean_expired();  // *Must* be before the below get_impl because otherwise the read-only impl
-                      // would deadlock with the clean_expired write=true get_impl().
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
-            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
-            " FROM owned_messages "
-            " WHERE mid = (SELECT id FROM messages ORDER BY RANDOM() LIMIT 1)");
-    return get_message(*impl, st);
-}
-
-std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
-            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
-            " FROM owned_messages WHERE hash = ?");
-    st->bindNoCopy(1, msg_hash);
-    return get_message(*impl, st);
 }
 
 StoreResult Database::store(const message& msg, std::chrono::system_clock::time_point* expiry) {
@@ -679,17 +820,6 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             owner_id = impl->prepared_get<int64_t>(
                     "INSERT INTO owners (pubkey, type) VALUES (?, ?) RETURNING id", msg.pubkey);
 
-        // When storing to a public namespace we clear anything there (except for a duplicate, to
-        // avoid unnecessary storage churn).
-        if (is_public_outbox_namespace(msg.msg_namespace)) {
-            impl->prepared_exec(
-                    "DELETE FROM messages"
-                    " WHERE owner = ? AND namespace = ? AND hash != ?",
-                    owner_id,
-                    msg.msg_namespace,
-                    msg.hash);
-        }
-
         auto new_exp = to_epoch_ms(msg.expiry);
 
         if (auto existing = exec_and_maybe_get<int64_t, int64_t>(
@@ -706,15 +836,25 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             if (expiry)
                 *expiry = from_epoch_ms(exp);
         } else {
-            impl->prepared_exec(
+            auto rows = impl->prepared_exec(
                     "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
+                    " DO UPDATE SET"
+                    " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
+                    " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
+                    " WHERE EXCLUDED.timestamp > messages.timestamp",
                     owner_id,
                     msg.hash,
                     msg.msg_namespace,
                     to_epoch_ms(msg.timestamp),
                     to_epoch_ms(msg.expiry),
                     blob_binder{msg.data});
+
+            // did not insert, which means public namespace and not newer
+            if (rows == 0)
+                return StoreResult::Obsolete;
+
             ret = StoreResult::New;
 
             if (expiry)
@@ -768,7 +908,14 @@ void Database::bulk_store(const std::vector<message>& items) {
     auto insert_message = impl->prepared_st(
             "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
             " VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT DO NOTHING");
+            " ON CONFLICT (hash)"
+            " DO UPDATE SET"
+            " expiry = MAX(EXCLUDED.expiry, messages.expiry)"
+            " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
+            " DO UPDATE SET"
+            " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
+            " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
+            " WHERE EXCLUDED.timestamp > messages.timestamp");
 
     for (auto& m : items) {
         if (!m.pubkey)
@@ -869,7 +1016,7 @@ std::vector<message> Database::retrieve_all() {
                 get<uint8_t, std::string, std::string, namespace_id, int64_t, int64_t, std::string>(
                         st);
         results.emplace_back(
-                impl->load_pubkey(type, pubkey),
+                load_pubkey(type, pubkey),
                 std::move(hash),
                 ns,
                 from_epoch_ms(ts),
@@ -1189,6 +1336,169 @@ std::vector<std::string> Database::update_all_expiries(
 void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) {
     auto impl = get_impl(false);
     std::this_thread::sleep_for(duration);
+}
+
+int64_t Database::add_retry_request(
+        const crypto::legacy_pubkey& key,
+        const std::string& cmd,
+        const std::string& payload,
+        int64_t req_id) {
+    auto impl = get_impl(/*write =*/true);
+
+    // insert into request table if not present
+    if (req_id == 0) {
+        req_id = impl->prepared_get<int64_t>(
+                "INSERT INTO retry_requests (command, payload) values (?,?) RETURNING id",
+                cmd,
+                payload);
+    }
+
+    impl->prepared_exec(
+            "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, ?)",
+            req_id,
+            key.str(),
+            to_epoch_double(std::chrono::system_clock::now() + RETRY_INITIAL_DELAY));
+
+    return req_id;
+}
+
+void Database::foreach_ready_retry_request(std::function<
+                                           bool(const crypto::legacy_pubkey& key,
+                                                const std::string& cmd,
+                                                const std::string& payload,
+                                                int64_t req_id)> callback) {
+    auto impl = get_impl(/*write =*/true);
+
+    // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
+    // if the table it is reading is updated on the same connection mid-iteration.
+    //
+    // See the retry_requests.created default for why this isn't `unixepoch('now', 'subsec')`.
+    auto ready = get_all<int64_t, std::string, std::string, std::string>(
+            impl->prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
+                              " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
+
+    // The next retry time is set here, before the outcome of the request is known, rather than
+    // when the request times out: a successful or definitively failed request deletes the row
+    // (making this update moot), and doing it here avoids a second write on every timeout.
+    auto now = std::chrono::system_clock::now();
+    auto sent_retry = to_epoch_double(now + RETRY_INTERVAL);
+    auto unsent_retry = to_epoch_double(now + RETRY_NO_CONTACT_INTERVAL);
+
+    for (auto& [req_id, key_str, cmd, payload] : ready) {
+        bool sent = callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
+        impl->prepared_exec(
+                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?",
+                sent ? sent_retry : unsent_retry,
+                req_id);
+    }
+}
+
+int64_t Database::retry_request_count() {
+    auto impl = get_impl(/*write =*/false);
+    return impl->prepared_get<int64_t>("SELECT COUNT(*) from retry_node_reqs");
+}
+
+void Database::foreach_swarm_message(
+        std::function<void(const std::vector<message>&)> callback,
+        uint64_t lower_bound,
+        uint64_t upper_bound,
+        bool zero_inclusive) {
+
+    if (lower_bound > upper_bound) {
+        foreach_swarm_message(callback, lower_bound, std::numeric_limits<uint64_t>::max());
+        foreach_swarm_message(callback, 0, upper_bound, /*zero_inclusive=*/true);
+        return;
+    }
+
+    auto impl = get_impl(/*write =*/false);
+
+    constexpr size_t batch_size = 100;
+
+    std::optional<SQLite::Statement> statement;
+
+    // weird case of their exists exactly one swarm, which should be impossible
+    if (lower_bound == upper_bound) {
+        statement = SQLite::Statement{
+                impl->db,
+                "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
+                " FROM owned_messages ORDER BY mid"};
+    } else {
+        // there's probably a better way to do this, but it should be fine
+        std::string query = R"(
+SELECT type, pubkey, hash, namespace, timestamp, expiry, data
+FROM owned_messages
+JOIN owners ON oid = id
+WHERE
+        )";
+        query += R"(
+    (owners.swarm_space_hi >{0} ?1 OR (owners.swarm_space_hi == ?1 AND owners.swarm_space_lo >{0} ?2))
+    AND
+    (owners.swarm_space_hi <= ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4))
+ORDER BY mid;
+        )"_format(zero_inclusive ? "=" : "");
+
+        statement = SQLite::Statement{impl->db, query};
+
+        int pos = 1;
+        statement->bind(pos++, (int64_t)(lower_bound >> 32));
+        statement->bind(pos++, (int64_t)(lower_bound & 0xffffffff));
+        statement->bind(pos++, (int64_t)(upper_bound >> 32));
+        statement->bind(pos++, (int64_t)(upper_bound & 0xffffffff));
+    }
+
+    auto& st = *statement;
+    std::vector<message> messages;
+    while (st.executeStep()) {
+        auto [type, pubkey, hash, ns, ts, exp, data] =
+                get<uint8_t, std::string, std::string, namespace_id, int64_t, int64_t, std::string>(
+                        st);
+        messages.emplace_back(
+                load_pubkey(type, pubkey),
+                std::move(hash),
+                ns,
+                from_epoch_ms(ts),
+                from_epoch_ms(exp),
+                std::move(data));
+        if (messages.size() >= batch_size) {
+            callback(messages);
+            messages.clear();
+        }
+    }
+    if (messages.size())
+        callback(messages);
+}
+
+void Database::remove_node_retry_request(int64_t req_id) {
+    auto impl = get_impl(/*write =*/true);
+    impl->prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
+}
+
+void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
+    auto impl = get_impl(/*write =*/true);
+
+    // FIXME: retry requests don't have an expiry, so we need to pick a good expiration time
+    //        for these retries.  For now, using 4 hours ago.  Tests will pass 4 hours from
+    //        now.
+    impl->prepared_exec("DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - 4h));
+}
+
+void Database::update_current_swarm(uint64_t swarm_id) {
+    auto as_hex = oxenc::bt_serialize<uint64_t>(swarm_id);
+    auto impl = get_impl(/*write =*/true);
+    impl->prepared_exec(
+            "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)", as_hex);
+}
+
+std::optional<uint64_t> Database::get_current_swarm() {
+    auto impl = get_impl(/*write =*/false);
+    try {
+        auto as_hex = impl->prepared_get<std::string>(
+                "SELECT value FROM state_kv WHERE key = 'swarm_id'");
+        return oxenc::bt_deserialize<uint64_t>(as_hex);
+    } catch (const std::exception& e) {
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 }  // namespace oxenss

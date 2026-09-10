@@ -27,7 +27,6 @@ namespace snode {
 }  // namespace oxenss
 
 namespace oxenss::server {
-
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;
     oxenmq::ConnectionID oxend_conn_;

@@ -336,7 +336,7 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
                         f"revoked_subaccounts{ts}".encode(), encoder=Base64Encoder
                     ).signature.decode(),
                 }
-            ).encode(),
+            ).encode()
         ],
     ).get()
     assert len(r) == 1
@@ -408,14 +408,13 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
                         f"revoked_subaccounts{ts}".encode(), encoder=Base64Encoder
                     ).signature.decode(),
                 }
-            ).encode(),
+            ).encode()
         ],
     ).get()
     assert len(r) == 1
     r = json.loads(r[0])
     assert len(r["revoked_subaccounts"]) == 1
     assert r["revoked_subaccounts"][0] == b64(dude_token)
-
 
     # But the one in the revoked-keys-allowed namespace should work:
     r = omq.request_future(
@@ -511,7 +510,7 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
                         f"revoked_subaccounts{ts}".encode(), encoder=Base64Encoder
                     ).signature.decode(),
                 }
-            ).encode(),
+            ).encode()
         ],
     ).get()
     assert len(r) == 1

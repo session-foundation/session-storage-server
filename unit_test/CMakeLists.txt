@@ -19,3 +19,7 @@ target_link_libraries(Test
     Catch2::Catch2)
 
 target_include_directories(Test PRIVATE ..)
+
+add_executable(migrate_test migrate_test.cpp)
+target_link_libraries(migrate_test PRIVATE common storage utils crypto snode rpc server)
+target_include_directories(migrate_test PRIVATE ..)

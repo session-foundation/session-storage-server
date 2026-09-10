@@ -27,6 +27,12 @@ enum class namespace_id : int16_t {
     // For "old" closed group messages; allows unauthenticated store *and* retrieval.  Deprecated
     // and will be removed from a future version once no longer used.
     LegacyClosed = -10,
+
+    // A permanently reserved namespace for client and network testing: stores into it are always
+    // rejected and retrievals from it always come back empty.  Clients can rely on it behaving
+    // that way forever, which makes it a stable target for exercising request plumbing without
+    // leaving anything behind on a swarm.
+    Testing = -3741,
 };
 
 constexpr auto to_int(namespace_id ns) {
@@ -57,6 +63,15 @@ constexpr bool is_public_inbox_namespace(namespace_id ns) {
 constexpr bool is_public_outbox_namespace(namespace_id ns) {
     const auto n = to_int(ns);
     return n < 0 && -n % 20 == 1;
+}
+
+// The reserved testing namespace, which never holds anything: stores are refused and retrievals
+// short-circuit to an empty result without touching the database.
+//
+// Note that -3741 also satisfies `is_public_outbox_namespace`; this check must therefore come
+// first anywhere the public outbox rules would otherwise apply.
+constexpr bool is_testing_namespace(namespace_id ns) {
+    return ns == namespace_id::Testing;
 }
 
 // True if this namespace doesn't require authentication for retrieval: either the public outbox, or

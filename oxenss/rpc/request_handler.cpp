@@ -529,6 +529,16 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
     if (!swarm_.is_pubkey_for_us(req.pubkey))
         return cb(handle_wrong_swarm(req.pubkey));
 
+    // Must precede the public-outbox handling below: the testing namespace also matches the
+    // -(20n+1) public outbox rule, and nothing may be stored in it under any rules.
+    if (is_testing_namespace(req.msg_namespace)) {
+        log::debug(logcat, "store: refusing store to reserved testing namespace");
+        return cb(Response{
+                http::FORBIDDEN,
+                "namespace {} is reserved for testing and cannot store messages"_format(
+                        to_int(req.msg_namespace))});
+    }
+
     using namespace std::chrono;
     bool public_in = is_public_inbox_namespace(req.msg_namespace);
     auto ttl = duration_cast<milliseconds>(req.expiry - req.timestamp);
@@ -717,6 +727,14 @@ void RequestHandler::process_client_req(
         return cb(handle_wrong_swarm(req.pubkey));
 
     auto now = system_clock::now();
+
+    // Stores into the testing namespace are refused, so it is permanently empty: answer without
+    // signature checking or a database query.
+    if (is_testing_namespace(req.msg_namespace)) {
+        json res{{"messages", json::array()}, {"more", false}};
+        add_misc_response_fields(res, service_node_, now);
+        return cb(Response{http::OK, std::move(res)});
+    }
 
     if (!is_noauth_retrieve_namespace(req.msg_namespace) && !req.check_signature) {
         log::debug(logcat, "retrieve: request signature required");

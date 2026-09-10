@@ -165,11 +165,10 @@ local static_check_and_upload = [
   debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false),
 
   // Static build (on bionic) which gets uploaded to oxen.rocks:
-  debian_pipeline('Static (focal amd64)',
-                  docker_base + 'ubuntu-focal',
-                  extra_setup=kitware_repo('focal'),
-                  deps=['autoconf', 'automake', 'file', 'g++-10', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
-                  cmake_extra='-DBUILD_STATIC_DEPS=ON -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10',
+  debian_pipeline('Static (jammy amd64)',
+                  docker_base + 'ubuntu-jammy',
+                  deps=['autoconf', 'automake', 'file', 'g++', 'libtool', 'make', 'openssh-client', 'patch', 'pkg-config'],
+                  cmake_extra='-DBUILD_STATIC_DEPS=ON',
                   lto=true,
                   extra_cmds=static_check_and_upload),
 ]

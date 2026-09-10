@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -105,6 +106,15 @@ class MQBase {
 
     void update_monitors(std::vector<sub_info>& subs, connection_id conn);
 
+    // Removes every monitor subscription belonging to `conn`, for a connection that has gone away.
+    // Only connections tracked in `monitoring_conns_` can be removed this way; for anything else
+    // this does nothing.
+    void remove_monitors_for(const connection_id& conn);
+
+    // Drops `account` from `conn`'s entry in `monitoring_conns_`.  Must be called with
+    // `monitoring_mutex_` held for writing.
+    void unindex_monitor(const connection_id& conn, const std::string& account);
+
     // Removes every monitor subscription whose account `still_ours` rejects, returning the dropped
     // accounts along with the connections that had been subscribed to each.
     //
@@ -121,6 +131,19 @@ class MQBase {
 
     // Tracks accounts we are monitoring for OMQ push notification messages
     std::unordered_multimap<std::string, MonitorData> monitoring_;
+
+    // Reverse index of `monitoring_`, listing the accounts subscribed to by each connection so
+    // that a connection going away doesn't require a scan of the whole table.
+    //
+    // Only quic connections are indexed: a closed quic connection is gone for good, and we get
+    // told when it closes.  oxenmq, in contrast, gives us no notification at all when an inbound
+    // connection goes away, so there would be nothing to trigger a lookup and the index would only
+    // accumulate entries; oxenmq subscriptions are cleaned up by expiry instead.
+    //
+    // Guarded by `monitoring_mutex_` along with `monitoring_` itself so that the two cannot drift
+    // apart.
+    std::map<connection_id, std::vector<std::string>> monitoring_conns_;
+
     mutable std::shared_mutex monitoring_mutex_;
 
   public:

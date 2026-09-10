@@ -338,6 +338,12 @@ namespace {
         return c;
     }
 
+    // See `monitoring_conns_`: only quic connections notify us when they close, so only those are
+    // worth indexing by connection.
+    bool indexed_connection(const connection_id& conn) {
+        return std::holds_alternative<std::pair<size_t, oxen::quic::ConnectionID>>(conn);
+    }
+
 }  // namespace
 
 void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
@@ -366,12 +372,49 @@ void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
                     "new subscription for {} monitoring namespace(s) {}",
                     pubkey_hex,
                     fmt::join(namespaces, ", "));
+            if (indexed_connection(conn))
+                monitoring_conns_[conn].push_back(pubkey);
             monitoring_.emplace(
                     std::piecewise_construct,
                     std::forward_as_tuple(std::move(pubkey)),
                     std::forward_as_tuple(std::move(namespaces), want_data, conn));
         }
     }
+}
+
+void MQBase::unindex_monitor(const connection_id& conn, const std::string& account) {
+    auto it = monitoring_conns_.find(conn);
+    if (it == monitoring_conns_.end())
+        return;
+    auto& accounts = it->second;
+    std::erase(accounts, account);
+    if (accounts.empty())
+        monitoring_conns_.erase(it);
+}
+
+void MQBase::remove_monitors_for(const connection_id& conn) {
+    std::unique_lock lock{monitoring_mutex_};
+
+    auto conn_it = monitoring_conns_.find(conn);
+    if (conn_it == monitoring_conns_.end())
+        return;
+
+    log::debug(
+            logcat,
+            "dropping {} monitor subscription(s) of a closed connection",
+            conn_it->second.size());
+
+    for (const auto& account : conn_it->second) {
+        auto [it, end] = monitoring_.equal_range(account);
+        while (it != end) {
+            if (it->second.conn == conn)
+                it = monitoring_.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    monitoring_conns_.erase(conn_it);
 }
 
 std::vector<std::pair<user_pubkey, std::vector<connection_id>>> MQBase::extract_foreign_monitors(
@@ -411,6 +454,7 @@ std::vector<std::pair<user_pubkey, std::vector<connection_id>>> MQBase::extract_
             auto [it, end] = monitoring_.equal_range(account);
             while (it != end) {
                 conns.push_back(it->second.conn);
+                unindex_monitor(it->second.conn, account);
                 it = monitoring_.erase(it);
             }
             if (!conns.empty())

@@ -81,7 +81,12 @@ void QUIC::startup_endpoint() {
                 [handler = std::move(handler)](
                         quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                     return e.loop.make_shared<quic::BTRequestStream>(c, e, handler);
-                });
+                },
+                // A closed connection never comes back, so its monitor subscriptions can never
+                // deliver anything again.  Note that this runs on the quic event loop.
+                quic::connection_closed_callback{[this, ep_idx](quic::Connection& c, uint64_t) {
+                    remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+                }});
         ep_idx++;
     }
 }

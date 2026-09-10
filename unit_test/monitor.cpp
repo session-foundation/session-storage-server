@@ -1,6 +1,7 @@
 #include <catch2/catch.hpp>
 
 #include <oxenmq/oxenmq.h>
+#include <oxenss/common/message.h>
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
 #include <oxenss/server/mqbase.h>
@@ -41,6 +42,8 @@ class TestMQ : public oxenss::server::MQBase {
     void reachability_test(std::shared_ptr<oxenss::snode::sn_test>) override {}
 
     using MQBase::extract_foreign_monitors;
+    using MQBase::monitoring_conns_;
+    using MQBase::remove_monitors_for;
     using MQBase::update_monitors;
 };
 
@@ -50,6 +53,20 @@ std::string account(unsigned char fill) {
 
 connection_id conn(unsigned char fill) {
     return oxenmq::ConnectionID{std::string(32, static_cast<char>(fill))};
+}
+
+connection_id quic_conn(uint64_t id) {
+    return std::pair{size_t{0}, oxen::quic::ConnectionID{id}};
+}
+
+// The connections that would be sent a notification for a message to `acct`.
+std::vector<connection_id> notifiers(TestMQ& mq, const std::string& acct) {
+    oxenss::message m;
+    m.pubkey.load(acct);
+    m.msg_namespace = namespace_id::Default;
+    std::vector<connection_id> to, with_data;
+    mq.get_notifiers(m, to, with_data);
+    return to;
 }
 
 void subscribe(TestMQ& mq, const std::string& acct, connection_id c) {
@@ -131,6 +148,77 @@ TEST_CASE("monitor - extraction keeps everything when nothing is foreign", "[mon
     CHECK(dropped.empty());
     CHECK(remaining(mq).size() == 2);
     CHECK(mq.ended.empty());
+}
+
+TEST_CASE("monitor - closing a quic connection drops its subscriptions", "[monitor]") {
+    TestMQ mq;
+
+    auto a = account(0x11), b = account(0x22);
+    auto q1 = quic_conn(1), q2 = quic_conn(2), omq = conn(0xcc);
+
+    subscribe(mq, a, q1);
+    subscribe(mq, b, q1);
+    subscribe(mq, b, q2);
+    subscribe(mq, a, omq);
+
+    mq.remove_monitors_for(q1);
+
+    // Both of q1's subscriptions go, and nothing else: not the same account on another
+    // connection, nor another connection's subscription to an account q1 was also watching.
+    CHECK(notifiers(mq, a) == std::vector{omq});
+    CHECK(notifiers(mq, b) == std::vector{q2});
+    CHECK(mq.monitoring_conns_.count(q1) == 0);
+    CHECK(mq.monitoring_conns_.count(q2) == 1);
+}
+
+TEST_CASE("monitor - renewing a subscription doesn't duplicate its index entry", "[monitor]") {
+    TestMQ mq;
+
+    auto a = account(0x11);
+    auto q1 = quic_conn(1);
+
+    subscribe(mq, a, q1);
+    subscribe(mq, a, q1);
+
+    CHECK(mq.monitoring_conns_[q1] == std::vector{a});
+}
+
+TEST_CASE("monitor - oxenmq subscriptions are not indexed by connection", "[monitor]") {
+    TestMQ mq;
+
+    auto a = account(0x11);
+    auto omq = conn(0xcc);
+    subscribe(mq, a, omq);
+
+    CHECK(mq.monitoring_conns_.empty());
+
+    // Nothing tells us when an inbound oxenmq connection goes away, so there is nothing to trigger
+    // a removal and the subscription has to wait for its expiry.
+    mq.remove_monitors_for(omq);
+    CHECK(notifiers(mq, a) == std::vector{omq});
+}
+
+TEST_CASE("monitor - the connection index follows swarm-change removals", "[monitor]") {
+    TestMQ mq;
+
+    auto ours = account(0x11), theirs = account(0x22);
+    auto q1 = quic_conn(1);
+
+    subscribe(mq, ours, q1);
+    subscribe(mq, theirs, q1);
+
+    auto dropped = mq.extract_foreign_monitors(
+            [&theirs](const user_pubkey& pk) { return pk.prefixed_raw() != theirs; });
+    REQUIRE(dropped.size() == 1);
+
+    REQUIRE(mq.monitoring_conns_.count(q1) == 1);
+    CHECK(mq.monitoring_conns_[q1] == std::vector{ours});
+
+    // Losing the last of a connection's accounts takes the connection out of the index rather than
+    // leaving an empty entry behind.
+    auto rest = mq.extract_foreign_monitors([](const user_pubkey&) { return false; });
+    REQUIRE(rest.size() == 1);
+    CHECK(mq.monitoring_conns_.empty());
 }
 
 TEST_CASE("monitor - bt swarm encoding matches the json one", "[monitor][swarm]") {

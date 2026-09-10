@@ -5,6 +5,7 @@ add_executable(Test
     main.cpp
 
     encrypt.cpp
+    monitor.cpp
     onion_requests.cpp
     rate_limiter.cpp
     serialization.cpp

@@ -1,7 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 #include <set>
+
+#include <nlohmann/json_fwd.hpp>
+#include <oxenc/bt_producer.h>
 
 #include "network.h"
 #include "oxenss/crypto/keys.h"
@@ -14,6 +18,23 @@ using namespace std::literals;
 class ServiceNode;
 
 enum class SnodeStatus { UNKNOWN, UNSTAKED, DECOMMISSIONED, ACTIVE };
+
+/// The id and membership of some swarm, as returned by `Network::get_swarm_for`; nullopt when no
+/// swarms are known at all.
+using swarm_membership = std::optional<std::pair<swarm_id_t, std::set<crypto::legacy_pubkey>>>;
+
+/// Describes a swarm for a client: a `snodes` list of one dict per contactable member, plus the
+/// hex-encoded `swarm` id.  This is what clients get in a 421 wrong-swarm response body and from
+/// the `get_swarm` endpoint.
+nlohmann::json swarm_to_json(const swarm_membership& swarm, const Contacts& contacts);
+
+/// Appends the same `snodes` and `swarm` keys that `swarm_to_json` produces to a bt-encoded dict,
+/// for the notification channels, which are bt- rather than json-encoded.
+///
+/// bt dict keys must be appended in ascending order, so `out` must not yet contain any key sorting
+/// at or after "snodes".
+void swarm_to_bt(
+        oxenc::bt_dict_producer& out, const swarm_membership& swarm, const Contacts& contacts);
 
 struct SwarmEvents {
     /// our (potentially new) swarm id

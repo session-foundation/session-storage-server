@@ -2,6 +2,8 @@
 #include <sodium/crypto_sign.h>
 #include "../rpc/rate_limiter.h"
 #include "../rpc/request_handler.h"
+#include "../snode/service_node.h"
+#include "../snode/swarm.h"
 #include "utils.h"
 #include <fmt/ranges.h>
 #include <oxenc/hex.h>
@@ -163,6 +165,20 @@ void MQBase::handle_monitor_message_single(
         return monitor_error(out, MonitorResponse::BAD_SIG, "Signature verification failed");
     }
 
+    // A subscription to an account we do not store can never deliver anything, so refuse it and
+    // hand back the swarm that does store it (the same information a 421 would carry).
+    user_pubkey account;
+    if (!account.load(pubkey) || !service_node_->swarm().is_pubkey_for_us(account)) {
+        log::debug(logcat, "monitor.messages: {} is not stored by this swarm", pubkey_hex);
+        monitor_error(
+                out,
+                MonitorResponse::WRONG_SWARM,
+                "Account is not stored by this service node's swarm");
+        snode::swarm_to_bt(
+                out, service_node_->network().get_swarm_for(account), service_node_->contacts());
+        return;
+    }
+
     subs.emplace_back(std::move(pubkey), std::move(pubkey_hex), std::move(namespaces), want_data);
     out.append("success", 1);
 }
@@ -322,6 +338,12 @@ namespace {
         return c;
     }
 
+    // See `monitoring_conns_`: only quic connections notify us when they close, so only those are
+    // worth indexing by connection.
+    bool indexed_connection(const connection_id& conn) {
+        return std::holds_alternative<std::pair<size_t, oxen::quic::ConnectionID>>(conn);
+    }
+
 }  // namespace
 
 void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
@@ -350,11 +372,132 @@ void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
                     "new subscription for {} monitoring namespace(s) {}",
                     pubkey_hex,
                     fmt::join(namespaces, ", "));
+            if (indexed_connection(conn))
+                monitoring_conns_[conn].push_back(pubkey);
             monitoring_.emplace(
                     std::piecewise_construct,
                     std::forward_as_tuple(std::move(pubkey)),
                     std::forward_as_tuple(std::move(namespaces), want_data, conn));
         }
+    }
+}
+
+void MQBase::unindex_monitor(const connection_id& conn, const std::string& account) {
+    auto it = monitoring_conns_.find(conn);
+    if (it == monitoring_conns_.end())
+        return;
+    auto& accounts = it->second;
+    std::erase(accounts, account);
+    if (accounts.empty())
+        monitoring_conns_.erase(it);
+}
+
+void MQBase::remove_monitors_for(const connection_id& conn) {
+    std::unique_lock lock{monitoring_mutex_};
+
+    auto conn_it = monitoring_conns_.find(conn);
+    if (conn_it == monitoring_conns_.end())
+        return;
+
+    log::debug(
+            logcat,
+            "dropping {} monitor subscription(s) of a closed connection",
+            conn_it->second.size());
+
+    for (const auto& account : conn_it->second) {
+        auto [it, end] = monitoring_.equal_range(account);
+        while (it != end) {
+            if (it->second.conn == conn)
+                it = monitoring_.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    monitoring_conns_.erase(conn_it);
+}
+
+std::vector<std::pair<user_pubkey, std::vector<connection_id>>> MQBase::extract_foreign_monitors(
+        const std::function<bool(const user_pubkey&)>& still_ours) {
+
+    std::vector<std::string> accounts;
+    {
+        std::shared_lock lock{monitoring_mutex_};
+        accounts.reserve(monitoring_.size());
+        // Entries with equal keys are adjacent in an unordered_multimap, so this collects each
+        // monitored account exactly once.
+        for (const auto& [account, _mon] : monitoring_)
+            if (accounts.empty() || accounts.back() != account)
+                accounts.push_back(account);
+    }
+
+    std::vector<std::pair<std::string, user_pubkey>> foreign;
+    for (auto& account : accounts) {
+        user_pubkey pk;
+        if (!pk.load(account)) {
+            log::warning(logcat, "Ignoring unparseable pubkey in the monitoring table");
+            continue;
+        }
+        if (!still_ours(pk))
+            foreign.emplace_back(std::move(account), std::move(pk));
+    }
+
+    std::vector<std::pair<user_pubkey, std::vector<connection_id>>> dropped;
+    if (foreign.empty())
+        return dropped;
+
+    dropped.reserve(foreign.size());
+    {
+        std::unique_lock lock{monitoring_mutex_};
+        for (auto& [account, pk] : foreign) {
+            std::vector<connection_id> conns;
+            auto [it, end] = monitoring_.equal_range(account);
+            while (it != end) {
+                conns.push_back(it->second.conn);
+                unindex_monitor(it->second.conn, account);
+                it = monitoring_.erase(it);
+            }
+            if (!conns.empty())
+                dropped.emplace_back(std::move(pk), std::move(conns));
+        }
+    }
+
+    return dropped;
+}
+
+std::string MQBase::monitor_ended_payload(
+        const user_pubkey& pubkey, MonitorResponse reason, std::string_view message) {
+    oxenc::bt_dict_producer d;
+    d.append("@", pubkey.prefixed_raw());
+    monitor_error(d, reason, std::string{message});
+    snode::swarm_to_bt(
+            d, service_node_->network().get_swarm_for(pubkey), service_node_->contacts());
+    return std::move(d).str();
+}
+
+void MQBase::drop_foreign_monitors() {
+    const auto& network = service_node_->network();
+    const auto our_swarm = service_node_->swarm().our_swarm_id();
+
+    auto dropped = extract_foreign_monitors([&](const user_pubkey& pk) {
+        auto swarm = network.get_swarm_for(pk);
+        // Knowing no swarms at all means we answer requests with a 500 rather than a 421, and we
+        // would have no replacement swarm to offer, so hold onto the subscription instead of
+        // terminating it on what is most likely a transient gap in our oxend data.
+        return !swarm || swarm->first == our_swarm;
+    });
+
+    for (auto& [pk, conns] : dropped) {
+        log::debug(
+                logcat,
+                "terminating {} monitor subscription(s) for {}: no longer in our swarm",
+                conns.size(),
+                pk.prefixed_hex());
+        auto payload = monitor_ended_payload(
+                pk,
+                MonitorResponse::WRONG_SWARM,
+                "Account is no longer stored by this service node's swarm");
+        notify_monitor_ended(conns, payload);
     }
 }
 

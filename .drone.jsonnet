@@ -124,47 +124,6 @@ local clang(version, lto=false) = debian_pipeline(
   lto=lto
 );
 
-// Macos build
-local mac_builder(name,
-                  build_type='Release',
-                  lto=false,
-                  werror=true,
-                  build_tests=true,
-                  run_tests=true,
-                  test_oxen_storage=true,  // Makes sure oxen-storage --version runs
-                  cmake_extra='',
-                  extra_cmds=[],
-                  extra_steps=[],
-                  jobs=6,
-                  allow_fail=false) = {
-  kind: 'pipeline',
-  type: 'exec',
-  name: name,
-  platform: { os: 'darwin', arch: 'amd64' },
-  steps: [
-    { name: 'submodules', commands: submodules_commands },
-    {
-      name: 'build',
-      environment: { SSH_KEY: { from_secret: 'SSH_KEY' } },
-      commands: [
-                  // If you don't do this then the C compiler doesn't have an include path containing
-                  // basic system headers.  WTF apple:
-                  'export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"',
-                  'mkdir build',
-                  'cd build',
-                  'cmake .. -G Ninja -DCMAKE_CXX_FLAGS=-fcolor-diagnostics -DCMAKE_BUILD_TYPE=' + build_type
-                  + ' -DLOCAL_MIRROR=https://oxen.rocks/deps -DEXTRA_WARNINGS=ON '
-                  + cmake_options({ USE_LTO: lto, WARNINGS_AS_ERRORS: werror, BUILD_TESTS: build_tests || run_tests })
-                  + cmake_extra,
-                  'ninja -j' + jobs + ' -v',
-                ] +
-                (if test_oxen_storage then ['./oxen-storage --version'] else []) +
-                (if run_tests then ['./unit_test/Test'] else []) +
-                extra_cmds,
-    },
-  ] + extra_steps,
-};
-
 local static_check_and_upload = [
   '../contrib/drone-check-static-libs.sh',
   'ninja strip',
@@ -213,12 +172,4 @@ local static_check_and_upload = [
                   cmake_extra='-DBUILD_STATIC_DEPS=ON -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10',
                   lto=true,
                   extra_cmds=static_check_and_upload),
-
-  // Macos builds:
-  mac_builder('macOS (Static)',
-              cmake_extra='-DBUILD_STATIC_DEPS=ON',
-              lto=true,
-              extra_cmds=static_check_and_upload),
-  mac_builder('macOS (Release)'),
-  mac_builder('macOS (Debug)', build_type='Debug'),
 ]

@@ -1357,19 +1357,18 @@ int64_t Database::add_retry_request(
     return req_id;
 }
 
-void Database::foreach_ready_retry_request(
-        std::function<
-                bool(const crypto::legacy_pubkey& key,
-                     const std::string& cmd,
-                     const std::string& payload,
-                     int64_t req_id)> callback) {
+void Database::foreach_ready_retry_request(std::function<
+                                           bool(const crypto::legacy_pubkey& key,
+                                                const std::string& cmd,
+                                                const std::string& payload,
+                                                int64_t req_id)> callback) {
     auto impl = get_impl(/*write =*/true);
 
     // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
     // if the table it is reading is updated on the same connection mid-iteration.
-    auto ready = get_all<int64_t, std::string, std::string, std::string>(impl->prepared_st(
-            "SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
-            " WHERE next_retry < unixepoch('now', 'subsec')"));
+    auto ready = get_all<int64_t, std::string, std::string, std::string>(
+            impl->prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
+                              " WHERE next_retry < unixepoch('now', 'subsec')"));
 
     // The next retry time is set here, before the outcome of the request is known, rather than
     // when the request times out: a successful or definitively failed request deletes the row

@@ -252,12 +252,11 @@ class Database {
     // callback returns true if it sent the request, in which case the next retry is scheduled
     // RETRY_INTERVAL out, or false if it could not send it (e.g. no contact details yet), in which
     // case the next retry is scheduled RETRY_NO_CONTACT_INTERVAL out.
-    void foreach_ready_retry_request(
-            std::function<
-                    bool(const crypto::legacy_pubkey& key,
-                         const std::string& cmd,
-                         const std::string& payload,
-                         int64_t req_id)>);
+    void foreach_ready_retry_request(std::function<
+                                     bool(const crypto::legacy_pubkey& key,
+                                          const std::string& cmd,
+                                          const std::string& payload,
+                                          int64_t req_id)>);
 
     // This is just for the test suite, as using "ready retry requests" as above would require it
     // to take several seconds longer to execute, per call.

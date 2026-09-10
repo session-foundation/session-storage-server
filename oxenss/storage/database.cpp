@@ -410,7 +410,12 @@ CREATE TABLE retry_requests (
     id INTEGER PRIMARY KEY,
     command TEXT NOT NULL,
     payload BLOB NOT NULL,
-    created DOUBLE PRECISION NOT NULL DEFAULT (unixepoch('now', 'subsec'))
+    -- 2440587.5 is the julian day of the unix epoch, so this is unix time with the subsecond part
+    -- retained.  Switch to the more legible `unixepoch('now', 'subsec')` once we require sqlite
+    -- 3.42+: `subsec` arrived in 3.42, and Debian bookworm has 3.40, where an unrecognized date
+    -- modifier makes the whole expression NULL rather than raising, so the breakage would surface
+    -- only as a NOT NULL failure at insertion time.
+    created DOUBLE PRECISION NOT NULL DEFAULT ((julianday('now') - 2440587.5) * 86400.0)
 );
 
 CREATE TABLE retry_pubkeys (
@@ -1366,9 +1371,11 @@ void Database::foreach_ready_retry_request(std::function<
 
     // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
     // if the table it is reading is updated on the same connection mid-iteration.
+    //
+    // See the retry_requests.created default for why this isn't `unixepoch('now', 'subsec')`.
     auto ready = get_all<int64_t, std::string, std::string, std::string>(
             impl->prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
-                              " WHERE next_retry < unixepoch('now', 'subsec')"));
+                              " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
 
     // The next retry time is set here, before the outcome of the request is known, rather than
     // when the request times out: a successful or definitively failed request deletes the row

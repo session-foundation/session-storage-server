@@ -451,10 +451,21 @@ void OMQ::handle_monitor_messages(oxenmq::Message& message) {
             message.conn);
 }
 
-void OMQ::notify(std::vector<connection_id>& conns, std::string_view notification) {
+void OMQ::send_notification(
+        std::vector<connection_id>& conns,
+        std::string_view command,
+        std::string_view notification) {
     for (const auto& c : conns)
         if (auto* id = std::get_if<oxenmq::ConnectionID>(&c))
-            omq_.send(*id, "notify.message", notification);
+            omq_.send(*id, command, notification);
+}
+
+void OMQ::notify(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "notify.message", notification);
+}
+
+void OMQ::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "notify.monitor_ended", notification);
 }
 
 void OMQ::reachability_test(std::shared_ptr<snode::sn_test> test) {

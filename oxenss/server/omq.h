@@ -130,6 +130,9 @@ class OMQ : public MQBase {
     ///   - 6 -- wrong swarm -- the given pubkey is not stored by this service node's swarm.
     /// - error -- included whenever `errcode` is, this contains an English description of the
     ///   error.
+    /// - snodes, swarm -- included with errcode 6, and describing the swarm that *does* store the
+    ///   account, in the same form as the body of a 421 response (see `get_swarm`).  This lets a
+    ///   client redirect itself without a further request.
     ///
     /// Each time a message is received the service node sends a message to the connection with a
     /// first part (i.e. endpoint) of "notify.message", and second part containing the bt-encoded
@@ -163,6 +166,23 @@ class OMQ : public MQBase {
     ///
     /// Thus any code that is managing subscriptions for multiple end clients should take care to
     /// check the namespace/data values and only pass it on if actually desired by a client.
+    ///
+    /// A subscription can also be terminated by the service node before it expires, which happens
+    /// when the account stops being one that this node stores (because this node moved swarm, or
+    /// because the swarm boundaries moved around the account).  The subscriber is sent a message
+    /// with a first part of "notify.monitor_ended" and a second part containing a bt-encoded dict
+    /// with keys:
+    ///
+    /// - @ -- the account pubkey, in bytes (33), whose subscription has ended.
+    /// - errcode -- why it ended, using the same codes as the subscription response above;
+    ///   currently always 6 (wrong swarm).
+    /// - error -- an English description of the reason.
+    /// - snodes, swarm -- the swarm that now stores the account, in the same form as the body of a
+    ///   421 response.  A client that has stopped polling can reconnect to one of these nodes and
+    ///   resubscribe immediately, without having to ask where the account went.
+    ///
+    /// No notification is sent for a subscription that simply expires, nor when this node no
+    /// longer knows of any swarms at all (in which case it has nowhere to redirect the client).
     ///
     /// Note that the client should accept (and ignore) unknown keys, to allow for future expansion.
     void handle_monitor_messages(oxenmq::Message& message);
@@ -223,7 +243,17 @@ class OMQ : public MQBase {
 
     void notify(std::vector<connection_id>&, std::string_view notification) override;
 
+    void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;
+
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
+
+  private:
+    // Fire-and-forget push of `notification` to the OMQ connections in `conns`, using `command`
+    // as the endpoint name.
+    void send_notification(
+            std::vector<connection_id>& conns,
+            std::string_view command,
+            std::string_view notification);
 };
 
 }  // namespace oxenss::server

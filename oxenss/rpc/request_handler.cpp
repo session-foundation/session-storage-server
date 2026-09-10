@@ -17,7 +17,6 @@
 #include <chrono>
 
 #include <nlohmann/json.hpp>
-#include <oxenc/base32z.h>
 #include <oxenc/base64.h>
 #include <oxenc/hex.h>
 #include <oxenmq/oxenmq.h>
@@ -58,44 +57,6 @@ std::string debug_string(const Response& res) {
 }
 
 namespace {
-    json swarm_to_json(
-            const std::optional<std::pair<snode::swarm_id_t, std::set<crypto::legacy_pubkey>>>&
-                    swarm,
-            const snode::Contacts& contacts) {
-        if (!swarm)
-            return json{
-                    {"snodes", json::array()},
-                    {"swarm", "{:x}"_format(snode::INVALID_SWARM_ID)},
-            };
-        json snodes_json = json::array();
-        for (const auto& snpk : swarm->second) {
-            auto ct = contacts.find(snpk);
-            if (!ct || !*ct)
-                // Older versions did not even have (and so could not return) any info for
-                // non-contactable nodes, so do the same to avoid potentially breaking session
-                // clients that aren't expecting 0 values for pubkey/IP/ports.
-                continue;
-            snodes_json.push_back(json{
-                    // Deprecated; use pubkey_legacy instead:
-                    {"address", "{}.snode"_format(oxenc::to_base32z(snpk.view()))},
-                    // Deprecated string port for backwards compat; prefer port_https:
-                    {"port", "{}"_format(ct->https_port)},
-
-                    {"pubkey_legacy", snpk.hex()},
-                    {"pubkey_x25519", ct->pubkey_x25519.hex()},
-                    {"pubkey_ed25519", ct->pubkey_ed25519.hex()},
-                    {"port_https", ct->https_port},
-                    {"port_omq", ct->omq_quic_port},
-                    {"port_quic", ct->omq_quic_port},
-                    {"ip", ct->ip.to_string()}});
-        }
-
-        return json{
-                {"snodes", std::move(snodes_json)},
-                {"swarm", "{:x}"_format(swarm->first)},
-        };
-    }
-
     void add_misc_response_fields(
             json& j,
             snode::ServiceNode& sn,
@@ -394,7 +355,7 @@ Response RequestHandler::handle_wrong_swarm(const user_pubkey& pubKey) {
     if (!maybe_swarm)
         return {http::INTERNAL_SERVER_ERROR, "No swarms known!"s};
 
-    json swarm = swarm_to_json(maybe_swarm, contacts_);
+    json swarm = snode::swarm_to_json(maybe_swarm, contacts_);
     add_misc_response_fields(swarm, service_node_);
     return {http::MISDIRECTED_REQUEST, std::move(swarm)};
 }
@@ -740,7 +701,7 @@ void RequestHandler::process_client_req(
             obfuscate_pubkey(req.pubkey),
             swarm ? swarm->second.size() : 0);
 
-    auto body = swarm_to_json(swarm, contacts_);
+    auto body = snode::swarm_to_json(swarm, contacts_);
     add_misc_response_fields(body, service_node_);
 
 #ifndef NDEBUG

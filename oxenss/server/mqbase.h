@@ -1,7 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <nlohmann/json_fwd.hpp>
@@ -11,6 +15,7 @@
 #include <shared_mutex>
 
 #include "../common/namespace.h"
+#include "../common/pubkey.h"
 #include "utils.h"
 
 namespace oxenss {
@@ -100,6 +105,20 @@ class MQBase {
 
     void update_monitors(std::vector<sub_info>& subs, connection_id conn);
 
+    // Removes every monitor subscription whose account `still_ours` rejects, returning the dropped
+    // accounts along with the connections that had been subscribed to each.
+    //
+    // `still_ours` is called without `monitoring_mutex_` held, because it takes network locks of
+    // its own; the table is therefore sampled, tested, and then modified in three separate steps.
+    std::vector<std::pair<user_pubkey, std::vector<connection_id>>> extract_foreign_monitors(
+            const std::function<bool(const user_pubkey&)>& still_ours);
+
+    // Builds the bt-encoded body of a monitor-terminated notification for `pubkey`: the account,
+    // the reason it ended, and the swarm that now holds the account so that the subscriber can
+    // resubscribe without first asking us where to go.
+    std::string monitor_ended_payload(
+            const user_pubkey& pubkey, MonitorResponse reason, std::string_view message);
+
     // Tracks accounts we are monitoring for OMQ push notification messages
     std::unordered_multimap<std::string, MonitorData> monitoring_;
     mutable std::shared_mutex monitoring_mutex_;
@@ -108,7 +127,21 @@ class MQBase {
     void get_notifiers(
             message& m, std::vector<connection_id>& to, std::vector<connection_id>& with_data);
 
+    /// Terminates every monitor subscription for an account this node no longer serves, pushing a
+    /// `monitor_ended` notification to each affected subscriber.
+    ///
+    /// A subscription is only useful for as long as we would not answer a request for the account
+    /// with a 421, so this must be called after a swarm update has taken effect.  Without it a
+    /// client that has stopped polling cannot tell "the swarm moved" from "no messages arrived".
+    void drop_foreign_monitors();
+
     virtual void notify(std::vector<connection_id>&, std::string_view notification) = 0;
+
+    /// Pushes a notification telling `conns` that a monitor subscription of theirs has been
+    /// terminated.  This is a separate command from `notify` so that clients which only know
+    /// about message notifications are unaffected by it.
+    virtual void notify_monitor_ended(
+            std::vector<connection_id>&, std::string_view notification) = 0;
 
     virtual void reachability_test(std::shared_ptr<snode::sn_test> test) = 0;
 

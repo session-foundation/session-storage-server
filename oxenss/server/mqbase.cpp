@@ -170,16 +170,28 @@ void MQBase::handle_monitor_message_single(
         return monitor_error(
                 out, MonitorResponse::BAD_PUBKEY, "Provided p= pubkey is not a valid account");
 
+    // Knowing no swarms at all is not the same as knowing the account is someone else's: we have
+    // no swarm to redirect the subscriber to, and this is most likely a transient gap in our oxend
+    // data, so say so rather than claiming a wrong swarm.  `drop_foreign_monitors` holds onto
+    // existing subscriptions in this same state.
+    auto swarm = service_node_->network().get_swarm_for(account);
+    if (!swarm) {
+        log::debug(logcat, "monitor.messages: no swarms known, cannot place {}", pubkey_hex);
+        return monitor_error(
+                out,
+                MonitorResponse::NO_SWARM_INFO,
+                "Service node does not currently know the swarm list");
+    }
+
     // A subscription to an account we do not store can never deliver anything, so refuse it and
     // hand back the swarm that does store it (the same information a 421 would carry).
-    if (!service_node_->swarm().is_pubkey_for_us(account)) {
+    if (swarm->first != service_node_->swarm().our_swarm_id()) {
         log::debug(logcat, "monitor.messages: {} is not stored by this swarm", pubkey_hex);
         monitor_error(
                 out,
                 MonitorResponse::WRONG_SWARM,
                 "Account is not stored by this service node's swarm");
-        snode::swarm_to_bt(
-                out, service_node_->network().get_swarm_for(account), service_node_->contacts());
+        snode::swarm_to_bt(out, swarm, service_node_->contacts());
         return;
     }
 

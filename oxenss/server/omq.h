@@ -128,6 +128,9 @@ class OMQ : public MQBase {
     ///     or is in the future.
     ///   - 5 -- signature failed -- the signature failed to validate.
     ///   - 6 -- wrong swarm -- the given pubkey is not stored by this service node's swarm.
+    ///   - 7 -- no swarm info -- this service node does not currently know of any swarms, and so
+    ///     cannot tell whether the account is one it stores.  This is a temporary condition and
+    ///     the request can be retried.
     /// - error -- included whenever `errcode` is, this contains an English description of the
     ///   error.
     /// - snodes, swarm -- included with errcode 6, and describing the swarm that *does* store the

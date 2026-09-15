@@ -42,6 +42,7 @@ class TestMQ : public oxenss::server::MQBase {
     void reachability_test(std::shared_ptr<oxenss::snode::sn_test>) override {}
 
     using MQBase::extract_foreign_monitors;
+    using MQBase::handle_monitor;
     using MQBase::monitoring_conns_;
     using MQBase::remove_monitors_for;
     using MQBase::update_monitors;
@@ -148,6 +149,26 @@ TEST_CASE("monitor - extraction keeps everything when nothing is foreign", "[mon
     CHECK(dropped.empty());
     CHECK(remaining(mq).size() == 2);
     CHECK(mq.ended.empty());
+}
+
+TEST_CASE("monitor - a wrong-sized p= pubkey is rejected outright", "[monitor]") {
+    TestMQ mq;
+
+    oxenc::bt_dict_producer req;
+    {
+        auto ns = req.append_list("n");
+        ns.append(0);
+    }
+    req.append("p", "too short");
+    auto request = std::move(req).str();
+
+    std::string reply;
+    mq.handle_monitor(request, [&reply](std::string r) { reply = std::move(r); }, conn(0xaa));
+
+    // The error must be the only thing in the response: carrying on past a bad pubkey reaches the
+    // signature check with a short key, and appends a second errcode to this same dict.
+    CHECK(oxenss::bt_to_json(oxenc::bt_dict_consumer{reply}) ==
+          nlohmann::json{{"errcode", 2}, {"error", "Provided p= pubkey must be 33 bytes"}});
 }
 
 TEST_CASE("monitor - closing a quic connection drops its subscriptions", "[monitor]") {

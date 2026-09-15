@@ -85,7 +85,7 @@ void MQBase::handle_monitor_message_single(
                 throw std::runtime_error{"Cannot provide both p= and P= pubkey values"};
             pubkey = d.consume_string();
             if (pubkey.size() != 33)
-                monitor_error(
+                return monitor_error(
                         out, MonitorResponse::BAD_PUBKEY, "Provided p= pubkey must be 33 bytes");
         } else if (ed_pk.empty()) {
             throw std::runtime_error{"Either p= or P= must be given"};

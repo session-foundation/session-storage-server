@@ -165,10 +165,14 @@ void MQBase::handle_monitor_message_single(
         return monitor_error(out, MonitorResponse::BAD_SIG, "Signature verification failed");
     }
 
+    user_pubkey account;
+    if (!account.load(pubkey))
+        return monitor_error(
+                out, MonitorResponse::BAD_PUBKEY, "Provided p= pubkey is not a valid account");
+
     // A subscription to an account we do not store can never deliver anything, so refuse it and
     // hand back the swarm that does store it (the same information a 421 would carry).
-    user_pubkey account;
-    if (!account.load(pubkey) || !service_node_->swarm().is_pubkey_for_us(account)) {
+    if (!service_node_->swarm().is_pubkey_for_us(account)) {
         log::debug(logcat, "monitor.messages: {} is not stored by this swarm", pubkey_hex);
         monitor_error(
                 out,

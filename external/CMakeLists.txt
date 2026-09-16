@@ -5,7 +5,7 @@ check_submodule(cpr)
 check_submodule(nlohmann_json)
 check_submodule(oxen-libquic)
 check_submodule(oxen-mq)
-check_submodule(SQLiteCpp)
+check_submodule(session-sqlite)
 check_submodule(uWebSockets)
 
 
@@ -116,42 +116,17 @@ if(USE_JEMALLOC AND NOT BUILD_STATIC_DEPS)
 endif()
 
 
-# We require 3.35.x for some queries we use (such as "RETURNING"), and 3.35.5 for bug fixes.  When
-# the system sqlite3 is too old we fall back to sqlite3mc, which is a regular sqlite3 build with
-# encryption support bolted on: we don't use the encryption, but everything else works as usual.
-# Deliberately not named SQLite3_*: the SQLiteCpp workaround below force-sets SQLite3_FOUND in the
-# cache, which would then win over this check on every re-configure.
-if(NOT BUILD_STATIC_DEPS)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(SYS_SQLITE3 sqlite3>=3.35.5 IMPORTED_TARGET GLOBAL)
-endif()
+# 3.35.x is required for queries we use (RETURNING), and 3.35.5 for its bug fixes; anything older
+# falls back to a static sqlite3mc, which is a regular sqlite3 with encryption bolted on that we
+# simply don't use.
+session_dep(sqlite3 3.35.5)
 
-if(SYS_SQLITE3_FOUND)
-  add_library(SQLite::SQLite3 ALIAS PkgConfig::SYS_SQLITE3)
-else()
-  session_dep(sqlite3mc 2)
-  # IMPORTED so that SQLiteCpp's install(EXPORT) doesn't demand that we export it too.
-  add_library(SQLite::SQLite3 INTERFACE IMPORTED GLOBAL)
-  set_target_properties(SQLite::SQLite3 PROPERTIES INTERFACE_LINK_LIBRARIES sessiondep::sqlite3mc)
-endif()
+# session-sqlite would build its own sqlite3mc given the chance; hand it ours instead so that a
+# system sqlite3 gets used where there is a new enough one.  SESSION_EXTERNAL_SQLITE_MC stays off
+# deliberately: it only enables session-sqlite's encryption support, which we don't use, and it
+# would not be true when the system sqlite3 was picked.
+set(SESSION_SQLITE_BUILD_SQLITE3MC OFF CACHE BOOL "" FORCE)
+add_library(SQLite::SQLite3 INTERFACE IMPORTED GLOBAL)
+set_target_properties(SQLite::SQLite3 PROPERTIES INTERFACE_LINK_LIBRARIES sessiondep::sqlite3)
 
-# Hack around SQLiteCpp's attempts to locate sqlite3 because we *don't* want to link against the
-# system one, but don't download and build the embedded one until build time.  Thankfully it
-# actually links against the SQLite::SQLite3 cmake target if it already exists, so all we have to do
-# is set that up and circumvent some of the non-target bits of its FindSQLite3.cmake.
-set(SQLite3_FOUND TRUE CACHE BOOL "" FORCE)
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ignored")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ignored/sqlite3.h" "#define SQLITE_VERSION \"${SYS_SQLITE3_VERSION}\"")
-set(SQLite3_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/ignored" CACHE STRING "" FORCE)
-set(SQLite3_LIBRARY "ignored" CACHE STRING "" FORCE)
-set(SQLITECPP_INTERNAL_SQLITE OFF CACHE BOOL "don't build SQLiteCpp's internal sqlite3" FORCE)
-set(SQLITE_ENABLE_COLUMN_METADATA OFF CACHE BOOL "" FORCE)
-set(SQLITECPP_RUN_CPPLINT OFF CACHE BOOL "" FORCE)
-set(SQLITECPP_RUN_CPPCHECK OFF CACHE BOOL "" FORCE)
-set(SQLITECPP_RUN_DOXYGEN OFF CACHE BOOL "" FORCE)
-set(SQLITECPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(SQLITECPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-
-add_subdirectory(SQLiteCpp EXCLUDE_FROM_ALL)
-
-file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/ignored/sqlite3.h")
+add_subdirectory(session-sqlite EXCLUDE_FROM_ALL)

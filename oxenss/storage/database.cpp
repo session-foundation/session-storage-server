@@ -493,7 +493,7 @@ WHERE namespace < 0 AND namespace % 20 = -1;
     }
 
     void create_schema() {
-        SQLite::Transaction transaction{db};
+        SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
 
         db.exec(R"(
 CREATE TABLE owners (
@@ -604,7 +604,7 @@ CREATE TABLE messages (
         // We create these separate from the table because it makes upgrading easier (we can just
         // drop the indices/views that we want to recreate).
 
-        SQLite::Transaction transaction{db};
+        SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
 
         db.exec(R"(
 CREATE TRIGGER IF NOT EXISTS owner_autoclean
@@ -809,7 +809,11 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
     StoreResult ret;
     try {
 
-        SQLite::Transaction transaction{impl->db};
+        // IMMEDIATE, not the default DEFERRED: this transaction reads (the owner/message lookups
+        // below) before it writes, and a deferred transaction that upgrades to a write lock fails
+        // with SQLITE_BUSY_SNAPSHOT if anything else committed since the read snapshot was taken.
+        // That error does not invoke the busy handler, so busy_timeout cannot retry it.
+        SQLite::Transaction transaction{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
 
         int64_t owner_id;
         if (auto maybe = exec_and_maybe_get<int64_t>(
@@ -878,7 +882,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
 
 void Database::bulk_store(const std::vector<message>& items) {
     auto impl = get_impl(true);
-    SQLite::Transaction t{impl->db};
+    SQLite::Transaction t{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
     auto get_owner = impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
     auto insert_owner = impl->prepared_st(
             "INSERT INTO owners (pubkey, type) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING id");
@@ -1140,7 +1144,7 @@ void Database::revoke_subaccounts(
         return;
     }
 
-    SQLite::Transaction transaction{impl->db};
+    SQLite::Transaction transaction{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
 
     auto get_owner = impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
     auto ownerid = exec_and_maybe_get<int64_t>(get_owner, pubkey);
@@ -1259,6 +1263,8 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
         for (auto& hash : get_all<std::string>(st))
             result.emplace_back(hash, new_exp[0]);
     } else {
+        SQLite::Transaction transaction{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
+
         int64_t owner;
         if (auto maybe = exec_and_maybe_get<int64_t>(
                     impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
@@ -1276,6 +1282,8 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
             if (exec_query(st, to_epoch_ms(new_exp[i]), msg_hashes[i], owner) > 0)
                 result.emplace_back(msg_hashes[i], new_exp[i]);
         }
+
+        transaction.commit();
     }
     return result;
 }
@@ -1345,6 +1353,10 @@ int64_t Database::add_retry_request(
         int64_t req_id) {
     auto impl = get_impl(/*write =*/true);
 
+    // The two inserts have to land together: the second one is what makes the first one reachable,
+    // so a failure between them would leave an orphaned retry_requests row that nothing retries.
+    SQLite::Transaction transaction{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
+
     // insert into request table if not present
     if (req_id == 0) {
         req_id = impl->prepared_get<int64_t>(
@@ -1358,6 +1370,8 @@ int64_t Database::add_retry_request(
             req_id,
             key.str(),
             to_epoch_double(std::chrono::system_clock::now() + RETRY_INITIAL_DELAY));
+
+    transaction.commit();
 
     return req_id;
 }

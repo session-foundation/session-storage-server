@@ -48,11 +48,18 @@ class QUIC : public MQBase {
 
     void notify(std::vector<connection_id>&, std::string_view notification) override;
 
+    void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;
+
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
 
     quic::Loop loop{};
 
   private:
+    // Fire-and-forget push of `notification` to each quic connection in `conns`, as a `command`
+    // on the connection's stream 0.
+    void send_notification(
+            std::vector<connection_id>& conns, std::string command, std::string_view notification);
+
     std::shared_ptr<quic::TLSCreds> tls_creds;
     std::vector<std::shared_ptr<quic::Endpoint>> endpoints;
     quic::Endpoint* reach_ep = nullptr;

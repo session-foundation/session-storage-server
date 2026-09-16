@@ -10,7 +10,7 @@ if(CCACHE_PROGRAM)
   endforeach()
 endif()
 
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.18)
 
 project(oxenss
     VERSION 2.11.3
@@ -39,62 +39,17 @@ endif()
 
 option(BUILD_TESTS "build storage server unit tests" OFF)
 
-find_package(Git)
-option(MANUAL_SUBMODULES "Don't check for out-of-date submodules" OFF)
-if(NOT GIT_FOUND)
-  message(WARNING "Git not found, unable to check that submodules are up-to-date")
-else()
-  function (check_submodule relative_path)
-    execute_process(COMMAND git rev-parse "HEAD" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path} OUTPUT_VARIABLE localHead)
-    execute_process(COMMAND git rev-parse "HEAD:${relative_path}" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE checkedHead)
-    string(COMPARE EQUAL "${localHead}" "${checkedHead}" upToDate)
-    if (upToDate)
-      message(STATUS "Submodule '${relative_path}' is up-to-date")
-    elseif(MANUAL_SUBMODULES)
-      message(WARNING "Submodule '${relative_path}' is not up-to-date")
-    else()
-      message(FATAL_ERROR "Submodule '${relative_path}' is not up-to-date. Please update with\ngit submodule update --init --recursive\nor run cmake with -DMANUAL_SUBMODULES=1")
-    endif()
-
-    # Extra arguments check nested submodules
-    foreach(submod ${ARGN})
-      execute_process(COMMAND git rev-parse "HEAD" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}/${submod} OUTPUT_VARIABLE localHead)
-      execute_process(COMMAND git rev-parse "HEAD:${submod}" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path} OUTPUT_VARIABLE checkedHead)
-      string(COMPARE EQUAL "${localHead}" "${checkedHead}" upToDate)
-      if (NOT upToDate)
-        if(MANUAL_SUBMODULES)
-          message(WARNING "Nested submodule '${relative_path}/${submod}' is not up-to-date")
-        else()
-          message(FATAL_ERROR "Nested submodule '${relative_path}/${submod}' is not up-to-date. Please update with\ngit submodule update --init --recursive\nor run cmake with -DMANUAL_SUBMODULES=1")
-        endif()
-      endif()
-    endforeach()
-  endfunction ()
-
-  message(STATUS "Checking submodules")
-  check_submodule(external/oxenc)
-  check_submodule(external/oxen-mq cppzmq)
-  check_submodule(external/oxen-logging fmt spdlog)
-  check_submodule(external/oxen-libquic)
-  check_submodule(external/nlohmann_json)
-  check_submodule(external/uWebSockets uSockets)
-  check_submodule(external/cpr)
-  check_submodule(external/CLI11)
-  if(BUILD_TESTS)
-    check_submodule(unit_test/Catch2)
-  endif()
-endif()
-
+# session-deps has its own LTO switch for static dependency builds that defaults ON regardless of
+# ours; leaving the two to disagree breaks the link, because an LTO'd static archive can't be
+# consumed by a non-LTO link (clang emits pure bitcode archives, which either fail to load or get
+# silently dropped).  Seed it from what we actually settled on above so USE_LTO is the only knob.
+set(SESSIONDEPS_LTO ${IPO_ENABLED} CACHE BOOL "Use LTO for static dependency builds, where supported" FORCE)
 
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
-option(BUILD_STATIC_DEPS "Download, build and statically link against core dependencies" OFF)
-if(BUILD_STATIC_DEPS)
-  include(StaticBuild)
-else()
-  find_package(PkgConfig REQUIRED)
-  find_package(OpenSSL REQUIRED)
-endif()
+include(cmake/session-deps/Deps.cmake)
+
+check_submodule(cmake/session-deps)
 
 include(cmake/check_atomic.cmake)
 link_libatomic()
@@ -111,11 +66,11 @@ endif ()
 
 add_executable(onion-request EXCLUDE_FROM_ALL contrib/onion-request.cpp)
 set_target_properties(onion-request PROPERTIES RUNTIME_OUTPUT_DIRECTORY contrib)
-target_link_libraries(onion-request common crypto cpr::cpr oxenmq::oxenmq quic)
+target_link_libraries(onion-request common crypto cpr::cpr oxenmq::oxenmq oxen::quic)
 target_include_directories(onion-request PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(quic-reach-test EXCLUDE_FROM_ALL contrib/quic-reach-test.cpp)
 set_target_properties(quic-reach-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY contrib)
-target_link_libraries(quic-reach-test quic sodium fmt::fmt)
+target_link_libraries(quic-reach-test oxen::quic sessiondep::libsodium fmt::fmt)
 
 include(cmake/archive.cmake)

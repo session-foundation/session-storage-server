@@ -12,16 +12,16 @@ find_package(Threads)
 target_link_libraries(server
     PUBLIC
     uWebSockets
-    quic    # public so it gets to /daemon
+    oxen::quic    # public so it gets to /daemon
     PRIVATE
     common
     utils
     rpc
     snode
     logging
-    OpenSSL::SSL
+    sessiondep::libcrypto
     oxenmq::oxenmq
-    sodium
+    sessiondep::libsodium
     Threads::Threads)
 
 set_source_files_properties(server_certificates.cpp PROPERTIES COMPILE_FLAGS -Wno-error=deprecated-declarations)

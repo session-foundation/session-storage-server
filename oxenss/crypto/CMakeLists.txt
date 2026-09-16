@@ -11,5 +11,5 @@ target_link_libraries(crypto
     PRIVATE
     common
     logging
-    OpenSSL::SSL
-    sodium)
+    sessiondep::libcrypto
+    sessiondep::libsodium)

@@ -1,9 +1,13 @@
 #include "swarm.h"
 #include "oxenss/crypto/keys.h"
 #include "service_node.h"
+#include <oxenss/common/format.h>
 #include <oxenss/logging/oxen_logger.h>
 #include <chrono>
 #include <oxenss/utils/string_utils.hpp>
+
+#include <nlohmann/json.hpp>
+#include <oxenc/base32z.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -304,4 +308,73 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
 
     return result;
 }
+
+namespace {
+
+    // The fields we publish about a swarm member, listed once so that the json and bt encodings
+    // cannot drift apart.  `add(key, value)` is called for each in ascending key order, which bt
+    // dicts require; json objects are key-sorted regardless, so the order does not affect the json
+    // output.
+    template <typename Add>
+    void snode_fields(const crypto::legacy_pubkey& snpk, const contact& ct, Add&& add) {
+        // Deprecated; use pubkey_legacy instead:
+        add("address", "{}.snode"_format(oxenc::to_base32z(snpk.view())));
+        add("ip", ct.ip.to_string());
+        // Deprecated string port for backwards compat; prefer port_https:
+        add("port", "{}"_format(ct.https_port));
+        add("port_https", ct.https_port);
+        add("port_omq", ct.omq_quic_port);
+        add("port_quic", ct.omq_quic_port);
+        add("pubkey_ed25519", ct.pubkey_ed25519.hex());
+        add("pubkey_legacy", snpk.hex());
+        add("pubkey_x25519", ct.pubkey_x25519.hex());
+    }
+
+    template <typename F>
+    void each_contactable_member(const swarm_membership& swarm, const Contacts& contacts, F&& f) {
+        if (!swarm)
+            return;
+        for (const auto& snpk : swarm->second) {
+            auto ct = contacts.find(snpk);
+            // Older versions did not even have (and so could not return) any info for
+            // non-contactable nodes, so do the same to avoid potentially breaking session clients
+            // that aren't expecting 0 values for pubkey/IP/ports.
+            if (!ct || !*ct)
+                continue;
+            f(snpk, *ct);
+        }
+    }
+
+    std::string swarm_id_hex(const swarm_membership& swarm) {
+        return "{:x}"_format(swarm ? swarm->first : INVALID_SWARM_ID);
+    }
+
+}  // namespace
+
+nlohmann::json swarm_to_json(const swarm_membership& swarm, const Contacts& contacts) {
+    auto snodes = nlohmann::json::array();
+    each_contactable_member(swarm, contacts, [&snodes](const auto& snpk, const contact& ct) {
+        auto& sn = snodes.emplace_back(nlohmann::json::object());
+        snode_fields(snpk, ct, [&sn](std::string_view key, auto&& val) {
+            sn[std::string{key}] = std::forward<decltype(val)>(val);
+        });
+    });
+
+    return nlohmann::json{{"snodes", std::move(snodes)}, {"swarm", swarm_id_hex(swarm)}};
+}
+
+void swarm_to_bt(
+        oxenc::bt_dict_producer& out, const swarm_membership& swarm, const Contacts& contacts) {
+    {
+        auto snodes = out.append_list("snodes");
+        each_contactable_member(swarm, contacts, [&snodes](const auto& snpk, const contact& ct) {
+            auto sn = snodes.append_dict();
+            snode_fields(snpk, ct, [&sn](std::string_view key, auto&& val) {
+                sn.append(key, std::forward<decltype(val)>(val));
+            });
+        });
+    }
+    out.append("swarm", swarm_id_hex(swarm));
+}
+
 }  // namespace oxenss::snode

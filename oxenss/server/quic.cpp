@@ -81,7 +81,12 @@ void QUIC::startup_endpoint() {
                 [handler = std::move(handler)](
                         quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                     return e.loop.make_shared<quic::BTRequestStream>(c, e, handler);
-                });
+                },
+                // A closed connection never comes back, so its monitor subscriptions can never
+                // deliver anything again.  Note that this runs on the quic event loop.
+                quic::connection_closed_callback{[this, ep_idx](quic::Connection& c, uint64_t) {
+                    remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+                }});
         ep_idx++;
     }
 }
@@ -220,16 +225,25 @@ nlohmann::json QUIC::wrap_response(
     return res;
 }
 
-void QUIC::notify(std::vector<connection_id>& conns, std::string_view notification) {
+void QUIC::send_notification(
+        std::vector<connection_id>& conns, std::string command, std::string_view notification) {
     for (const auto& c : conns) {
         if (auto* quic_id = std::get_if<std::pair<size_t, quic::ConnectionID>>(&c)) {
             auto& [ep_idx, cid] = *quic_id;
             assert(ep_idx < endpoints.size());
             if (auto conn = endpoints[ep_idx]->get_conn(cid))
                 if (auto str = conn->get_stream<quic::BTRequestStream>(0))
-                    str->command("notify", notification);
+                    str->command(command, notification);
         }
     }
+}
+
+void QUIC::notify(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "notify", notification);
+}
+
+void QUIC::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "monitor_ended", notification);
 }
 
 void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {

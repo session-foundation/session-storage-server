@@ -1,10 +1,13 @@
 
+check_submodule(Catch2)
+
 add_subdirectory(Catch2)
 
 add_executable(Test
     main.cpp
 
     encrypt.cpp
+    monitor.cpp
     onion_requests.cpp
     rate_limiter.cpp
     serialization.cpp

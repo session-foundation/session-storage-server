@@ -2,17 +2,55 @@
 
 // Copied entirely from oxen-core, minus the epee bits.
 
+#include <oxenc/common.h>
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <concepts>
 #include <cstring>
+#include <span>
 #include <string_view>
 #include <vector>
 
 namespace oxenss::util {
 
 using namespace std::literals;
+
+/// Reinterprets a span of one char-like type as a span of another (`std::byte` by default),
+/// preserving the static extent.
+template <oxenc::basic_char OutChar = std::byte, oxenc::basic_char InChar, size_t Extent>
+inline std::span<const OutChar, Extent> as_span(std::span<const InChar, Extent> sp) {
+    return std::span<const OutChar, Extent>{reinterpret_cast<const OutChar*>(sp.data()), sp.size()};
+}
+template <oxenc::basic_char OutChar = std::byte, oxenc::basic_char InChar, size_t Extent>
+inline std::span<OutChar, Extent> as_span(std::span<InChar, Extent> sp) {
+    return std::span<OutChar, Extent>{reinterpret_cast<OutChar*>(sp.data()), sp.size()};
+}
+
+/// Converts a string-like value into a span of char-like values (`std::byte` by default).  The
+/// span points at the argument's storage, so it must not outlive it.
+template <typename OutChar = std::byte, oxenc::bt_input_string T>
+inline std::span<const OutChar> to_span(const T& c) {
+    return {reinterpret_cast<const OutChar*>(c.data()), c.size()};
+}
+
+template <typename OutChar = std::byte, size_t N>
+inline std::span<const OutChar> to_span(const char (&literal)[N]) {
+    return {reinterpret_cast<const OutChar*>(literal), N - 1};
+}
+
+template <typename OutChar = std::byte, typename Container>
+    requires(
+            std::convertible_to<
+                    const Container&,
+                    std::span<const typename Container::value_type>> &&
+            !oxenc::bt_input_string<Container> && oxenc::basic_char<typename Container::value_type>)
+inline auto to_span(const Container& c) {
+    constexpr size_t Extent{decltype(std::span{c})::extent};
+    return std::span<const OutChar, Extent>{reinterpret_cast<const OutChar*>(c.data()), c.size()};
+}
 
 /// Returns true if the first string is equal to the second string, compared case-insensitively.
 inline bool string_iequal(std::string_view s1, std::string_view s2) {
@@ -114,7 +152,7 @@ T make_from_guts(std::string_view s) {
 }
 
 template <typename T>
-T make_from_guts(std::basic_string_view<std::byte> s) {
+T make_from_guts(std::span<const std::byte> s) {
     return make_from_guts<T>(std::string_view{reinterpret_cast<const char*>(s.data()), s.size()});
 }
 

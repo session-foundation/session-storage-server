@@ -3,4 +3,4 @@ add_library(utils STATIC
     string_utils.cpp
 )
 
-target_link_libraries(utils PRIVATE oxen::logging)
+target_link_libraries(utils PUBLIC oxenc::oxenc PRIVATE oxen::logging)

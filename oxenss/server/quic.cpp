@@ -276,7 +276,10 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
                     test->pubkey);
             passed = true;
         }
-        if (auto conn = m.stream()->endpoint.get_conn(m.conn_rid()))
+        // Go via reach_ep rather than m.stream(): on a timeout the stream may already be gone,
+        // and m.stream() throws rather than returning nullptr, which would skip the result
+        // reporting below and leave the test unresolved.
+        if (auto conn = reach_ep->get_conn(m.conn_rid()))
             conn->close_connection();
 
         // Defer this to an omq task; the same deadlock-avoidance logic described in

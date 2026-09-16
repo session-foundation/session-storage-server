@@ -54,6 +54,9 @@ class Database {
 
     friend class TestSuiteHacks;
     void test_suite_block_for(std::chrono::milliseconds duration);
+    // Shifts every pending retry's next_retry earlier, so that a test can reach the ready state
+    // without waiting out RETRY_INITIAL_DELAY.
+    void test_suite_backdate_retries(std::chrono::seconds age);
 
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;

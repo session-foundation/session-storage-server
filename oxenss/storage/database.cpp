@@ -1346,6 +1346,13 @@ void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) 
     std::this_thread::sleep_for(duration);
 }
 
+void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
+    auto impl = get_impl(/*write =*/true);
+    impl->prepared_exec(
+            "UPDATE retry_node_requests SET next_retry = next_retry - ?",
+            std::chrono::duration<double>{age}.count());
+}
+
 int64_t Database::add_retry_request(
         const crypto::legacy_pubkey& key,
         const std::string& cmd,

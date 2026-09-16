@@ -13,26 +13,34 @@ The default build compiles for the current system and requires the following be 
 headers/dev packages for the libraries):
 
 Requirements:
-* cmake >= 3.10
-* OpenSSL >= 1.1.1
-* libsodium >= 1.0.17
+* a C++20 compiler
+* cmake >= 3.18
 * pkg-config (any version)
-* libcurl
-* jemalloc (not strictly required but recommended for reduced long-term memory use)
-* autoconf (for building jemalloc)
 
-Other dependencies will be used from the system if found, but if not found will be compiled and
-built statically from bundled versions:
-* spdlog >= 1.8
+These are used from the system when a new enough version is installed, and otherwise downloaded and
+built statically as part of the build:
+* OpenSSL >= 3
+* libsodium >= 1.0.18
+* libcurl >= 7.68
+* libevent >= 2.1
 * libzmq >= 4.3
-* oxen-mq >= 1.2.6
-* oxen-encoding >= 1.0.1
 * sqlite >= 3.35.5
+* gnutls and ngtcp2 (required by oxen-libquic)
 
-You can, however, instruct the build to download and build static versions of all of these
-dependencies (other than autoconf) as part of the build by adding the `-D BUILD_STATIC_DEPS=ON`
-option to the `cmake` command below.  (This will, however, result in a slower build and larger,
-slower binary, as is typical for static builds).
+These are used from the system if found, and otherwise built from the bundled submodules:
+* oxen-libquic >= 1.8
+* oxen-mq >= 1.3
+* oxen-encoding >= 1.5
+* nlohmann-json >= 3.11
+* CLI11 >= 2.2
+
+jemalloc is linked against when it is found; it isn't required, but is recommended for reduced
+long-term memory use.
+
+You can instruct the build to ignore system libraries entirely and download and build static
+versions of everything by adding the `-D BUILD_STATIC_DEPS=ON` option to the `cmake` command below.
+That additionally requires autoconf, automake, libtool and patch, and will result in a slower build
+and a larger, slower binary, as is typical for static builds.
 
 ```
 git submodule update --init --recursive

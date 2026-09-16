@@ -1,4 +1,6 @@
 
+check_submodule(Catch2)
+
 add_subdirectory(Catch2)
 
 add_executable(Test

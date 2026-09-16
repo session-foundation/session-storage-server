@@ -2,6 +2,7 @@ local default_deps_base = [
   'autoconf',
   'libboost-program-options-dev',
   'libcurl4-openssl-dev',
+  'libevent-dev',
   'libjemalloc-dev',
   'libsodium-dev',
   'libgnutls28-dev',
@@ -10,6 +11,7 @@ local default_deps_base = [
   'libsystemd-dev',
   'libngtcp2-dev',
   'libngtcp2-crypto-gnutls-dev',
+  'libzmq3-dev',
   'make',
   'pkg-config',
 ];

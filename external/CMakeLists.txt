@@ -1,126 +1,64 @@
 
-if(BUILD_STATIC_DEPS)
-  set(DEFAULT_STATIC ON)
-else()
-  set(DEFAULT_STATIC OFF)
-endif()
-option(STATIC "Try to link external dependencies statically, where possible" ${DEFAULT_STATIC})
+message(STATUS "Checking submodules")
+check_submodule(CLI11)
+check_submodule(cpr)
+check_submodule(nlohmann_json)
+check_submodule(oxen-libquic)
+check_submodule(oxen-mq)
+check_submodule(SQLiteCpp)
+check_submodule(uWebSockets)
 
 
-if(NOT STATIC AND NOT BUILD_STATIC_DEPS)
-  find_package(PkgConfig REQUIRED)
-else()
-  set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
-endif()
+session_dep(libsodium 1.0.18)
+session_dep(libzmq 4.3)
+session_dep(libssl 3 WITH libcrypto)
+session_dep(libcurl 7.68)
 
-if(NOT TARGET sodium)
-  # Allow -D DOWNLOAD_SODIUM=FORCE to download without even checking for a local libsodium
-  option(DOWNLOAD_SODIUM "Allow libsodium to be downloaded and built locally if not found on the system" OFF)
-  if(NOT DOWNLOAD_SODIUM STREQUAL "FORCE" AND NOT BUILD_STATIC_DEPS)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SODIUM libsodium>=1.0.18 IMPORTED_TARGET)
-  endif()
+# oxenss/http drives curl from libquic's event loop, so it needs libevent itself rather than just
+# inheriting it from libquic (which isn't built at all when a system liboxenquic is used).
+session_dep(libevent_core 2.1)
 
-  add_library(sodium INTERFACE)
-  if(SODIUM_FOUND AND NOT DOWNLOAD_SODIUM STREQUAL "FORCE" AND NOT BUILD_STATIC_DEPS)
-    target_link_libraries(sodium INTERFACE PkgConfig::SODIUM)
-  else()
-    if(NOT DOWNLOAD_SODIUM AND NOT BUILD_STATIC_DEPS)
-      message(FATAL_ERROR "Could not find libsodium >= 1.0.18; either install it on your system or use -DDOWNLOAD_SODIUM=ON to download and build an internal copy")
-    endif()
-    message(STATUS "Sodium >= 1.0.18 not found, but DOWNLOAD_SODIUM specified, so downloading it")
-    include(DownloadLibSodium)
-    target_link_libraries(sodium INTERFACE sodium_vendor)
-  endif()
+# oxen-mq looks for plain `sodium` and `libzmq` targets set up by the parent project and links to
+# those in preference to going looking for system libraries of its own.
+add_library(sodium INTERFACE)
+target_link_libraries(sodium INTERFACE sessiondep::libsodium)
+add_library(libzmq INTERFACE)
+target_link_libraries(libzmq INTERFACE sessiondep::libzmq)
 
-  # Need this target export so that oxenmq properly picks up sodium
-  export(TARGETS sodium NAMESPACE sodium:: FILE sodium-exports.cmake)
+
+# oxenc and oxen-logging come from libquic's submodules: libquic pulls them in anyway, and a second
+# copy here would only be a second thing to keep in sync.
+if(NOT TARGET oxenc::oxenc)
+    sessiondep_or_submodule(liboxenc 1.5.0 oxen-libquic/external/oxen-encoding oxenc::oxenc)
 endif()
 
-
-macro(system_or_submodule BIGNAME smallname pkgconf subdir)
-  option(FORCE_${BIGNAME}_SUBMODULE "force using ${smallname} submodule" OFF)
-  if(NOT STATIC AND NOT FORCE_${BIGNAME}_SUBMODULE)
-    pkg_check_modules(${BIGNAME} ${pkgconf} IMPORTED_TARGET)
-  endif()
-  if(${BIGNAME}_FOUND)
-    add_library(${smallname} INTERFACE)
-    if(NOT TARGET PkgConfig::${BIGNAME} AND CMAKE_VERSION VERSION_LESS "3.21")
-      # Work around cmake bug 22180 (PkgConfig::THING not set if no flags needed)
-    else()
-      target_link_libraries(${smallname} INTERFACE PkgConfig::${BIGNAME})
-    endif()
-    message(STATUS "Found system ${smallname} ${${BIGNAME}_VERSION}")
-  else()
-    message(STATUS "using ${smallname} submodule")
-    add_subdirectory(${subdir})
-  endif()
-  if(NOT TARGET ${smallname}::${smallname})
-    add_library(${smallname}::${smallname} ALIAS ${smallname})
-  endif()
-endmacro()
-
-system_or_submodule(OXENC oxenc liboxenc>=1.5.0 oxenc)
+# oxen::logging, with matching fmt/spdlog targets.  This can't go through sessiondep_or_submodule
+# because oxen-logging's public headers expose fmt types, which a system liboxen-logging's .pc file
+# doesn't pull in; load.cmake resolves that for us.  It doesn't know about our submodule/static
+# options, though, so translate those for it.
+option(DEPS_FORCE_liboxen-logging_SUBMODULE "force using liboxen-logging submodule" OFF)
+if(BUILD_STATIC_DEPS OR DEPS_FORCE_SUBMODULE OR DEPS_FORCE_liboxen-logging_SUBMODULE)
+    set(OXEN_LOGGING_FORCE_SUBMODULES ON)
+endif()
+include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-system_or_submodule(OXENQUIC quic liboxenquic>=1.6.0 oxen-libquic)
+sessiondep_or_submodule(liboxenquic 1.8.0 oxen-libquic oxen::quic)
 
-system_or_submodule(OXENMQ oxenmq liboxenmq>=1.3.0 oxen-mq)
+sessiondep_or_submodule(liboxenmq 1.3.0 oxen-mq oxenmq::oxenmq)
+
 set(JSON_MultipleHeaders ON CACHE BOOL "") # Allows multi-header nlohmann use
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(JSON_Diagnostics ON CACHE BOOL "")
 endif()
-system_or_submodule(NLOHMANN nlohmann_json nlohmann_json>=3.11.0 nlohmann_json)
-system_or_submodule(CLI11 CLI11 CLI11>=2.2.0 CLI11)
+sessiondep_or_submodule(nlohmann_json 3.11.0 nlohmann_json nlohmann_json::nlohmann_json)
 
-
-# libevent
-if(NOT TARGET libevent::core)
-    add_library(libevent_core INTERFACE)
-    pkg_check_modules(LIBEVENT_core libevent_core>=2.1 IMPORTED_TARGET REQUIRED)
-    target_link_libraries(libevent_core INTERFACE PkgConfig::LIBEVENT_core)
-    add_library(libevent::core ALIAS libevent_core)
-
-    add_library(libevent_threads INTERFACE)
-    if(NOT WIN32)
-        pkg_check_modules(LIBEVENT_pthreads libevent_pthreads>=2.1 IMPORTED_TARGET REQUIRED)
-        target_link_libraries(libevent_threads INTERFACE PkgConfig::LIBEVENT_pthreads)
-    endif()
-    add_library(libevent::threads ALIAS libevent_threads)
-else()
-    # If this already exists it is probably via the one oxen-libquic provides when used as a submodule
-    message(STATUS "Using pre-existing libevent::core target for libevent")
-endif()
-
-
-if (STATIC OR FORCE_SPDLOG_SUBMODULE OR FORCE_FMT_SUBMODULE)
-    set(OXEN_LOGGING_FORCE_SUBMODULES ON CACHE INTERNAL "")
-endif()
-if(NOT TARGET oxen::logging)
-    if(BUILD_STATIC_DEPS)
-        set(OXEN_LOGGING_FORCE_SUBMODULES ON CACHE INTERNAL "")
-    endif()
-    system_or_submodule(OXENLOGGING oxen-logging liboxen-logging>=1.2.0 oxen-logging)
-    if(OXENLOGGING_FOUND)
-        # If we load oxen-logging via system lib then we won't necessarily have fmt/spdlog targets,
-        # but this script will give us them:
-        include(oxen-logging/cmake/load_fmt_spdlog.cmake)
-
-        add_library(oxen-logging-fmt-spdlog INTERFACE)
-        target_link_libraries(oxen-logging-fmt-spdlog INTERFACE oxen-logging ${OXEN_LOGGING_FMT_TARGET} ${OXEN_LOGGING_SPDLOG_TARGET})
-        add_library(oxen::logging ALIAS oxen-logging-fmt-spdlog)
-    endif()
-endif()
+sessiondep_or_submodule(CLI11 2.2.0 CLI11 CLI11::CLI11)
 
 
 # uSockets doesn't really have a proper build system (just a very simple Makefile) so build it
 # ourselves.
-if (NOT CMAKE_VERSION VERSION_LESS 3.12)
-    set(conf_depends "CONFIGURE_DEPENDS")
-else()
-    set(conf_depends "")
-endif()
-file(GLOB usockets_src ${conf_depends}
+file(GLOB usockets_src CONFIGURE_DEPENDS
     uWebSockets/uSockets/src/*.c
     uWebSockets/uSockets/src/eventing/*.c
     uWebSockets/uSockets/src/crypto/*.c
@@ -130,23 +68,7 @@ add_library(uSockets STATIC EXCLUDE_FROM_ALL ${usockets_src})
 target_include_directories(uSockets PRIVATE uWebSockets/uSockets/src)
 target_compile_definitions(uSockets PRIVATE LIBUS_USE_OPENSSL)
 target_compile_features(uSockets PRIVATE c_std_11 cxx_std_17)
-target_link_libraries(uSockets OpenSSL::SSL OpenSSL::Crypto)
-
-# On Windows uSockets uses libuv for its event loop; on Mac kqueue is the default, but that seems to
-# not be reliable on older macos versions (like 10.12), so we use libuv on macos as well.
-if (WIN32 OR (APPLE AND NOT IOS))
-  if(BUILD_STATIC_DEPS)
-    target_link_libraries(uSockets libuv)
-  else()
-    if(STATIC)
-      pkg_check_modules(LIBUV libuv-static REQUIRED IMPORTED_TARGET)
-    else()
-      pkg_check_modules(LIBUV libuv REQUIRED IMPORTED_TARGET)
-    endif()
-    target_link_libraries(uSockets PkgConfig::LIBUV)
-  endif()
-endif()
-
+target_link_libraries(uSockets sessiondep::libssl sessiondep::libcrypto)
 
 # The uWebSockets C++ layer is header-only but isn't actually prefixed in the repository itself, but
 # rather only on install (which, as above, is just a very simple Makefile).  This is unfortunate
@@ -159,25 +81,10 @@ target_include_directories(uWebSockets SYSTEM INTERFACE ${CMAKE_CURRENT_BINARY_D
 target_link_libraries(uWebSockets INTERFACE uSockets)
 target_compile_definitions(uWebSockets INTERFACE UWS_HTTPRESPONSE_NO_WRITEMARK UWS_NO_ZLIB)
 
-# cpr configuration.  Ideally we'd just do this via add_subdirectory, but cpr's cmake requires
-# 3.15+, and we target lower than that (and this is fairly simple to build).
 
-if(NOT BUILD_STATIC_DEPS)
-  find_package(CURL REQUIRED COMPONENTS HTTP HTTPS SSL)
-
-  # CURL::libcurl wasn't added to FindCURL until cmake 3.12, so add it if necessary
-  if (CMAKE_VERSION VERSION_LESS 3.12 AND NOT TARGET CURL::libcurl)
-    add_library(libcurl UNKNOWN IMPORTED GLOBAL)
-    set_target_properties(libcurl PROPERTIES
-      IMPORTED_LOCATION ${CURL_LIBRARIES}
-      INTERFACE_INCLUDE_DIRECTORIES "${CURL_INCLUDE_DIRS}")
-    add_library(CURL_libcurl INTERFACE)
-    target_link_libraries(CURL_libcurl INTERFACE libcurl)
-    add_library(CURL::libcurl ALIAS CURL_libcurl)
-  endif()
-endif()
-
-file(GLOB cpr_sources ${conf_depends} cpr/cpr/*.cpp)
+# cpr configuration.  Ideally we'd just do this via add_subdirectory, but cpr's cmake drags in a
+# pile of options and its own curl handling, and this is fairly simple to build.
+file(GLOB cpr_sources CONFIGURE_DEPENDS cpr/cpr/*.cpp)
 file(READ cpr/CMakeLists.txt cpr_cmakelists_txt)
 if(NOT cpr_cmakelists_txt MATCHES "project\\(cpr VERSION ([0-9]+)\\.([0-9]+)\\.([0-9]+) LANGUAGES CXX\\)")
     message(FATAL_ERROR "Failed to detect cpr version")
@@ -191,7 +98,7 @@ set(cpr_VERSION_NUM "(${cpr_VERSION_MAJOR} * 0x10000 + ${cpr_VERSION_MINOR} * 0x
 configure_file("cpr/cmake/cprver.h.in" "${CMAKE_CURRENT_BINARY_DIR}/include/cpr/cprver.h")
 
 add_library(cpr STATIC EXCLUDE_FROM_ALL ${cpr_sources})
-target_link_libraries(cpr PUBLIC CURL::libcurl)
+target_link_libraries(cpr PUBLIC sessiondep::libcurl)
 target_include_directories(cpr PUBLIC cpr/include "${CMAKE_CURRENT_BINARY_DIR}/include")
 target_compile_definitions(cpr PUBLIC CPR_CURL_NOSIGNAL)
 add_library(cpr::cpr ALIAS cpr)
@@ -200,58 +107,32 @@ add_library(cpr::cpr ALIAS cpr)
 option(USE_JEMALLOC "Link to jemalloc for memory allocations, if found" ON)
 add_library(jemalloc INTERFACE)
 add_library(jemalloc::jemalloc ALIAS jemalloc)
-if (USE_JEMALLOC AND NOT STATIC)
+if(USE_JEMALLOC AND NOT BUILD_STATIC_DEPS)
+  find_package(PkgConfig REQUIRED)
   pkg_check_modules(JEMALLOC jemalloc IMPORTED_TARGET)
   if(JEMALLOC_FOUND)
     target_link_libraries(jemalloc INTERFACE PkgConfig::JEMALLOC)
   endif()
 endif()
 
-if(NOT BUILD_STATIC_DEPS) # Under BUILD_STATIC_DEPS the SQLite::SQLite3 target is already set up
-  # We require 3.35.x for some queries we use (such as "RETURNING"), and 3.35.5 for bug fixes, but
-  # that release is very new as of this writing so we build a static release if the system one is
-  # too old.
-  pkg_check_modules(SQLite3 sqlite3>=3.35.5 IMPORTED_TARGET)
 
-  if(SQLite3_FOUND)
-    add_library(SQLite::SQLite3 ALIAS PkgConfig::SQLite3)
-  else()
-    include(ExternalProject)
-    unset(SQLITE3_VERSION CACHE)
-    include(sqlite3_source)
+# We require 3.35.x for some queries we use (such as "RETURNING"), and 3.35.5 for bug fixes.  When
+# the system sqlite3 is too old we fall back to sqlite3mc, which is a regular sqlite3 build with
+# encryption support bolted on: we don't use the encryption, but everything else works as usual.
+# Deliberately not named SQLite3_*: the SQLiteCpp workaround below force-sets SQLite3_FOUND in the
+# cache, which would then win over this check on every re-configure.
+if(NOT BUILD_STATIC_DEPS)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(SYS_SQLITE3 sqlite3>=3.35.5 IMPORTED_TARGET GLOBAL)
+endif()
 
-    set(sqlite_urls)
-    foreach(mirror ${SQLITE3_MIRROR})
-      list(APPEND sqlite_urls "${mirror}/${SQLITE3_SOURCE}")
-    endforeach()
-
-    set(deps_cc "${CMAKE_C_COMPILER}")
-    if(CMAKE_C_COMPILER_LAUNCHER)
-      set(deps_cc "${CMAKE_C_COMPILER_LAUNCHER} ${deps_cc}")
-    endif()
-    set(deps_CFLAGS "-O2")
-    if(USE_LTO AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
-      # For unknown reasons, clang has trouble linking sqlite3 if we build it with lto
-      set(deps_CFLAGS "${deps_CFLAGS} -flto")
-    endif()
-
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/include ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/lib)
-    ExternalProject_Add(sqlite3_external
-      BUILD_IN_SOURCE ON
-      PREFIX ${CMAKE_CURRENT_BINARY_DIR}/sqlite3
-      URL ${sqlite_urls}
-      URL_HASH ${SQLITE3_HASH}
-      DOWNLOAD_NO_PROGRESS ON
-      CONFIGURE_COMMAND ./configure --disable-shared --prefix=${CMAKE_CURRENT_BINARY_DIR}/sqlite3 "CC=${deps_cc}" "CFLAGS=${deps_CFLAGS}"
-      BUILD_COMMAND true
-      INSTALL_COMMAND make install-headers install-lib
-      BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/lib/libsqlite3.a ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/include/sqlite3.h
-      )
-    add_library(SQLite::SQLite3 STATIC IMPORTED GLOBAL)
-    add_dependencies(SQLite::SQLite3 sqlite3_external)
-    set_target_properties(SQLite::SQLite3 PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/lib/libsqlite3.a)
-    target_include_directories(SQLite::SQLite3 INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/sqlite3/include)
-  endif()
+if(SYS_SQLITE3_FOUND)
+  add_library(SQLite::SQLite3 ALIAS PkgConfig::SYS_SQLITE3)
+else()
+  session_dep(sqlite3mc 2)
+  # IMPORTED so that SQLiteCpp's install(EXPORT) doesn't demand that we export it too.
+  add_library(SQLite::SQLite3 INTERFACE IMPORTED GLOBAL)
+  set_target_properties(SQLite::SQLite3 PROPERTIES INTERFACE_LINK_LIBRARIES sessiondep::sqlite3mc)
 endif()
 
 # Hack around SQLiteCpp's attempts to locate sqlite3 because we *don't* want to link against the
@@ -260,7 +141,7 @@ endif()
 # is set that up and circumvent some of the non-target bits of its FindSQLite3.cmake.
 set(SQLite3_FOUND TRUE CACHE BOOL "" FORCE)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ignored")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ignored/sqlite3.h" "#define SQLITE_VERSION \"${SQLite3_VERSION}\"")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ignored/sqlite3.h" "#define SQLITE_VERSION \"${SYS_SQLITE3_VERSION}\"")
 set(SQLite3_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/ignored" CACHE STRING "" FORCE)
 set(SQLite3_LIBRARY "ignored" CACHE STRING "" FORCE)
 set(SQLITECPP_INTERNAL_SQLITE OFF CACHE BOOL "don't build SQLiteCpp's internal sqlite3" FORCE)

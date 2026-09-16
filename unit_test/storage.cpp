@@ -11,6 +11,7 @@
 #include <future>
 
 #include <catch2/catch.hpp>
+#include "oxenss/common/format.h"
 #include "oxenss/utils/time.hpp"
 
 using namespace oxenss;
@@ -379,62 +380,64 @@ TEST_CASE("storage - retrieve limit", "[storage]") {
 namespace oxenss {
 class TestSuiteHacks {
   public:
-    static void db_block(Database& db, std::chrono::milliseconds duration) {
-        db.test_suite_block_for(duration);
-    }
-    static int db_pool_size(Database& db) {
-        std::lock_guard lock{db.impl_lock_};
-        return db.impl_pool_.size();
-    }
     static void db_backdate_retries(Database& db, std::chrono::seconds age) {
         db.test_suite_backdate_retries(age);
     }
 };
 }  // namespace oxenss
 
-TEST_CASE("storage - connection pool", "[storage][pool]") {
+// The connection pool belongs to session-sqlite now, so rather than asserting on its internals this
+// checks what we actually depend on: that concurrent readers and writers all get through without
+// "database is locked" and without losing writes.
+TEST_CASE("storage - concurrent access", "[storage][pool]") {
     StorageDeleter fixture;
 
     Database storage{"."};
 
-    auto n_blocked_threads = GENERATE(1, 2, 5, 10);
+    auto n_threads = GENERATE(2, 5, 10);
+    constexpr int per_thread = 20;
 
-    user_pubkey pubkey1;
-    REQUIRE(pubkey1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
-
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
 
     auto now = std::chrono::system_clock::now();
-    CHECK(storage.store(
-                  {pubkey1, "hash0", namespace_id::Default, now, now + 1s, "bytesasstring0"}) ==
-          StoreResult::New);
+    std::atomic<int> failures = 0;
 
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_threads; t++)
+        workers.emplace_back([&, t] {
+            try {
+                for (int i = 0; i < per_thread; i++) {
+                    auto hash = "hash{}_{}"_format(t, i);
+                    storage.store(
+                            {pubkey,
+                             hash,
+                             namespace_id::Default,
+                             now,
+                             now + 1h,
+                             "data{}_{}"_format(t, i)});
+                    // Interleave reads with the writes so both are in flight at once.
+                    storage.retrieve_by_hash(hash);
+                    storage.get_message_count();
+                }
+            } catch (const std::exception& e) {
+                if (failures++ == 0)
+                    UNSCOPED_INFO("first failure: " << e.what());
+            }
+        });
+    for (auto& w : workers)
+        w.join();
 
-    constexpr auto blocking_time =
-#ifdef __APPLE__
-            1s;  // Way to go making a nice fast filesystem, apple!
-#else
-            100ms;
-#endif
+    CHECK(failures == 0);
+    CHECK(storage.get_message_count() == n_threads * per_thread);
 
-    std::vector<std::thread> busy;
-    for (int i = 0; i < n_blocked_threads; i++)
-        busy.emplace_back([&] { oxenss::TestSuiteHacks::db_block(storage, blocking_time); });
-
-    std::this_thread::sleep_for(20ms);
-
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 0);
-    CHECK(storage.retrieve_by_hash("hash0"));
-    // The blocking threads are still there, so our retrieve should have created a new one then
-    // returned it the pool:
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
-    for (auto& b : busy)
-        b.join();
-
-    // Now we've waited for the blocking threads to finish, so the blocked conns should have been
-    // returned to the pool:
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1 + n_blocked_threads);
+    // Everything each thread wrote is retrievable and intact.
+    for (int t = 0; t < n_threads; t++)
+        for (int i = 0; i < per_thread; i++) {
+            auto msg = storage.retrieve_by_hash("hash{}_{}"_format(t, i));
+            REQUIRE(msg);
+            CHECK(msg->data == "data{}_{}"_format(t, i));
+        }
 }
 
 TEST_CASE("storage - current swarm", "[storage]") {

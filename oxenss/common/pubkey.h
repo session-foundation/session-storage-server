@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace oxenss {
@@ -52,6 +53,10 @@ class user_pubkey {
 
     // Returns the raw bytes that make up the pubkey (not including the type/network prefix).
     const std::string& raw() const { return pubkey_; }
+
+    // As raw(), but as a byte span, which is what binds as a database BLOB (a std::string binds as
+    // TEXT).  The span points at this object's storage, so it must not outlive it.
+    std::span<const std::byte> raw_bytes() const { return std::as_bytes(std::span{pubkey_}); }
 
     // Returns the raw bytes that makes up the pubkey, including the type/network prefix byte.
     // Returns an empty string for an invalid (default constructed) pubkey.

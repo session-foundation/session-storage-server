@@ -25,3 +25,6 @@
 [submodule "cmake/session-deps"]
 	path = cmake/session-deps
 	url = https://github.com/session-foundation/session-deps.git
+[submodule "external/session-sqlite"]
+	path = external/session-sqlite
+	url = https://github.com/session-foundation/session-sqlite.git

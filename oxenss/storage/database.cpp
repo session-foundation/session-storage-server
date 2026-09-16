@@ -1398,13 +1398,23 @@ void Database::foreach_ready_retry_request(std::function<
     auto sent_retry = to_epoch_double(now + RETRY_INTERVAL);
     auto unsent_retry = to_epoch_double(now + RETRY_NO_CONTACT_INTERVAL);
 
+    // The callback dispatches network requests, so the updates are accumulated here and applied
+    // together afterwards rather than one per iteration: a transaction around this loop would hold
+    // the write lock open across every dispatch.  If we die partway through then the rows already
+    // dispatched keep their old next_retry and simply come up for retry again sooner, which is
+    // harmless.
+    std::vector<std::pair<int64_t, double>> updates;
+    updates.reserve(ready.size());
     for (auto& [req_id, key_str, cmd, payload] : ready) {
         bool sent = callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
-        impl->prepared_exec(
-                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?",
-                sent ? sent_retry : unsent_retry,
-                req_id);
+        updates.emplace_back(req_id, sent ? sent_retry : unsent_retry);
     }
+
+    SQLite::Transaction transaction{impl->db, SQLite::TransactionBehavior::IMMEDIATE};
+    for (const auto& [req_id, next_retry] : updates)
+        impl->prepared_exec(
+                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?", next_retry, req_id);
+    transaction.commit();
 }
 
 int64_t Database::retry_request_count() {

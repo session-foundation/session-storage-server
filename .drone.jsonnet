@@ -1,7 +1,12 @@
 local default_deps_base = [
   'autoconf',
   'libboost-program-options-dev',
-  'libcurl4-openssl-dev',
+  // Must be the gnutls flavour, not libcurl4-openssl-dev: that one pulls in
+  // libngtcp2_crypto_ossl, whose symbols are identical to libngtcp2_crypto_gnutls's, so whichever
+  // of the two the loader reaches first satisfies *both* libcurl and liboxenquic.  When ossl wins,
+  // libquic hands a gnutls_session_t to SSL_do_handshake() and the process segfaults.  The gnutls
+  // build of libcurl uses the same ngtcp2 backend (and the same gnutls) that libquic does.
+  'libcurl4-gnutls-dev',
   'libevent-dev',
   'libjemalloc-dev',
   'libsodium-dev',

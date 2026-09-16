@@ -39,6 +39,12 @@ endif()
 
 option(BUILD_TESTS "build storage server unit tests" OFF)
 
+# session-deps has its own LTO switch for static dependency builds that defaults ON regardless of
+# ours; leaving the two to disagree breaks the link, because an LTO'd static archive can't be
+# consumed by a non-LTO link (clang emits pure bitcode archives, which either fail to load or get
+# silently dropped).  Seed it from what we actually settled on above so USE_LTO is the only knob.
+set(SESSIONDEPS_LTO ${IPO_ENABLED} CACHE BOOL "Use LTO for static dependency builds, where supported" FORCE)
+
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
 include(cmake/session-deps/Deps.cmake)

@@ -34,16 +34,7 @@ constexpr std::chrono::milliseconds SQLite_busy_timeout = 15s;
 
 namespace {
     using namespace session::sqlite;
-
-    // Binds as a BLOB rather than TEXT, which is what a std::string or string_view would give.
-    // The returned span points at the argument's storage, so it has to outlive the statement.
-    std::span<const std::byte> as_blob(std::string_view s) {
-        return std::as_bytes(std::span{s});
-    }
-    std::span<const std::byte> as_blob(std::basic_string_view<uint8_t> s) {
-        return std::as_bytes(std::span{s});
-    }
-
+    using util::to_span;
 
     // session-sqlite's get_all yields tuples for multi-column results; several of our signatures
     // predate that and use pairs.
@@ -613,7 +604,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                     msg.msg_namespace,
                     to_epoch_ms(msg.timestamp),
                     to_epoch_ms(msg.expiry),
-                    as_blob(msg.data));
+                    to_span(msg.data));
 
             // did not insert, which means public namespace and not newer
             if (rows == 0)
@@ -697,7 +688,7 @@ void Database::bulk_store(const std::vector<message>& items) {
                 m.msg_namespace,
                 to_epoch_ms(m.timestamp),
                 to_epoch_ms(m.expiry),
-                as_blob(m.data));
+                to_span(m.data));
         insert_message->reset();
     }
 
@@ -905,7 +896,7 @@ void Database::revoke_subaccounts(
                 insert_token,
                 pubkey.raw_bytes(),
                 pubkey.type(),
-                as_blob(subaccounts[0].view()));
+                subaccounts[0].view());
         return;
     }
 
@@ -920,7 +911,7 @@ void Database::revoke_subaccounts(
             fmt::format("{} VALUES (?, ?) {}", ins_revoke_prefix, ins_revoke_suffix));
 
     for (const auto& sa : subaccounts) {
-        exec_query(insert_token, *ownerid, as_blob(sa.view()));
+        exec_query(insert_token, *ownerid, sa.view());
         insert_token->reset();
     }
 
@@ -943,7 +934,7 @@ int Database::unrevoke_subaccounts(
                 remove_token,
                 pubkey.raw_bytes(),
                 pubkey.type(),
-                as_blob(subaccounts[0].view()));
+                subaccounts[0].view());
     }
 
     SQLite::Statement st{
@@ -958,7 +949,7 @@ int Database::unrevoke_subaccounts(
     std::vector<std::span<const std::byte>> tokens;
     tokens.reserve(subaccounts.size());
     for (const auto& sa : subaccounts)
-        tokens.push_back(as_blob(sa.sview()));
+        tokens.push_back(sa.view());
 
     return exec_query(st, pubkey.raw_bytes(), pubkey.type(), bind_each{tokens});
 }
@@ -969,7 +960,7 @@ bool Database::subaccount_revoked(const user_pubkey& pubkey, const subaccount_to
     auto count = exec_and_get<int64_t>(
             conn.prepared_st("SELECT COUNT(*) FROM revoked_subaccounts WHERE token = ? AND "
                               "owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"),
-            as_blob(subaccount.view()),
+            subaccount.view(),
             pubkey.raw_bytes(),
             pubkey.type());
     return count > 0;

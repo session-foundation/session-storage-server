@@ -12,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <stack>
 #include <string>
 #include <vector>
@@ -47,8 +46,7 @@ class Database {
     friend class DatabaseImpl;
     friend class LockedDBImpl;
     std::mutex impl_lock_;
-    std::shared_mutex access_lock_;
-    LockedDBImpl get_impl(bool write);
+    LockedDBImpl get_impl();
 
     const std::filesystem::path db_path_;
 

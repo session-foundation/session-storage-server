@@ -43,7 +43,7 @@ endif()
 include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-sessiondep_or_submodule(liboxenquic 1.8.0 oxen-libquic oxen::quic)
+sessiondep_or_submodule(liboxenquic 1.9.0 oxen-libquic oxen::quic)
 
 sessiondep_or_submodule(liboxenmq 1.3.0 oxen-mq oxenmq::oxenmq)
 

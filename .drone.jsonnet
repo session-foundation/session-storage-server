@@ -177,11 +177,11 @@ local static_check_and_upload = [
 
   // The default build is libmicrohttpd only.  These keep the uWebSockets backend compiling, alone
   // and alongside libmicrohttpd, so that it stays usable for comparison.
-  debian_pipeline('Debian sid, uWebSockets only (amd64)',
+  debian_pipeline('Debian sid, uWS-only (amd64)',
                   docker_base + 'debian-sid',
                   deps=uws_deps,
                   cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON -DHTTPS_BACKEND_MICROHTTPD=OFF'),
-  debian_pipeline('Debian sid, both HTTPS backends (amd64)',
+  debian_pipeline('Debian sid, uWS+MHD (amd64)',
                   docker_base + 'debian-sid',
                   deps=uws_deps,
                   cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON'),

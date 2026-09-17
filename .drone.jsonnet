@@ -187,8 +187,9 @@ local static_check_and_upload = [
                   cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON'),
 
   // ARM builds (ARM64 and armhf)
-  debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),
-  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false),
+  // The ARM box is shared and short on RAM: at the default -j6 it kills compilers mid-build.
+  debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64', jobs=4),
+  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false, jobs=4),
 
   // Static build (on bionic) which gets uploaded to oxen.rocks:
   debian_pipeline('Static (jammy amd64)',

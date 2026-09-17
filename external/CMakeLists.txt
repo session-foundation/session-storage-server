@@ -6,12 +6,17 @@ check_submodule(nlohmann_json)
 check_submodule(oxen-libquic)
 check_submodule(oxen-mq)
 check_submodule(session-sqlite)
-check_submodule(uWebSockets)
+if(HTTPS_BACKEND_UWEBSOCKETS)
+    check_submodule(uWebSockets)
+endif()
 
 
 session_dep(libsodium 1.0.18)
 session_dep(libzmq 4.3)
-session_dep(libssl 3 WITH libcrypto)
+if(HTTPS_BACKEND_UWEBSOCKETS)
+    # Only uSockets wants OpenSSL; everything else TLS-related here is gnutls.
+    session_dep(libssl 3 WITH libcrypto)
+endif()
 session_dep(libcurl 7.68)
 
 # Already pulled in by liboxenquic and the gnutls flavour of libcurl; declared here because we use
@@ -60,6 +65,7 @@ sessiondep_or_submodule(nlohmann_json 3.11.0 nlohmann_json nlohmann_json::nlohma
 sessiondep_or_submodule(CLI11 2.2.0 CLI11 CLI11::CLI11)
 
 
+if(HTTPS_BACKEND_UWEBSOCKETS)
 # uSockets doesn't really have a proper build system (just a very simple Makefile) so build it
 # ourselves.
 file(GLOB usockets_src CONFIGURE_DEPENDS
@@ -84,6 +90,7 @@ add_library(uWebSockets INTERFACE)
 target_include_directories(uWebSockets SYSTEM INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/uWebSockets)
 target_link_libraries(uWebSockets INTERFACE uSockets)
 target_compile_definitions(uWebSockets INTERFACE UWS_HTTPRESPONSE_NO_WRITEMARK UWS_NO_ZLIB)
+endif()
 
 
 # cpr configuration.  Ideally we'd just do this via add_subdirectory, but cpr's cmake drags in a

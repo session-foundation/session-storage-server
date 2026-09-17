@@ -2,7 +2,9 @@
 
 #include <oxenss/server/server_certificates.h>
 
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
 #include <uWebSockets/App.h>
+#endif
 
 #include <filesystem>
 #include <random>
@@ -41,6 +43,7 @@ TEST_CASE("certificate generation", "[certs]") {
     auto key_perms = std::filesystem::status(key).permissions();
     CHECK((key_perms & (perms::group_all | perms::others_all)) == perms::none);
 
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
     SECTION("openssl accepts what gnutls wrote") {
         // The certificates are written by gnutls but parsed by OpenSSL inside uSockets, so the
         // thing worth testing is that round trip rather than that gnutls can read its own output.
@@ -60,4 +63,5 @@ TEST_CASE("certificate generation", "[certs]") {
         uWS::SSLApp app{{.key_file_name = key_s.c_str(), .cert_file_name = cert_s.c_str()}};
         CHECK(app.constructorFailed());
     }
+#endif
 }

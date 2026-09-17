@@ -39,6 +39,13 @@ endif()
 
 option(BUILD_TESTS "build storage server unit tests" OFF)
 
+# HTTPS server implementations.  Any that are enabled get compiled in; which one is used is chosen
+# at runtime with --https-backend.  At least one must be enabled.
+option(HTTPS_BACKEND_UWEBSOCKETS "Build the uWebSockets (OpenSSL) HTTPS server backend" ON)
+if(NOT HTTPS_BACKEND_UWEBSOCKETS)
+    message(FATAL_ERROR "At least one HTTPS_BACKEND_* option must be enabled")
+endif()
+
 # session-deps has its own LTO switch for static dependency builds that defaults ON regardless of
 # ours; leaving the two to disagree breaks the link, because an LTO'd static archive can't be
 # consumed by a non-LTO link (clang emits pure bitcode archives, which either fail to load or get

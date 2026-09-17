@@ -1,8 +1,11 @@
 #include "command_line.h"
 #include <oxenss/logging/oxen_logger.h>
+#include <oxenss/server/https.h>
 #include <oxenss/version.h>
 #include <oxenss/common/format.h>
 #include <oxenss/utils/string_utils.hpp>
+
+#include <fmt/ranges.h>
 
 #include <CLI/CLI.hpp>
 #include <CLI/Error.hpp>
@@ -158,6 +161,17 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "Public port to listen on for HTTPS (TCP) connections")
             ->capture_default_str()
             ->type_name("PORT");
+    std::vector<std::string> https_backends;
+    for (auto b : server::available_https_backends())
+        https_backends.emplace_back(server::to_string(b));
+    cli.add_option(
+               "--https-backend",
+               options.https_backend,
+               "HTTPS server implementation to use.  Available in this build: " +
+                       fmt::format("{}", fmt::join(https_backends, ", ")))
+            ->capture_default_str()
+            ->type_name("BACKEND")
+            ->check(CLI::IsMember(https_backends));
     cli.add_option(
             "ignored",
             [](auto&&) { return true; },

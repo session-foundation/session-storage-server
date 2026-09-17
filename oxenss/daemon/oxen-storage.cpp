@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -182,14 +183,18 @@ int main(int argc, char* argv[]) {
         quic_bind.back().dual_stack = false;
 #endif
 
-        server::HTTPS https_server{
+        // Validated by the command-line parser, so this cannot fail to parse.
+        auto https_backend = *server::parse_https_backend(options.https_backend);
+        log::info(logcat, "Using HTTPS backend: {}", https_backend);
+        auto https_server = server::make_https(
+                https_backend,
                 service_node,
                 request_handler,
                 rate_limiter,
                 std::move(https_bind),
                 ssl_cert,
                 ssl_key,
-                l_keys};
+                l_keys);
 
         auto quic = std::make_unique<server::QUIC>(
                 service_node, request_handler, rate_limiter, std::move(quic_bind), ed_keys.sec);
@@ -207,7 +212,7 @@ int main(int argc, char* argv[]) {
 
         quic->startup_endpoint();
 
-        https_server.start();
+        https_server->start();
 
 #ifdef ENABLE_SYSTEMD
         sd_notify(0, "READY=1");
@@ -231,7 +236,7 @@ int main(int argc, char* argv[]) {
                               // `quic`'s event loop so *must* be destroyed before `quic`.
         service_node.shutdown();
         log::info(logcat, "Stopping https server");
-        https_server.shutdown(true);
+        https_server->shutdown(true);
         log::info(logcat, "Stopping quic server");
         quic.reset();
         log::info(logcat, "Stopping omq server");

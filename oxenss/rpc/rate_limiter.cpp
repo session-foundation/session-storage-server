@@ -76,6 +76,9 @@ bool RateLimiter::should_rate_limit_client(
         const oxen::quic::ipv6& ip, steady_clock::time_point now) {
     std::lock_guard lock{mutex_};
 
+    if (!client_limiting_)
+        return false;
+
     if (auto it = client_buckets_.find(ip); it != client_buckets_.end())
         return !remove_token(it->second, now);
 

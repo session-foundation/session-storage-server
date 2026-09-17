@@ -19,10 +19,16 @@
 #include <oxenc/base64.h>
 #include <sodium.h>
 
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace oxenss;
 using namespace std::literals;
@@ -144,6 +150,8 @@ TEST_CASE("https backends", "[https]") {
                       "Oxen Storage Server/" + std::string{STORAGE_SERVER_VERSION_STRING});
                 CHECK(r.header["Content-Type"] == "text/plain");
                 CHECK(r.text.empty());
+                // An immediate reply (no body read) must not cost the client its connection.
+                CHECK(r.header["Connection"] != "close");
             }
 
             SECTION("deprecated stats endpoint") {
@@ -225,6 +233,100 @@ TEST_CASE("https backends", "[https]") {
                 CHECK(total == threads * per_thread);
                 CHECK(ok == threads * per_thread);
             }
+        }
+    }
+}
+
+// Throughput/latency comparison of the backends on loopback.  Everything but the HTTP/TLS layer
+// is identical between them, so this isolates exactly the thing the runtime switch changes.
+// Hidden from normal runs; invoke with:  ./Test "[https-bench]"
+TEST_CASE("https backend benchmark", "[.][https-bench]") {
+    using clock = std::chrono::steady_clock;
+    using namespace std::chrono;
+
+    struct scenario {
+        const char* name;
+        std::string_view path;
+        std::string body;
+        int threads;
+        int requests;    // total, split across threads
+        bool keepalive;  // one connection per thread, or a fresh TLS handshake per request
+    };
+    const std::vector<scenario> scenarios{
+            {"ping, keep-alive, 1 thread", "/ping_test/v1", "", 1, 2000, true},
+            {"ping, keep-alive, 16 threads", "/ping_test/v1", "", 16, 8000, true},
+            {"info via OMQ, keep-alive, 16 threads",
+             "/storage_rpc/v1",
+             info_request,
+             16,
+             8000,
+             true},
+            {"ping, new connection each, 8 threads", "/ping_test/v1", "", 8, 800, false},
+    };
+
+    fmt::print(
+            stderr,
+            "\n{:<40} {:>12} {:>10} {:>10} {:>10}\n",
+            "scenario",
+            "backend",
+            "req/s",
+            "p50 ms",
+            "p99 ms");
+
+    for (auto backend : server::available_https_backends()) {
+        test_node node{backend};
+        // Everything comes from 127.0.0.1, which the per-IP limiter would otherwise cut off.
+        node.rl.set_client_limiting(false);
+        for (const auto& sc : scenarios) {
+            std::mutex mu;
+            std::vector<double> latencies;
+            latencies.reserve(sc.requests);
+            std::atomic<int> failures{0};
+            const int per_thread = sc.requests / sc.threads;
+
+            auto worker = [&] {
+                std::vector<double> mine;
+                mine.reserve(per_thread);
+                std::optional<cpr::Session> session;
+                if (sc.keepalive) {
+                    session.emplace();
+                    session->SetUrl(cpr::Url{node.url(sc.path)});
+                    session->SetSslOptions(no_verify);
+                    session->SetBody(cpr::Body{sc.body});
+                }
+                for (int i = 0; i < per_thread; i++) {
+                    auto t0 = clock::now();
+                    auto r = session ? session->Post() : post(node, sc.path, sc.body);
+                    mine.push_back(duration<double, std::milli>(clock::now() - t0).count());
+                    if (r.status_code != 200)
+                        failures++;
+                }
+                std::lock_guard lock{mu};
+                latencies.insert(latencies.end(), mine.begin(), mine.end());
+            };
+
+            auto start = clock::now();
+            std::vector<std::thread> pool;
+            for (int t = 0; t < sc.threads; t++)
+                pool.emplace_back(worker);
+            for (auto& t : pool)
+                t.join();
+            auto elapsed = duration<double>(clock::now() - start).count();
+
+            std::sort(latencies.begin(), latencies.end());
+            auto pct = [&](double p) {
+                return latencies[std::min(latencies.size() - 1, size_t(p * latencies.size()))];
+            };
+            fmt::print(
+                    stderr,
+                    "{:<40} {:>12} {:>10.0f} {:>10.2f} {:>10.2f}{}\n",
+                    sc.name,
+                    to_string(backend),
+                    latencies.size() / elapsed,
+                    pct(0.50),
+                    pct(0.99),
+                    failures ? fmt::format("   ({} failed!)", failures.load()) : "");
+            CHECK(failures == 0);
         }
     }
 }

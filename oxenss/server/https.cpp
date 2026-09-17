@@ -61,7 +61,6 @@ HTTPS::HTTPS(
         std::vector<std::tuple<std::string, uint16_t, bool>> bind,
         const std::filesystem::path& ssl_cert,
         const std::filesystem::path& ssl_key,
-        const std::filesystem::path& ssl_dh,
         crypto::legacy_keypair legacy_keys) :
         service_node_{sn},
         omq_{*service_node_.omq_server()},
@@ -102,10 +101,28 @@ HTTPS::HTTPS(
     //   start()).
     // startup_promise_
 
+    // This list is chosen for speed, not strength: the client cannot verify our certificate, so
+    // the TLS layer protects nothing that the payload's own encryption to our X25519 key does not
+    // already cover.  It only constrains TLS 1.2 -- TLS 1.3 suites come from
+    // SSL_CTX_set_ciphersuites, which uSockets never calls.
+    //
+    // AES-256 is omitted as it is ~7% slower than AES-128 here for strength we have no use for.
+    // Both AES-128-GCM and ChaCha20 are offered because neither is faster in general: ChaCha20
+    // wins on small payloads and on clients without AES hardware, AES on larger ones.  uSockets
+    // sets no SSL_OP_CIPHER_SERVER_PREFERENCE, so the client picks -- which is what we want, since
+    // it is the side that knows whether it has AES acceleration.
+    //
+    // Both ECDSA and RSA variants appear because we only generate a certificate when one is
+    // missing: a data directory created before the switch to ECDSA still holds an RSA cert.pem,
+    // and openssl will only negotiate suites matching whichever key type we loaded.
+    static constexpr auto ciphers =
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+
     uWS::SocketContextOptions https_opts{
             .key_file_name = ssl_key.c_str(),
             .cert_file_name = ssl_cert.c_str(),
-            .dh_params_file_name = ssl_dh.c_str()};
+            .ssl_ciphers = ciphers};
 
     server_thread_ = std::thread{
             [this, bind = std::move(bind), &https_opts](

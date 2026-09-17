@@ -4,7 +4,6 @@
 #include <gnutls/x509.h>
 
 #include <oxenss/common/format.h>
-#include <oxenss/logging/oxen_logger.h>
 
 #include <array>
 #include <chrono>
@@ -16,8 +15,6 @@
 namespace oxenss {
 
 namespace {
-
-    auto logcat = log::Cat("server");
 
     void check(int rc, std::string_view what) {
         if (rc < 0)
@@ -51,22 +48,6 @@ namespace {
     }
 
 }  // namespace
-
-void generate_dh_pem(const std::filesystem::path& dh_path) {
-    gnutls_dh_params_t dh_raw{};
-    check(gnutls_dh_params_init(&dh_raw), "DH parameter init");
-    gnutls_ptr<gnutls_dh_params_t> dh{dh_raw, gnutls_dh_params_deinit};
-
-    log::info(logcat, "Generating DH parameter, this might take a while...");
-    check(gnutls_dh_params_generate2(dh.get(), 2048), "DH parameter generation");
-    log::info(logcat, "DH parameter done!");
-
-    datum pem;
-    check(gnutls_dh_params_export2_pkcs3(dh.get(), GNUTLS_X509_FMT_PEM, &pem.d),
-          "DH parameter export");
-
-    write_pem(dh_path, pem.view(), public_perms);
-}
 
 void generate_cert(const std::filesystem::path& cert_path, const std::filesystem::path& key_path) {
     using namespace std::chrono;

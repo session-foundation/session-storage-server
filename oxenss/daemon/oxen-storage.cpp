@@ -141,11 +141,8 @@ int main(int argc, char* argv[]) {
 
         auto ssl_cert = options.data_dir / "cert.pem";
         auto ssl_key = options.data_dir / "key.pem";
-        auto ssl_dh = options.data_dir / "dh.pem";
         if (!exists(ssl_cert) || !exists(ssl_key))
             generate_cert(ssl_cert, ssl_key);
-        if (!exists(ssl_dh))
-            generate_dh_pem(ssl_dh);
 
         // Set up oxenmq now, but don't actually start it until after we set up the ServiceNode
         // instance (because ServiceNode and OxenmqServer reference each other).
@@ -188,7 +185,6 @@ int main(int argc, char* argv[]) {
                 std::move(https_bind),
                 ssl_cert,
                 ssl_key,
-                ssl_dh,
                 l_keys};
 
         auto quic = std::make_unique<server::QUIC>(

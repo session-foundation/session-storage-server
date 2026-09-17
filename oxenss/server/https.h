@@ -39,7 +39,6 @@ class HTTPS {
           std::vector<std::tuple<std::string, uint16_t, bool>> bind,
           const std::filesystem::path& ssl_cert,
           const std::filesystem::path& ssl_key,
-          const std::filesystem::path& ssl_dh,
           crypto::legacy_keypair legacy_keys);
 
     ~HTTPS();

@@ -30,14 +30,11 @@ TEST_CASE("certificate generation", "[certs]") {
     temp_dir dir;
     auto cert = dir.path / "cert.pem";
     auto key = dir.path / "key.pem";
-    auto dh = dir.path / "dh.pem";
 
     generate_cert(cert, key);
-    generate_dh_pem(dh);
 
     REQUIRE(std::filesystem::exists(cert));
     REQUIRE(std::filesystem::exists(key));
-    REQUIRE(std::filesystem::exists(dh));
 
     // The private key must not be readable by anyone else.
     using std::filesystem::perms;
@@ -48,11 +45,8 @@ TEST_CASE("certificate generation", "[certs]") {
         // The certificates are written by gnutls but parsed by OpenSSL inside uSockets, so the
         // thing worth testing is that round trip rather than that gnutls can read its own output.
         // Constructing an SSLApp is exactly what the https server does.
-        auto cert_s = cert.string(), key_s = key.string(), dh_s = dh.string();
-        uWS::SSLApp app{
-                {.key_file_name = key_s.c_str(),
-                 .cert_file_name = cert_s.c_str(),
-                 .dh_params_file_name = dh_s.c_str()}};
+        auto cert_s = cert.string(), key_s = key.string();
+        uWS::SSLApp app{{.key_file_name = key_s.c_str(), .cert_file_name = cert_s.c_str()}};
         CHECK_FALSE(app.constructorFailed());
     }
 

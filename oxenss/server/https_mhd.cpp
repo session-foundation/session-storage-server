@@ -173,16 +173,32 @@ HTTPS_MHD::~HTTPS_MHD() {
     shutdown(true);
 }
 
-MHD_Result HTTPS_MHD::queue(MHD_Connection* conn, const rpc::Response& response, bool force_close) {
-    auto rendered = render(response);
-    // MUST_COPY because `rendered.body` may point into `response`, which does not outlive this
-    // call.  (Responses are small; a copy is cheaper than plumbing ownership through to MHD.)
-    auto* r = MHD_create_response_from_buffer(
-            rendered.body.size(), const_cast<char*>(rendered.body.data()), MHD_RESPMEM_MUST_COPY);
+namespace {
+    // Owns a response for as long as libmicrohttpd is sending it, so that the body can be handed
+    // over as a view rather than copied: `rendered.body` points into either `rendered` (json) or
+    // `response` (string, or a span pinned by response.keepalive).  Freed from MHD's callback
+    // once the response object's last reference is gone.
+    struct held_response {
+        rpc::Response response;
+        RenderedResponse rendered;
+    };
+}  // namespace
+
+MHD_Result HTTPS_MHD::queue(MHD_Connection* conn, rpc::Response response, bool force_close) {
+    auto held = std::make_unique<held_response>(std::move(response), RenderedResponse{});
+    held->rendered = render(held->response);
+    const auto& rendered = held->rendered;
+    auto* r = MHD_create_response_from_buffer_with_free_callback_cls(
+            rendered.body.size(),
+            rendered.body.data(),
+            [](void* cls) { delete static_cast<held_response*>(cls); },
+            held.get());
     if (!r) {
         log::error(logcat, "Failed to allocate HTTP response");
         return MHD_NO;
     }
+    // MHD's callback owns it from here.
+    (void)held.release();
     for (const auto& [h, v] : rendered.headers)
         MHD_add_response_header(r, h.c_str(), v.c_str());
     if (force_close || closing())
@@ -218,7 +234,7 @@ MHD_Result HTTPS_MHD::on_request(
         // what we don't want for everything else, so ordinary immediate replies are held until
         // MHD's final call for the request, once it has read (and here, discarded) the body.
         if (immediate && immediate->force_close)
-            return queue(conn, immediate->response, true);
+            return queue(conn, std::move(immediate->response), true);
 
         auto mconn = std::make_shared<MhdConn>(conn);
         {
@@ -288,7 +304,7 @@ MHD_Result HTTPS_MHD::on_request(
         log::error(logcat, "HTTPS connection resumed with no response pending");
         return queue(conn, error_response(http::INTERNAL_SERVER_ERROR), true);
     }
-    return queue(conn, pending->response, pending->force_close);
+    return queue(conn, std::move(pending->response), pending->force_close);
 }
 
 void HTTPS_MHD::on_completed(void** req_cls, MHD_RequestTerminationCode code) {

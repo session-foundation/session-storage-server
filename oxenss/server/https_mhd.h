@@ -52,8 +52,9 @@ class HTTPS_MHD : public HTTPS {
     void on_completed(void** req_cls, MHD_RequestTerminationCode code);
     void on_log(const char* fmt, va_list ap);
 
-    // Sends `response` on `conn`; must be called from inside a libmicrohttpd callback.
-    MHD_Result queue(MHD_Connection* conn, const rpc::Response& response, bool force_close);
+    // Sends `response` on `conn`; must be called from inside a libmicrohttpd callback.  Takes
+    // ownership: the body is handed to libmicrohttpd as a view into the response, not copied.
+    MHD_Result queue(MHD_Connection* conn, rpc::Response response, bool force_close);
 
     MHD_Daemon* start_daemon(const std::string& addr, uint16_t port, bool dual_stack);
 

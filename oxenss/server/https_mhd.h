@@ -39,9 +39,7 @@ class HTTPS_MHD : public HTTPS {
     void shutdown(bool join = false) override;
     HttpsBackend backend() const override { return HttpsBackend::microhttpd; }
 
-    // The ports we ended up listening on, one per daemon started; only meaningful after
-    // start().  (Mainly useful when binding to port 0.)
-    std::vector<uint16_t> listening_ports() const;
+    std::vector<uint16_t> listening_ports() const override;
 
   private:
     MHD_Result on_request(

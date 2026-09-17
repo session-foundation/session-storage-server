@@ -129,6 +129,10 @@ class HTTPS {
 
     virtual HttpsBackend backend() const = 0;
 
+    // The ports actually being listened on, one per bound address; only meaningful after start().
+    // (Mainly useful when binding to port 0.)
+    virtual std::vector<uint16_t> listening_ports() const = 0;
+
     // Backend entry point once the request line and headers are in (`req.body` is still empty).
     // Returns a response to send immediately, in which case the backend must not read the body
     // and must send the response (closing afterwards if `force_close`); or nullopt, in which

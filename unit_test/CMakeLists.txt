@@ -8,6 +8,7 @@ add_executable(Test
 
     certificates.cpp
     encrypt.cpp
+    https_backends.cpp
     monitor.cpp
     onion_requests.cpp
     rate_limiter.cpp
@@ -20,6 +21,7 @@ add_executable(Test
 target_link_libraries(Test
     PRIVATE
     common storage utils crypto snode rpc server
+    cpr::cpr  # https_backends.cpp is an HTTPS client of the server under test
     Catch2::Catch2)
 
 # certificates.cpp drives each backend's TLS setup directly.

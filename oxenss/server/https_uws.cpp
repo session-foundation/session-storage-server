@@ -235,6 +235,14 @@ void HTTPS_uWS::start() {
     listen_socks_ = startup_success_.get();
 }
 
+std::vector<uint16_t> HTTPS_uWS::listening_ports() const {
+    std::vector<uint16_t> ports;
+    // A us_listen_socket_t is a us_socket_t with extras, which is how uSockets itself treats it.
+    for (auto* ls : listen_socks_)
+        ports.push_back(us_socket_local_port(/*ssl=*/true, reinterpret_cast<us_socket_t*>(ls)));
+    return ports;
+}
+
 void HTTPS_uWS::shutdown(bool join) {
     if (!server_thread_.joinable())
         return;

@@ -28,6 +28,7 @@ class HTTPS_uWS : public HTTPS {
     void start() override;
     void shutdown(bool join = false) override;
     HttpsBackend backend() const override { return HttpsBackend::uwebsockets; }
+    std::vector<uint16_t> listening_ports() const override;
 
     // Writes a response to `res` and finalizes it.  Must be called from the server thread.
     void write(HttpResponse& res, const rpc::Response& response, bool force_close);

@@ -56,7 +56,12 @@ void generate_cert(const std::filesystem::path& cert_path, const std::filesystem
     check(gnutls_x509_privkey_init(&key_raw), "private key init");
     gnutls_ptr<gnutls_x509_privkey_t> key{key_raw, gnutls_x509_privkey_deinit};
 
-    check(gnutls_x509_privkey_generate(key.get(), GNUTLS_PK_RSA, 2048, 0),
+    // P-256 rather than RSA because the server signs once per handshake and this certificate is
+    // never verified by anyone: ECDSA signing is roughly 30x faster than RSA-2048 here, which is
+    // the only property of it that matters to us.  It is also mandatory to implement for TLS 1.3
+    // (RFC 8446 §9.1), so no client that can reach us can fail to handle it.
+    check(gnutls_x509_privkey_generate(
+                  key.get(), GNUTLS_PK_ECDSA, GNUTLS_CURVE_TO_BITS(GNUTLS_ECC_CURVE_SECP256R1), 0),
           "private key generation");
 
     gnutls_x509_crt_t crt_raw{};

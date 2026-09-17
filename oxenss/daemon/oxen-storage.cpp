@@ -139,8 +139,12 @@ int main(int argc, char* argv[]) {
 
         crypto::ChannelEncryption channel_encryption{x_keys};
 
-        auto ssl_cert = options.data_dir / "cert.pem";
-        auto ssl_key = options.data_dir / "key.pem";
+        // Deliberately not cert.pem/key.pem: those hold the RSA certificate earlier releases
+        // issued, and a node upgrading would otherwise go on serving it forever, since we only
+        // generate when the file is absent.  Using a new name abandons the old pair instead;
+        // cert.pem, key.pem and dh.pem are left on disk but no longer read.
+        auto ssl_cert = options.data_dir / "cert_ecdsa.pem";
+        auto ssl_key = options.data_dir / "key_ecdsa.pem";
         if (!exists(ssl_cert) || !exists(ssl_key))
             generate_cert(ssl_cert, ssl_key);
 

@@ -111,13 +111,7 @@ HTTPS::HTTPS(
     // wins on small payloads and on clients without AES hardware, AES on larger ones.  uSockets
     // sets no SSL_OP_CIPHER_SERVER_PREFERENCE, so the client picks -- which is what we want, since
     // it is the side that knows whether it has AES acceleration.
-    //
-    // Both ECDSA and RSA variants appear because we only generate a certificate when one is
-    // missing: a data directory created before the switch to ECDSA still holds an RSA cert.pem,
-    // and openssl will only negotiate suites matching whichever key type we loaded.
-    static constexpr auto ciphers =
-            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
-            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+    static constexpr auto ciphers = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305";
 
     uWS::SocketContextOptions https_opts{
             .key_file_name = ssl_key.c_str(),

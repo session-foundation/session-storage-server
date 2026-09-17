@@ -209,23 +209,37 @@ MHD_Result HTTPS_MHD::on_request(
         MHD_get_connection_values_n(conn, MHD_HEADER_KIND, header_iterator, &req.headers);
         set_remote(req, conn);
 
-        if (auto immediate = on_headers(req))
-            return queue(conn, immediate->response, immediate->force_close);
+        auto immediate = on_headers(req);
+
+        // Replying from this first call is legal, but if the request has any body still to come
+        // MHD then closes the connection after the reply rather than reuse one whose request it
+        // never finished reading.  That is exactly what we want for the deliberate rejections
+        // (bad or over-size Content-Length: don't read the body, drop the client), and exactly
+        // what we don't want for everything else, so ordinary immediate replies are held until
+        // MHD's final call for the request, once it has read (and here, discarded) the body.
+        if (immediate && immediate->force_close)
+            return queue(conn, immediate->response, true);
 
         auto mconn = std::make_shared<MhdConn>(conn);
         {
             std::lock_guard lock{conns_mutex_};
             conns_.insert(mconn);
         }
-        ctx = new req_ctx{mconn, std::make_shared<mhd_call>(*this, mconn)};
-        ctx->call->request = std::move(req);
+        ctx = new req_ctx{mconn, nullptr};
+        if (immediate) {
+            mconn->pending = std::move(immediate);
+        } else {
+            ctx->call = std::make_shared<mhd_call>(*this, mconn);
+            ctx->call->request = std::move(req);
+        }
         *req_cls = ctx;
         return MHD_YES;
     }
 
     if (*upload_data_size > 0) {
         // Body chunk.  We are not allowed to queue a response from here, so an over-size body is
-        // just noted and rejected once the upload ends.
+        // just noted and rejected once the upload ends.  (With no `call` the reply is already
+        // decided and the body is simply discarded.)
         if (ctx->call && !ctx->call->too_large) {
             auto& body = ctx->call->request.body;
             if (body.size() + *upload_data_size > MAX_REQUEST_BODY_SIZE) {
@@ -261,7 +275,8 @@ MHD_Result HTTPS_MHD::on_request(
         }
     }
 
-    // Resumed with a response waiting (or the too-large rejection from just above).
+    // MHD's final call for the request, with a response waiting: one held back from the first
+    // call, the too-large rejection from just above, or a worker's reply that resumed us.
     std::optional<Immediate> pending;
     {
         std::lock_guard lock{ctx->conn->mutex};

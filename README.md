@@ -19,7 +19,9 @@ Requirements:
 
 These are used from the system when a new enough version is installed, and otherwise downloaded and
 built statically as part of the build:
-* OpenSSL >= 3
+* OpenSSL >= 3 (only for the uWebSockets HTTPS backend; see below)
+* libmicrohttpd >= 1.0.8 (only for the libmicrohttpd HTTPS backend; the floor is a security fix
+  level, not an API one, so most distro packages are currently too old and it gets built statically)
 * libsodium >= 1.0.18
 * libcurl >= 7.68
 * libevent >= 2.1
@@ -50,6 +52,15 @@ cmake --build build --parallel
 
 The build will produce a `./build/oxen-storage` binary.  You can run it with `--help` to
 see supported run-time options.
+
+## HTTPS backends
+
+The HTTPS listener has two interchangeable implementations: one on uWebSockets (which brings in
+OpenSSL) and one on libmicrohttpd (GnuTLS, which the rest of the program already uses).  Both are
+built by default and can be switched at startup with `--https-backend uwebsockets|microhttpd`; the
+default is `uwebsockets`.  Either can be left out of the build with `-D HTTPS_BACKEND_UWEBSOCKETS=OFF`
+or `-D HTTPS_BACKEND_MICROHTTPD=OFF` (at least one must remain), and a build without the uWebSockets
+backend has no OpenSSL dependency at all.
 
 # Running
 

@@ -11,6 +11,11 @@ local default_deps_base = [
   'libjemalloc-dev',
   'libsodium-dev',
   'libgnutls28-dev',
+  // The libmicrohttpd HTTPS backend needs >= 1.0.8 (see external/CMakeLists.txt), which only sid
+  // and Ubuntu rolling currently ship; elsewhere cmake rejects the distro package as too old and
+  // session-deps builds it statically, so installing it everywhere just lets the distros that can
+  // use the system library exercise that path.
+  'libmicrohttpd-dev',
   'libsqlite3-dev',
   'libssl-dev',
   'libsystemd-dev',
@@ -166,6 +171,18 @@ local static_check_and_upload = [
   debian_pipeline('Ubuntu LTS (amd64)', docker_base + 'ubuntu-lts', oxen_repo=true),
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
   debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm', oxen_repo=true),
+
+  // Single-HTTPS-backend builds, so that neither backend can quietly stop compiling on its own.
+  // The libmicrohttpd-only build is also the one with no OpenSSL in it, which is checked.
+  debian_pipeline('Debian sid, uWebSockets only (amd64)',
+                  docker_base + 'debian-sid',
+                  cmake_extra='-DHTTPS_BACKEND_MICROHTTPD=OFF'),
+  debian_pipeline('Debian sid, libmicrohttpd only (amd64)',
+                  docker_base + 'debian-sid',
+                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=OFF',
+                  extra_cmds=[
+                    'if objdump -p oxen-storage | grep -E "NEEDED.*lib(ssl|crypto)"; then echo "OpenSSL is still linked"; exit 1; fi',
+                  ]),
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),

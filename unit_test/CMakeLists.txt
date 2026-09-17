@@ -6,6 +6,7 @@ add_subdirectory(Catch2)
 add_executable(Test
     main.cpp
 
+    certificates.cpp
     encrypt.cpp
     monitor.cpp
     onion_requests.cpp

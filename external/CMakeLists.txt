@@ -14,6 +14,10 @@ session_dep(libzmq 4.3)
 session_dep(libssl 3 WITH libcrypto)
 session_dep(libcurl 7.68)
 
+# Already pulled in by liboxenquic and the gnutls flavour of libcurl; declared here because we use
+# it directly for certificate generation.
+session_dep(gnutls 3.6)
+
 # oxenss/http drives curl from libquic's event loop, so it needs libevent itself rather than just
 # inheriting it from libquic (which isn't built at all when a system liboxenquic is used).
 session_dep(libevent_core 2.1)

@@ -19,9 +19,7 @@ target_link_libraries(server
     rpc
     snode
     logging
-    sessiondep::libcrypto
+    sessiondep::gnutls
     oxenmq::oxenmq
     sessiondep::libsodium
     Threads::Threads)
-
-set_source_files_properties(server_certificates.cpp PROPERTIES COMPILE_FLAGS -Wno-error=deprecated-declarations)

@@ -1,4 +1,5 @@
 #include <catch2/catch.hpp>
+#include <oxenc/hex.h>
 #include <oxenss/crypto/channel_encryption.hpp>
 #include <oxenss/crypto/keys.h>
 
@@ -27,6 +28,30 @@ TEST_CASE("AES-GCM encryption", "[encrypt][gcm]") {
     auto ptext_alice = alice_box.decrypt_gcm(ctext_alice, bob_keys.pub);
 
     CHECK(ptext_alice == plaintext_data);
+}
+
+TEST_CASE("AES-GCM known answer", "[encrypt][gcm]") {
+    // A round-trip test only proves the implementation agrees with itself; this pins the actual
+    // wire format (HMAC-SHA256("LOKI") key derivation, 12-byte IV prefix, 16-byte tag suffix,
+    // AES-256-GCM) so that swapping the underlying crypto library cannot silently change what
+    // clients see.  Generated independently with python-cryptography, and verified to decrypt
+    // under the openssl implementation this replaced.
+    auto ctext = oxenc::from_hex(
+            "000102030405060708090a0b254141d0fb10f0f25e1e316f3f47bf675d49eb6c238bd3c18b86df3fc8d56"
+            "87cc64c7a"sv);
+
+    ChannelEncryption bob_box{bob_keys};
+    CHECK(bob_box.decrypt_gcm(ctext, alice_keys.pub) == plaintext_data);
+
+    // Negative control: flipping a bit anywhere must fail the tag check rather than return
+    // garbage, otherwise the check above could pass with authentication broken.
+    for (size_t i : {size_t{0}, size_t{12}, ctext.size() - 1}) {
+        auto damaged = ctext;
+        damaged[i] ^= 0x01;
+        CHECK_THROWS_AS(bob_box.decrypt_gcm(damaged, alice_keys.pub), std::runtime_error);
+    }
+
+    CHECK_THROWS_AS(bob_box.decrypt_gcm(ctext.substr(0, 27), alice_keys.pub), std::runtime_error);
 }
 
 TEST_CASE("XChaCha20-Poly1309 encryption", "[encrypt][xchacha20]") {

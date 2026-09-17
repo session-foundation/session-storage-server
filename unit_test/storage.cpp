@@ -513,10 +513,11 @@ TEST_CASE("storage - ready retry requests", "[storage]") {
 
     std::vector<std::pair<std::string, std::string>> seen;
     auto collect = [&seen](bool sent) {
-        return [&seen, sent](const crypto::legacy_pubkey&,
-                             const std::string& cmd,
-                             const std::string& payload,
-                             int64_t) {
+        return [&seen, sent](
+                       const crypto::legacy_pubkey&,
+                       const std::string& cmd,
+                       const std::string& payload,
+                       int64_t) {
             seen.emplace_back(cmd, payload);
             return sent;
         };

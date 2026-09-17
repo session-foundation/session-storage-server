@@ -523,8 +523,7 @@ int64_t Database::get_total_bytes() {
 
 int64_t Database::get_used_bytes() {
     auto conn = db_->conn();
-    return get_total_bytes() -
-           conn.prepared_get<int64_t>("PRAGMA freelist_count") * page_size_;
+    return get_total_bytes() - conn.prepared_get<int64_t>("PRAGMA freelist_count") * page_size_;
 }
 
 std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
@@ -578,8 +577,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
         auto new_exp = to_epoch_ms(msg.expiry);
 
         if (auto existing = exec_and_maybe_get<int64_t, int64_t>(
-                    conn.prepared_st("SELECT id, expiry FROM messages WHERE hash = ?"),
-                    msg.hash)) {
+                    conn.prepared_st("SELECT id, expiry FROM messages WHERE hash = ?"), msg.hash)) {
             auto& [id, exp] = *existing;
             if (exp < new_exp) {
                 conn.prepared_exec("UPDATE messages SET expiry = ? WHERE id = ?", new_exp, id);
@@ -642,8 +640,8 @@ void Database::bulk_store(const std::vector<message>& items) {
         if (!m.pubkey)
             continue;
         if (auto [it, ins] = seen.emplace(m.pubkey, 0); ins) {
-            auto ownerid = exec_and_maybe_get<int64_t>(
-                    get_owner, m.pubkey.raw_bytes(), m.pubkey.type());
+            auto ownerid =
+                    exec_and_maybe_get<int64_t>(get_owner, m.pubkey.raw_bytes(), m.pubkey.type());
             get_owner->reset();
             if (!ownerid) {
                 ownerid = exec_and_maybe_get<int64_t>(
@@ -871,8 +869,7 @@ std::vector<std::string> Database::delete_by_timestamp(
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ? AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(
-            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
+    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
 }
 
 static constexpr auto ins_revoke_prefix = "INSERT INTO revoked_subaccounts (owner, token) "sv;
@@ -892,11 +889,7 @@ void Database::revoke_subaccounts(
                 "{} VALUES ((SELECT id FROM owners WHERE pubkey = ? AND type = ?), ?) {}",
                 ins_revoke_prefix,
                 ins_revoke_suffix));
-        exec_query(
-                insert_token,
-                pubkey.raw_bytes(),
-                pubkey.type(),
-                subaccounts[0].view());
+        exec_query(insert_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
         return;
     }
 
@@ -930,11 +923,7 @@ int Database::unrevoke_subaccounts(
                 "DELETE FROM revoked_subaccounts"
                 " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
                 " AND token = ?");
-        return exec_query(
-                remove_token,
-                pubkey.raw_bytes(),
-                pubkey.type(),
-                subaccounts[0].view());
+        return exec_query(remove_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
     }
 
     SQLite::Statement st{
@@ -959,7 +948,7 @@ bool Database::subaccount_revoked(const user_pubkey& pubkey, const subaccount_to
 
     auto count = exec_and_get<int64_t>(
             conn.prepared_st("SELECT COUNT(*) FROM revoked_subaccounts WHERE token = ? AND "
-                              "owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"),
+                             "owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"),
             subaccount.view(),
             pubkey.raw_bytes(),
             pubkey.type());
@@ -1058,8 +1047,7 @@ std::map<std::string, int64_t> Database::get_expiries(
         auto st = conn.prepared_st(
                 "SELECT hash, expiry FROM messages WHERE hash = ?"
                 " AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)");
-        return get_map<std::string, int64_t>(
-                st, msg_hashes[0], pubkey.raw_bytes(), pubkey.type());
+        return get_map<std::string, int64_t>(st, msg_hashes[0], pubkey.raw_bytes(), pubkey.type());
     }
 
     SQLite::Statement st{
@@ -1097,8 +1085,7 @@ std::vector<std::string> Database::update_all_expiries(
             " WHERE expiry > ? AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(
-            st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type(), ns);
+    return get_all<std::string>(st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type(), ns);
 }
 
 void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
@@ -1151,7 +1138,7 @@ void Database::foreach_ready_retry_request(std::function<
     // See the retry_requests.created default for why this isn't `unixepoch('now', 'subsec')`.
     auto ready = get_all<int64_t, std::string, std::string, std::string>(
             conn.prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
-                              " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
+                             " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
 
     // The next retry time is set here, before the outcome of the request is known, rather than
     // when the request times out: a successful or definitively failed request deletes the row
@@ -1278,8 +1265,8 @@ void Database::update_current_swarm(uint64_t swarm_id) {
 std::optional<uint64_t> Database::get_current_swarm() {
     auto conn = db_->conn();
     try {
-        auto as_hex = conn.prepared_get<std::string>(
-                "SELECT value FROM state_kv WHERE key = 'swarm_id'");
+        auto as_hex =
+                conn.prepared_get<std::string>("SELECT value FROM state_kv WHERE key = 'swarm_id'");
         return oxenc::bt_deserialize<uint64_t>(as_hex);
     } catch (const std::exception& e) {
         return std::nullopt;

@@ -281,8 +281,8 @@ std::string ChannelEncryption::decrypt_xchacha20(
 
     // Extract nonce from the beginning of the ciphertext.  The length check has to come first
     // because subspan, unlike string_view::substr, does not clamp to the available length.
-    if (ciphertext.size() < crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                                    crypto_aead_xchacha20poly1305_ietf_ABYTES)
+    if (ciphertext.size() <
+        crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES)
         throw std::runtime_error{"Invalid ciphertext: too short"};
     auto nonce = ciphertext.first(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
     ciphertext = ciphertext.subspan(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);

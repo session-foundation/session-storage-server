@@ -1,7 +1,10 @@
 #include "channel_encryption.hpp"
 
+#include <oxenss/utils/string_utils.hpp>
+
 #include <cassert>
 #include <memory>
+#include <span>
 
 #include <openssl/evp.h>
 #include <sodium/crypto_aead_xchacha20poly1305.h>
@@ -23,8 +26,8 @@ namespace {
         return secret;
     }
 
-    std::basic_string_view<unsigned char> to_uchar(std::string_view sv) {
-        return {reinterpret_cast<const unsigned char*>(sv.data()), sv.size()};
+    std::span<const unsigned char> to_uchar(std::string_view sv) {
+        return util::to_span<unsigned char>(sv);
     }
 
     inline constexpr std::string_view salt{"LOKI"};
@@ -85,7 +88,7 @@ std::string ChannelEncryption::decrypt(
 static std::string encrypt_openssl(
         const EVP_CIPHER* cipher,
         int taglen,
-        std::basic_string_view<unsigned char> plaintext,
+        std::span<const unsigned char> plaintext,
         const std::array<uint8_t, crypto_scalarmult_BYTES>& key) {
     // Initialise cipher context
     aes256_ctx_ptr ctx_ptr{EVP_CIPHER_CTX_new()};
@@ -132,21 +135,24 @@ static std::string encrypt_openssl(
 static std::string decrypt_openssl(
         const EVP_CIPHER* cipher,
         size_t taglen,
-        std::basic_string_view<unsigned char> ciphertext,
+        std::span<const unsigned char> ciphertext,
         const std::array<uint8_t, crypto_scalarmult_BYTES>& key) {
     // Initialise cipher context
     aes256_ctx_ptr ctx_ptr{EVP_CIPHER_CTX_new()};
     auto* ctx = ctx_ptr.get();
 
-    // We prepend the iv on the beginning of the ciphertext; extract it
-    auto iv = ciphertext.substr(0, EVP_CIPHER_iv_length(cipher));
-    ciphertext.remove_prefix(iv.size());
-
-    // We also append the tag (if applicable) so extract it:
-    if (ciphertext.size() < taglen)
+    // We prepend the iv and append the tag (if applicable), so both have to fit.  This has to be
+    // checked up front because subspan, unlike string_view::substr, does not clamp to the
+    // available length.
+    const size_t ivlen = EVP_CIPHER_iv_length(cipher);
+    if (ciphertext.size() < ivlen + taglen)
         throw std::runtime_error{"Encrypted value is too short"};
-    auto tag = ciphertext.substr(ciphertext.size() - taglen);
-    ciphertext.remove_suffix(tag.size());
+
+    auto iv = ciphertext.first(ivlen);
+    ciphertext = ciphertext.subspan(ivlen);
+
+    auto tag = ciphertext.last(taglen);
+    ciphertext = ciphertext.first(ciphertext.size() - taglen);
 
     // libssl docs say we need up to block size of extra buffer space:
     std::string output;
@@ -273,11 +279,13 @@ std::string ChannelEncryption::decrypt_xchacha20(
         std::string_view ciphertext_, const x25519_pubkey& pubKey) const {
     auto ciphertext = to_uchar(ciphertext_);
 
-    // Extract nonce from the beginning of the ciphertext:
-    auto nonce = ciphertext.substr(0, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-    ciphertext.remove_prefix(nonce.size());
-    if (ciphertext.size() < crypto_aead_xchacha20poly1305_ietf_ABYTES)
+    // Extract nonce from the beginning of the ciphertext.  The length check has to come first
+    // because subspan, unlike string_view::substr, does not clamp to the available length.
+    if (ciphertext.size() <
+        crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES)
         throw std::runtime_error{"Invalid ciphertext: too short"};
+    auto nonce = ciphertext.first(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+    ciphertext = ciphertext.subspan(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
 
     const auto key = xchacha20_shared_key(keys_.pub, keys_.sec, pubKey, !server_);
 

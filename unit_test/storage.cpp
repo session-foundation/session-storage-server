@@ -11,6 +11,7 @@
 #include <future>
 
 #include <catch2/catch.hpp>
+#include "oxenss/common/format.h"
 #include "oxenss/utils/time.hpp"
 
 using namespace oxenss;
@@ -379,59 +380,64 @@ TEST_CASE("storage - retrieve limit", "[storage]") {
 namespace oxenss {
 class TestSuiteHacks {
   public:
-    static void db_block(Database& db, std::chrono::milliseconds duration) {
-        db.test_suite_block_for(duration);
-    }
-    static int db_pool_size(Database& db) {
-        std::lock_guard lock{db.impl_lock_};
-        return db.impl_pool_.size();
+    static void db_backdate_retries(Database& db, std::chrono::seconds age) {
+        db.test_suite_backdate_retries(age);
     }
 };
 }  // namespace oxenss
 
-TEST_CASE("storage - connection pool", "[storage][pool]") {
+// The connection pool belongs to session-sqlite now, so rather than asserting on its internals this
+// checks what we actually depend on: that concurrent readers and writers all get through without
+// "database is locked" and without losing writes.
+TEST_CASE("storage - concurrent access", "[storage][pool]") {
     StorageDeleter fixture;
 
     Database storage{"."};
 
-    auto n_blocked_threads = GENERATE(1, 2, 5, 10);
+    auto n_threads = GENERATE(2, 5, 10);
+    constexpr int per_thread = 20;
 
-    user_pubkey pubkey1;
-    REQUIRE(pubkey1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
-
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
 
     auto now = std::chrono::system_clock::now();
-    CHECK(storage.store(
-                  {pubkey1, "hash0", namespace_id::Default, now, now + 1s, "bytesasstring0"}) ==
-          StoreResult::New);
+    std::atomic<int> failures = 0;
 
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_threads; t++)
+        workers.emplace_back([&, t] {
+            try {
+                for (int i = 0; i < per_thread; i++) {
+                    auto hash = "hash{}_{}"_format(t, i);
+                    storage.store(
+                            {pubkey,
+                             hash,
+                             namespace_id::Default,
+                             now,
+                             now + 1h,
+                             "data{}_{}"_format(t, i)});
+                    // Interleave reads with the writes so both are in flight at once.
+                    storage.retrieve_by_hash(hash);
+                    storage.get_message_count();
+                }
+            } catch (const std::exception& e) {
+                if (failures++ == 0)
+                    UNSCOPED_INFO("first failure: " << e.what());
+            }
+        });
+    for (auto& w : workers)
+        w.join();
 
-    constexpr auto blocking_time =
-#ifdef __APPLE__
-            1s;  // Way to go making a nice fast filesystem, apple!
-#else
-            100ms;
-#endif
+    CHECK(failures == 0);
+    CHECK(storage.get_message_count() == n_threads * per_thread);
 
-    std::vector<std::thread> busy;
-    for (int i = 0; i < n_blocked_threads; i++)
-        busy.emplace_back([&] { oxenss::TestSuiteHacks::db_block(storage, blocking_time); });
-
-    std::this_thread::sleep_for(20ms);
-
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 0);
-    CHECK(storage.retrieve_by_hash("hash0"));
-    // The blocking threads are still there, so our retrieve should have created a new one then
-    // returned it the pool:
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1);
-    for (auto& b : busy)
-        b.join();
-
-    // Now we've waited for the blocking threads to finish, so the blocked conns should have been
-    // returned to the pool:
-    CHECK(oxenss::TestSuiteHacks::db_pool_size(storage) == 1 + n_blocked_threads);
+    // Everything each thread wrote is retrievable and intact.
+    for (int t = 0; t < n_threads; t++)
+        for (int i = 0; i < per_thread; i++) {
+            auto msg = storage.retrieve_by_hash("hash{}_{}"_format(t, i));
+            REQUIRE(msg);
+            CHECK(msg->data == "data{}_{}"_format(t, i));
+        }
 }
 
 TEST_CASE("storage - current swarm", "[storage]") {
@@ -489,4 +495,73 @@ TEST_CASE("storage - retry requests", "[storage]") {
     CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
     req_count = storage.retry_request_count();
     CHECK(req_count == 1);
+}
+
+TEST_CASE("storage - ready retry requests", "[storage]") {
+    StorageDeleter fixture;
+    crypto::legacy_pubkey pk1, pk2, pk3;
+    pk1.load_from_hex("1111111111111111111111111111111111111111111111111111111111111111");
+    pk2.load_from_hex("2222222222222222222222222222222222222222222222222222222222222222");
+    pk3.load_from_hex("3333333333333333333333333333333333333333333333333333333333333333");
+
+    Database storage{"."};
+
+    storage.add_retry_request(pk1, "cmd1", "payload1");
+    storage.add_retry_request(pk2, "cmd2", "payload2");
+    storage.add_retry_request(pk3, "cmd3", "payload3");
+    REQUIRE(storage.retry_request_count() == 3);
+
+    std::vector<std::pair<std::string, std::string>> seen;
+    auto collect = [&seen](bool sent) {
+        return [&seen, sent](
+                       const crypto::legacy_pubkey&,
+                       const std::string& cmd,
+                       const std::string& payload,
+                       int64_t) {
+            seen.emplace_back(cmd, payload);
+            return sent;
+        };
+    };
+    auto saw = [&seen](std::string_view cmd) {
+        for (const auto& [c, p] : seen)
+            if (c == cmd)
+                return true;
+        return false;
+    };
+
+    // add_retry_request schedules the first attempt RETRY_INITIAL_DELAY out, so nothing is due yet
+    storage.foreach_ready_retry_request(collect(true));
+    CHECK(seen.empty());
+
+    // Backdating past RETRY_INITIAL_DELAY makes all three due; report only cmd1 as sent.
+    TestSuiteHacks::db_backdate_retries(storage, 30s);
+    seen.clear();
+    storage.foreach_ready_retry_request([&seen](const crypto::legacy_pubkey&,
+                                                const std::string& cmd,
+                                                const std::string& payload,
+                                                int64_t) {
+        seen.emplace_back(cmd, payload);
+        return cmd == "cmd1";
+    });
+    REQUIRE(seen.size() == 3);
+    CHECK(saw("cmd1"));
+    CHECK(saw("cmd2"));
+    CHECK(saw("cmd3"));
+    for (const auto& [c, p] : seen)
+        CHECK(p == "payload" + c.substr(3));
+
+    // Every row's next_retry was moved forward, so a second pass finds nothing.
+    seen.clear();
+    storage.foreach_ready_retry_request(collect(true));
+    CHECK(seen.empty());
+
+    // cmd1 was reported sent, so it waits RETRY_INTERVAL (60s); the other two were not, so they
+    // wait only RETRY_NO_CONTACT_INTERVAL (15s).  Backdating 30s brings back just those two.
+    TestSuiteHacks::db_backdate_retries(storage, 30s);
+    seen.clear();
+    storage.foreach_ready_retry_request(collect(true));
+    REQUIRE(seen.size() == 2);
+    CHECK_FALSE(saw("cmd1"));
+    CHECK(saw("cmd2"));
+    CHECK(saw("cmd3"));
 }

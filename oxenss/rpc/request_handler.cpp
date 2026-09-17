@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <span>
 
 #include <nlohmann/json.hpp>
 #include <oxenc/base64.h>
@@ -136,6 +137,15 @@ namespace {
         return regs;
     }
 
+    // Matches a span of any char-like type, of either extent, so that byte-valued arguments can
+    // be signed over without each one needing its own branch below.
+    template <typename T>
+    inline constexpr bool is_byte_span = false;
+    template <oxenc::basic_char Char, size_t Extent>
+    inline constexpr bool is_byte_span<std::span<Char, Extent>> = true;
+    template <oxenc::basic_char Char, size_t Extent>
+    inline constexpr bool is_byte_span<std::span<const Char, Extent>> = true;
+
     // For any integer (or timestamp) arguments convert to string using the provided buffer;
     // returns a string_view into the relevant part of the buffer for converted
     // integer/timestamp values.  If called with non-integer values then this simply returns an
@@ -159,7 +169,7 @@ namespace {
             s = stringified_ints[N - sizeof...(More) - 1].size();
         else if constexpr (std::is_convertible_v<T, std::string_view>)
             s += std::string_view{val}.size();
-        else if constexpr (std::is_same_v<T, std::basic_string_view<unsigned char>>)
+        else if constexpr (is_byte_span<T>)
             s += val.size();
         else if constexpr (std::is_same_v<T, std::map<std::string, int64_t>>) {
             for (auto& [k, v] : val) {
@@ -193,7 +203,7 @@ namespace {
             result += stringified_ints[N - sizeof...(More) - 1];
         else if constexpr (std::is_convertible_v<T, std::string_view>)
             result += std::string_view{val};
-        else if constexpr (std::is_same_v<T, std::basic_string_view<unsigned char>>)
+        else if constexpr (is_byte_span<T>)
             result += std::string_view{reinterpret_cast<const char*>(val.data()), val.size()};
         else if constexpr (std::is_same_v<T, std::map<std::string, int64_t>>) {
             for (auto& [k, v] : val) {

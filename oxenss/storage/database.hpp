@@ -10,20 +10,19 @@
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
-#include <stack>
 #include <string>
 #include <vector>
 #include "oxenss/crypto/keys.h"
 
+namespace session::sqlite {
+class Connection;
+class Database;
+}  // namespace session::sqlite
+
 namespace oxenss {
 
 using namespace std::literals;
-
-class DatabaseImpl;
-class LockedDBImpl;
 
 /// Possible return values of a `store()`:
 enum class StoreResult {
@@ -43,17 +42,23 @@ enum class BlobType {
 
 // Storage database class.
 class Database {
-    std::stack<std::unique_ptr<DatabaseImpl>> impl_pool_;
+    // Held by pointer so that this header does not have to pull in SQLiteCpp.
+    std::unique_ptr<session::sqlite::Database> db_;
     friend class DatabaseImpl;
-    friend class LockedDBImpl;
-    std::mutex impl_lock_;
-    std::shared_mutex access_lock_;
-    LockedDBImpl get_impl(bool write);
+
+    // Applied to every connection the pool opens, not just the first.
+    void setup_connection(session::sqlite::Connection& conn);
 
     const std::filesystem::path db_path_;
 
+    // Constant for the database, but written from whichever thread opens a connection, so atomic
+    // even though every write stores the same value.
+    std::atomic<int> page_size_ = 0;
+
     friend class TestSuiteHacks;
-    void test_suite_block_for(std::chrono::milliseconds duration);
+    // Shifts every pending retry's next_retry earlier, so that a test can reach the ready state
+    // without waiting out RETRY_INITIAL_DELAY.
+    void test_suite_backdate_retries(std::chrono::seconds age);
 
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;

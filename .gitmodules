@@ -13,9 +13,6 @@
 [submodule "unit_test/Catch2"]
 	path = unit_test/Catch2
 	url = https://github.com/catchorg/Catch2
-[submodule "vendors/SQLiteCpp"]
-	path = external/SQLiteCpp
-	url = https://github.com/SRombauts/SQLiteCpp.git
 [submodule "vendors/CLI11"]
 	path = external/CLI11
 	url = https://github.com/CLIUtils/CLI11
@@ -25,3 +22,6 @@
 [submodule "cmake/session-deps"]
 	path = cmake/session-deps
 	url = https://github.com/session-foundation/session-deps.git
+[submodule "external/session-sqlite"]
+	path = external/session-sqlite
+	url = https://github.com/session-foundation/session-sqlite.git

@@ -3,6 +3,7 @@
 #include <SQLiteCpp/Exception.h>
 #include <SQLiteCpp/Statement.h>
 #include <SQLiteCpp/Transaction.h>
+#include <session/sqlite.hpp>
 #include <oxenss/logging/oxen_logger.h>
 #include <limits>
 #include <oxenss/utils/string_utils.hpp>
@@ -14,7 +15,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
-#include <shared_mutex>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -33,202 +33,28 @@ static auto logcat = log::Cat("db");
 constexpr std::chrono::milliseconds SQLite_busy_timeout = 15s;
 
 namespace {
-    template <typename T>
-    constexpr bool is_cstr = false;
-    template <size_t N>
-    constexpr bool is_cstr<char[N]> = true;
-    template <size_t N>
-    constexpr bool is_cstr<const char[N]> = true;
-    template <>
-    [[maybe_unused]] inline constexpr bool is_cstr<char*> = true;
-    template <>
-    [[maybe_unused]] inline constexpr bool is_cstr<const char*> = true;
+    using namespace session::sqlite;
+    using util::to_span;
 
-    // Simple wrapper class that can be used to bind a blob through the templated binding code
-    // below. E.g. `exec_query(st, 100, 42, blob_binder{data})` binds the third parameter using
-    // no-copy blob binding of the contained data.
-    struct blob_binder {
-        std::string_view data;
-        explicit blob_binder(std::string_view d) : data{d} {}
-        template <typename Char, typename = std::enable_if_t<sizeof(Char) == 1>>
-        explicit blob_binder(const std::basic_string_view<Char>& d) :
-                data{reinterpret_cast<const char*>(d.data()), d.size()} {}
-    };
-
-    // Binds a string_view as a no-copy blob at parameter index i.
-    void bind_blob_ref(SQLite::Statement& st, int i, std::string_view blob) {
-        st.bindNoCopy(i, static_cast<const void*>(blob.data()), blob.size());
-    }
-
-    // Called from exec_query and similar to bind statement parameters for immediate execution.
-    // strings (and c strings) use no-copy binding; user_pubkey values use *two* sequential
-    // binding slots for pubkey (first) and type (second); integer values are bound by value.
-    // You can bind a blob (by reference, like strings) by passing `blob_binder{data}`.
-    template <typename T>
-    void bind_oneshot(SQLite::Statement& st, int& i, const T& val) {
-        if constexpr (std::is_same_v<T, std::string> || is_cstr<T>)
-            st.bindNoCopy(i++, val);
-        else if constexpr (std::is_same_v<T, blob_binder>)
-            bind_blob_ref(st, i++, val.data);
-        else if constexpr (std::is_same_v<T, user_pubkey>) {
-            bind_blob_ref(st, i++, val.raw());
-            st.bind(i++, val.type());
-        } else if constexpr (std::is_same_v<T, namespace_id>)
-            st.bind(i++, static_cast<std::underlying_type_t<namespace_id>>(val));
-        else
-            st.bind(i++, val);
-    }
-
-    // Binds pubkey in a query such as `... WHERE pubkey = ? AND type = ?` into positions i
-    // (pubkey) and j (type).  The user_pubkey reference must stay valid for the duration of
-    // the statement.
-    void bind_pubkey(SQLite::Statement& st, int i, int j, const user_pubkey& pk) {
-        bind_blob_ref(st, i, pk.raw());
-        st.bind(j, pk.type());
-    }
-
-    // Executes a query that does not expect results.  Optionally binds parameters, if provided.
-    // Returns the number of affected rows; throws on error or if results are returned.
-    template <typename... T>
-    int exec_query(SQLite::Statement& st, const T&... bind) {
-        [[maybe_unused]] int i = 1;
-        (bind_oneshot(st, i, bind), ...);
-        return st.exec();
-    }
-
-    // Same as above, but prepares a literal query on the fly for use with queries that are only
-    // used once.
-    template <typename... T>
-    int exec_query(SQLite::Database& db, const char* query, const T&... bind) {
-        SQLite::Statement st{db, query};
-        return exec_query(st, bind...);
-    }
-
-    template <typename T, typename... More>
-    struct first_type {
-        using type = T;
-    };
-    template <typename... T>
-    using first_type_t = typename first_type<T...>::type;
-
-    template <typename... T>
-    struct tuple_or_pair_impl {
-        using type = std::tuple<T...>;
-    };
-    template <typename T1, typename T2>
-    struct tuple_or_pair_impl<T1, T2> {
-        using type = std::pair<T1, T2>;
-    };
-
-    // Converts a parameter pack T... into either a plain T (if singleton), a pair (if exactly 2),
-    // or a tuple<T...>:
-    template <typename... T>
-    using type_or_tuple = std::conditional_t<
-            sizeof...(T) == 1,
-            first_type_t<T...>,
-            typename tuple_or_pair_impl<T...>::type>;
-
-    // We want to keep namespace_id as a type-safe integer, which requires some working around here
-    // to get an int64_t out of the database and stuff it into a namespace_id; everything else we
-    // pass through untouched.
-    template <typename... T>
-    constexpr bool contains_namespace_id = (... || std::is_same_v<T, namespace_id>);
-
-    template <typename T>
-    using db_source_type = std::conditional_t<std::is_same_v<T, namespace_id>, int64_t, T>;
-
-    template <typename T>
-    std::conditional_t<std::is_same_v<T, namespace_id>, namespace_id, T&> transform_db_source_impl(
-            db_source_type<T>& source_val) {
-        if constexpr (std::is_same_v<T, namespace_id>)
-            return static_cast<namespace_id>(source_val);
-        else
-            return source_val;
-    }
-
-    template <typename... T, size_t... I>
-    type_or_tuple<T...> transform_db_source(
-            std::tuple<db_source_type<T>...>&& source, std::index_sequence<I...>) {
-        return {std::move(transform_db_source_impl<T>(std::get<I>(source)))...};
-    }
-
-    // Retrieves a single row of values from the current state of a statement (i.e. after a
-    // executeStep() call that is expecting a return value).  If `T...` is a single type then this
-    // returns the single T value; if T... is two values you get back a pair, otherwise you get back
-    // a tuple of values.
-    template <typename... T>
-    type_or_tuple<T...> get(SQLite::Statement& st) {
-        if constexpr (contains_namespace_id<T...>) {
-            return transform_db_source<T...>(
-                    get<std::conditional_t<std::is_same_v<T, namespace_id>, int64_t, T>...>(st),
-                    std::make_index_sequence<sizeof...(T)>{});
-        } else {
-            using TT = type_or_tuple<T...>;
-            if constexpr (sizeof...(T) == 1)
-                return static_cast<TT>(st.getColumn(0));
-            else
-                return st.getColumns<TT, sizeof...(T)>();
-        }
-    }
-
-    // Steps a statement to completion that is expected to return at most one row, optionally
-    // binding values into it (if provided).  Returns a filled out optional<T> (or
-    // optional<std::tuple<T...>>) if a row was retrieved, otherwise a nullopt.  Throws if more
-    // than one row is retrieved.
-    template <typename... T, typename... Args>
-    std::optional<type_or_tuple<T...>> exec_and_maybe_get(
-            SQLite::Statement& st, const Args&... bind) {
-        [[maybe_unused]] int i = 1;
-        (bind_oneshot(st, i, bind), ...);
-        std::optional<type_or_tuple<T...>> result;
-        while (st.executeStep()) {
-            if (result) {
-                log::error(
-                        logcat,
-                        "Expected single-row result, got multiple rows from {}",
-                        st.getQuery());
-                throw std::runtime_error{"DB error: expected single-row result, got multiple rows"};
-            }
-            result = get<T...>(st);
-        }
-        return result;
-    }
-
-    // Executes a statement to completion that is expected to return exactly one row, optionally
-    // binding values into it (if provided).  Returns a T or std::tuple<T...> (depending on
-    // whether or not more than one T is provided) for the row.  Throws an exception if no rows
-    // or more than one row are returned.
-    template <typename... T, typename... Args>
-    type_or_tuple<T...> exec_and_get(SQLite::Statement& st, const Args&... bind) {
-        auto maybe_result = exec_and_maybe_get<T...>(st, bind...);
-        if (!maybe_result) {
-            log::error(logcat, "Expected single-row result, got no rows from {}", st.getQuery());
-            throw std::runtime_error{"DB error: expected single-row result, got not rows"};
-        }
-        return *std::move(maybe_result);
-    }
-
-    // Executes a query to completion, collecting each row into a vector<T>, vector<pair<T1,T2>, or
-    // vector<tuple<T...>>, depending on whether 1, 2, or more Ts are given.  Can optionally bind
-    // before executing.
-    template <typename... T, typename... Bind>
-    std::vector<type_or_tuple<T...>> get_all(SQLite::Statement& st, const Bind&... bind) {
-        [[maybe_unused]] int i = 1;
-        (bind_oneshot(st, i, bind), ...);
-        std::vector<type_or_tuple<T...>> results;
-        while (st.executeStep())
-            results.push_back(get<T...>(st));
+    // session-sqlite's get_all yields tuples for multi-column results; several of our signatures
+    // predate that and use pairs.
+    template <typename A, typename B, typename... Bind>
+    std::vector<std::pair<A, B>> get_all_pairs(SQLite::Statement& st, const Bind&... bind) {
+        std::vector<std::pair<A, B>> results;
+        for (auto& [a, b] : get_all<A, B>(st, bind...))
+            results.emplace_back(std::move(a), std::move(b));
         return results;
     }
 
-    // Similar to get_all<K, V>, but returns a std::map<K, V> rather than a std::vector<pair<K, V>>.
+    // session-sqlite has no map-producing counterpart to get_all.
     template <typename K, typename V, typename... Bind>
     std::map<K, V> get_map(SQLite::Statement& st, const Bind&... bind) {
-        [[maybe_unused]] int i = 1;
-        (bind_oneshot(st, i, bind), ...);
+        bind_oneshot(st, bind...);
         std::map<K, V> results;
-        while (st.executeStep())
-            results[static_cast<K>(st.getColumn(0))] = static_cast<V>(st.getColumn(1));
+        while (st.executeStep()) {
+            auto [k, v] = get<K, V>(st);
+            results.emplace(std::move(k), std::move(v));
+        }
         return results;
     }
 
@@ -262,62 +88,14 @@ void sqlite_swarm_space_lo(sqlite3_context* sqlite_context, int argc, sqlite3_va
     sqlite_swarm_space(sqlite_context, argc, argv, false);
 }
 
+/// Schema creation and migration.  This runs once, against the first connection the pool opens;
+/// everything else goes through session::sqlite::Connection directly.
 class DatabaseImpl {
   public:
     oxenss::Database& parent;
-    SQLite::Database db;
+    SQLite::Database& db;
 
-    std::unordered_map<std::string, SQLite::Statement> prepared_sts;
-
-    int page_size;
-
-    DatabaseImpl(Database& parent, const std::filesystem::path& db_path, bool initialize) :
-            parent{parent},
-            db{db_path / u8"storage.db",
-               SQLite::OPEN_READWRITE | (initialize ? SQLite::OPEN_CREATE : 0) |
-                       SQLite::OPEN_NOMUTEX,
-               SQLite_busy_timeout.count()} {
-
-        // intialize sqlite application-defined functions (must be set up per-connection).
-        db.createFunction("func_swarm_space_hi", 1, true, nullptr, &sqlite_swarm_space_hi);
-        db.createFunction("func_swarm_space_lo", 1, true, nullptr, &sqlite_swarm_space_lo);
-
-        // Don't fail on these because we can still work even if they fail
-        if (int rc = db.tryExec("PRAGMA journal_mode = WAL"); rc != SQLITE_OK)
-            log::error(logcat, "Failed to set journal mode to WAL: {}", sqlite3_errstr(rc));
-
-        if (int rc = db.tryExec("PRAGMA synchronous = NORMAL"); rc != SQLITE_OK)
-            log::error(logcat, "Failed to set synchronous mode to NORMAL: {}", sqlite3_errstr(rc));
-
-        if (int rc = db.tryExec("PRAGMA foreign_keys = ON"); rc != SQLITE_OK) {
-            auto m = fmt::format(
-                    "Failed to enable foreign keys constraints: {}", sqlite3_errstr(rc));
-            log::critical(logcat, "{}", m);
-            throw std::runtime_error{m};
-        }
-        int fk_enabled = db.execAndGet("PRAGMA foreign_keys").getInt();
-        if (fk_enabled != 1) {
-            log::critical(
-                    logcat,
-                    "Failed to enable foreign key constraints; perhaps this sqlite3 is "
-                    "compiled without it?");
-            throw std::runtime_error{"Foreign key support is required"};
-        }
-
-        page_size = db.execAndGet("PRAGMA page_size").getInt();
-        // Would use a placeholder here, but sqlite3 apparently doesn't support them for
-        // PRAGMAs.
-        if (int rc = db.tryExec(
-                    "PRAGMA max_page_count = {}"_format(Database::SIZE_LIMIT / page_size));
-            rc != SQLITE_OK) {
-            auto m = fmt::format("Failed to set max page count: {}", sqlite3_errstr(rc));
-            log::critical(logcat, "{}", m);
-            throw std::runtime_error{m};
-        }
-
-        if (initialize)
-            initialize_database();
-    }
+    DatabaseImpl(Database& parent, SQLite::Database& db) : parent{parent}, db{db} {}
 
     void initialize_database() {
         parent._had_swarm_state_on_open = db.tableExists("state_kv");
@@ -493,7 +271,7 @@ WHERE namespace < 0 AND namespace % 20 = -1;
     }
 
     void create_schema() {
-        SQLite::Transaction transaction{db};
+        SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
 
         db.exec(R"(
 CREATE TABLE owners (
@@ -604,7 +382,7 @@ CREATE TABLE messages (
         // We create these separate from the table because it makes upgrading easier (we can just
         // drop the indices/views that we want to recreate).
 
-        SQLite::Transaction transaction{db};
+        SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
 
         db.exec(R"(
 CREATE TRIGGER IF NOT EXISTS owner_autoclean
@@ -633,155 +411,124 @@ DROP TRIGGER IF EXISTS owned_messages_upsert;
 
     /** Wrapper around a SQLite::Statement that calls `tryReset()` on destruction of the
      * wrapper. */
-    class StatementWrapper {
-        SQLite::Statement& st;
-
-      public:
-        /// Whether we should reset on destruction; can be set to false if needed.
-        bool reset_on_destruction = true;
-
-        explicit StatementWrapper(SQLite::Statement& st) noexcept : st{st} {}
-        ~StatementWrapper() noexcept {
-            if (reset_on_destruction)
-                st.tryReset();
-        }
-        SQLite::Statement& operator*() noexcept { return st; }
-        SQLite::Statement* operator->() noexcept { return &st; }
-        operator SQLite::Statement&() noexcept { return st; }
-    };
-
-    StatementWrapper prepared_st(const std::string& query) {
-        if (auto qit = prepared_sts.find(query); qit != prepared_sts.end())
-            return StatementWrapper{qit->second};
-        return StatementWrapper{prepared_sts.try_emplace(query, db, query).first->second};
-    }
-
-    template <typename... T>
-    int prepared_exec(const std::string& query, const T&... bind) {
-        return exec_query(prepared_st(query), bind...);
-    }
-
-    template <typename... T, typename... Bind>
-    auto prepared_get(const std::string& query, const Bind&... bind) {
-        return exec_and_get<T...>(prepared_st(query), bind...);
-    }
 };
 
+// Applied to every connection the pool opens.  WAL mode, busy_timeout and foreign key enforcement
+// are handled by session::sqlite::Database itself, so only what it does not cover is here.
+void Database::setup_connection(session::sqlite::Connection& conn) {
+    auto& db = conn.sql;
+
+    // sqlite application-defined functions are per-connection.  Registered through the C API rather
+    // than SQLiteCpp's createFunction because that offers no way to pass SQLITE_INNOCUOUS: these
+    // are called from triggers, and under the PRAGMA trusted_schema = OFF that session-sqlite sets,
+    // sqlite rejects any function used in a trigger that is not marked innocuous ("unsafe use of
+    // func_swarm_space_hi()").
+    for (auto [name, fn] :
+         {std::pair{"func_swarm_space_hi", &sqlite_swarm_space_hi},
+          std::pair{"func_swarm_space_lo", &sqlite_swarm_space_lo}}) {
+        if (int rc = sqlite3_create_function_v2(
+                    db.getHandle(),
+                    name,
+                    1,
+                    SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+                    nullptr,
+                    fn,
+                    nullptr,
+                    nullptr,
+                    nullptr);
+            rc != SQLITE_OK) {
+            auto m = fmt::format("Failed to register {}: {}", name, sqlite3_errstr(rc));
+            log::critical(logcat, "{}", m);
+            throw std::runtime_error{m};
+        }
+    }
+
+    // Not fatal: we can still work without it.
+    if (int rc = db.tryExec("PRAGMA synchronous = NORMAL"); rc != SQLITE_OK)
+        log::error(logcat, "Failed to set synchronous mode to NORMAL: {}", sqlite3_errstr(rc));
+
+    // The same for every connection, but only obtainable from one.
+    int page_size = db.execAndGet("PRAGMA page_size").getInt();
+    page_size_.store(page_size, std::memory_order_relaxed);
+
+    // Would use a placeholder here, but sqlite3 apparently doesn't support them for PRAGMAs.
+    if (int rc = db.tryExec("PRAGMA max_page_count = {}"_format(SIZE_LIMIT / page_size));
+        rc != SQLITE_OK) {
+        auto m = fmt::format("Failed to set max page count: {}", sqlite3_errstr(rc));
+        log::critical(logcat, "{}", m);
+        throw std::runtime_error{m};
+    }
+}
+
 Database::Database(std::filesystem::path db_path) : db_path_{std::move(db_path)} {
-    impl_pool_.push(std::make_unique<DatabaseImpl>(*this, db_path_, /*initialize=*/true));
+    namespace ss = session::sqlite;
+    db_ = std::make_unique<ss::Database>(
+            db_path_ / u8"storage.db",
+            ss::Encryption::None,
+            ss::busy_timeout{SQLite_busy_timeout},
+            ss::post_open{[this](ss::Connection& conn) { setup_connection(conn); }});
+
+    {
+        auto conn = db_->conn();
+        DatabaseImpl{*this, conn.sql}.initialize_database();
+    }
 
     clean_expired();
 }
 
 Database::~Database() = default;
 
-/// RAII class that holds a single database instance exclusively for the owner, returning it to the
-/// database connection pool on destruction.  The general idea is that all database-interacting
-/// implementation methods shall do:
+/// Database methods obtain a connection from the pool for the duration of their work:
 ///
 ///     {
-///       auto impl = get_impl(/*write=*/ true);
-///       impl->whatever();
-///       // ...
+///       auto conn = db_->conn();
+///       conn.prepared_exec(...);
 ///     }
 ///
-/// if it needs to write to the database (INSERT/UPDATE/DELETE/etc.), and passing `false` as the
-/// get_impl argument if it only needs to read.  Internally a shared_mutex is used to ensure that a
-/// writer is exclusive; readers may run queries parallel.  (Not using such a mutex invokes sqlite's
-/// painful limitations around being busy/locked when reads and writes happen on different
-/// connections at the same time).
-///
-/// The "..." code must be as minimal as possible (any sort of recursion will very likely deadlock).
-class LockedDBImpl {
-  private:
-    std::unique_ptr<DatabaseImpl> impl_;
-    Database& parent_;
-    bool write_;
-
-    friend LockedDBImpl Database::get_impl(bool);
-    LockedDBImpl(std::unique_ptr<DatabaseImpl> impl, Database& parent, bool write) :
-            impl_{std::move(impl)}, parent_{parent}, write_{write} {
-        if (write_)
-            parent_.access_lock_.lock();
-        else
-            parent_.access_lock_.lock_shared();
-    }
-
-  public:
-    DatabaseImpl& operator*() noexcept { return *impl_; }
-    DatabaseImpl* operator->() noexcept { return impl_.get(); }
-
-    ~LockedDBImpl() {
-        {
-            std::lock_guard lock{parent_.impl_lock_};
-            parent_.impl_pool_.push(std::move(impl_));
-        }
-        if (write_)
-            parent_.access_lock_.unlock();
-        else
-            parent_.access_lock_.unlock_shared();
-    }
-};
-
-LockedDBImpl Database::get_impl(bool write) {
-    // First see if we can find an idle impl connection in the pool, and if so remove it from the
-    // pool and return it.
-    std::unique_ptr<DatabaseImpl> impl;
-    {
-        std::lock_guard lock{impl_lock_};
-        // We found one in the pool, so extract and use it
-        if (!impl_pool_.empty()) {
-            impl = std::move(impl_pool_.top());
-            impl_pool_.pop();
-        }
-    }
-    if (!impl)
-        // Otherwise construct a new one
-        impl = std::make_unique<DatabaseImpl>(*this, db_path_, /*initialize=*/false);
-
-    return LockedDBImpl{std::move(impl), *this, write};
-}
+/// Connections are independent: WAL mode lets one writer run concurrently with any number of
+/// readers, each reader seeing a consistent snapshot, and busy_timeout covers writer contention.
+/// Multi-statement sequences that must be atomic use an explicit IMMEDIATE transaction rather than
+/// relying on holding a connection; see store() for why DEFERRED is not good enough.
 
 void Database::clean_expired() {
-    get_impl(true)->prepared_exec(
+    db_->conn().prepared_exec(
             "DELETE FROM messages WHERE expiry <= ?",
             to_epoch_ms(std::chrono::system_clock::now()));
 }
 
 int64_t Database::get_message_count() {
-    return get_impl(false)->prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
+    return db_->conn().prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
 }
 
 int64_t Database::get_owner_count() {
-    return get_impl(false)->prepared_get<int64_t>("SELECT COUNT(*) FROM owners");
+    return db_->conn().prepared_get<int64_t>("SELECT COUNT(*) FROM owners");
 }
 
 std::vector<int> Database::get_message_counts() {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st("SELECT COUNT(*) FROM messages GROUP BY owner");
+    auto conn = db_->conn();
+    auto st = conn.prepared_st("SELECT COUNT(*) FROM messages GROUP BY owner");
     return get_all<int>(st);
 }
 
 std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts() {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st("SELECT namespace, COUNT(*) FROM messages GROUP BY namespace");
-    return get_all<namespace_id, int64_t>(st);
+    auto conn = db_->conn();
+    auto st = conn.prepared_st("SELECT namespace, COUNT(*) FROM messages GROUP BY namespace");
+    return get_all_pairs<namespace_id, int64_t>(st);
 }
 
 int64_t Database::get_total_bytes() {
-    auto impl = get_impl(false);
-    return impl->prepared_get<int64_t>("PRAGMA page_count") * impl->page_size;
+    auto conn = db_->conn();
+    return conn.prepared_get<int64_t>("PRAGMA page_count") * page_size_;
 }
 
 int64_t Database::get_used_bytes() {
-    auto impl = get_impl(false);
-    return get_total_bytes() -
-           impl->prepared_get<int64_t>("PRAGMA freelist_count") * impl->page_size;
+    auto conn = db_->conn();
+    return get_total_bytes() - conn.prepared_get<int64_t>("PRAGMA freelist_count") * page_size_;
 }
 
 std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(
             "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
             " FROM owned_messages WHERE hash = ?");
     st->bindNoCopy(1, msg_hash);
@@ -804,30 +551,36 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
 
 StoreResult Database::store(const message& msg, std::chrono::system_clock::time_point* expiry) {
 
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     StoreResult ret;
     try {
 
-        SQLite::Transaction transaction{impl->db};
+        // IMMEDIATE, not the default DEFERRED: this transaction reads (the owner/message lookups
+        // below) before it writes, and a deferred transaction that upgrades to a write lock fails
+        // with SQLITE_BUSY_SNAPSHOT if anything else committed since the read snapshot was taken.
+        // That error does not invoke the busy handler, so busy_timeout cannot retry it.
+        SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
 
         int64_t owner_id;
         if (auto maybe = exec_and_maybe_get<int64_t>(
-                    impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
-                    msg.pubkey))
+                    conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+                    msg.pubkey.raw_bytes(),
+                    msg.pubkey.type()))
             owner_id = *maybe;
         else
-            owner_id = impl->prepared_get<int64_t>(
-                    "INSERT INTO owners (pubkey, type) VALUES (?, ?) RETURNING id", msg.pubkey);
+            owner_id = conn.prepared_get<int64_t>(
+                    "INSERT INTO owners (pubkey, type) VALUES (?, ?) RETURNING id",
+                    msg.pubkey.raw_bytes(),
+                    msg.pubkey.type());
 
         auto new_exp = to_epoch_ms(msg.expiry);
 
         if (auto existing = exec_and_maybe_get<int64_t, int64_t>(
-                    impl->prepared_st("SELECT id, expiry FROM messages WHERE hash = ?"),
-                    msg.hash)) {
+                    conn.prepared_st("SELECT id, expiry FROM messages WHERE hash = ?"), msg.hash)) {
             auto& [id, exp] = *existing;
             if (exp < new_exp) {
-                impl->prepared_exec("UPDATE messages SET expiry = ? WHERE id = ?", new_exp, id);
+                conn.prepared_exec("UPDATE messages SET expiry = ? WHERE id = ?", new_exp, id);
                 ret = StoreResult::Extended;
                 exp = new_exp;
             } else {
@@ -836,7 +589,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             if (expiry)
                 *expiry = from_epoch_ms(exp);
         } else {
-            auto rows = impl->prepared_exec(
+            auto rows = conn.prepared_exec(
                     "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
                     " VALUES (?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
@@ -849,7 +602,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                     msg.msg_namespace,
                     to_epoch_ms(msg.timestamp),
                     to_epoch_ms(msg.expiry),
-                    blob_binder{msg.data});
+                    to_span(msg.data));
 
             // did not insert, which means public namespace and not newer
             if (rows == 0)
@@ -877,20 +630,22 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
 }
 
 void Database::bulk_store(const std::vector<message>& items) {
-    auto impl = get_impl(true);
-    SQLite::Transaction t{impl->db};
-    auto get_owner = impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
-    auto insert_owner = impl->prepared_st(
+    auto conn = db_->conn();
+    SQLite::Transaction t{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
+    auto insert_owner = conn.prepared_st(
             "INSERT INTO owners (pubkey, type) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING id");
     std::unordered_map<user_pubkey, int64_t> seen;
     for (auto& m : items) {
         if (!m.pubkey)
             continue;
         if (auto [it, ins] = seen.emplace(m.pubkey, 0); ins) {
-            auto ownerid = exec_and_maybe_get<int64_t>(get_owner, m.pubkey);
+            auto ownerid =
+                    exec_and_maybe_get<int64_t>(get_owner, m.pubkey.raw_bytes(), m.pubkey.type());
             get_owner->reset();
             if (!ownerid) {
-                ownerid = exec_and_maybe_get<int64_t>(insert_owner, m.pubkey);
+                ownerid = exec_and_maybe_get<int64_t>(
+                        insert_owner, m.pubkey.raw_bytes(), m.pubkey.type());
                 insert_owner->reset();
             }
             if (ownerid)
@@ -905,7 +660,7 @@ void Database::bulk_store(const std::vector<message>& items) {
         }
     }
 
-    auto insert_message = impl->prepared_st(
+    auto insert_message = conn.prepared_st(
             "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
             " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (hash)"
@@ -931,7 +686,7 @@ void Database::bulk_store(const std::vector<message>& items) {
                 m.msg_namespace,
                 to_epoch_ms(m.timestamp),
                 to_epoch_ms(m.expiry),
-                blob_binder{m.data});
+                to_span(m.data));
         insert_message->reset();
     }
 
@@ -947,9 +702,9 @@ std::pair<std::vector<message>, bool> Database::retrieve(
         const bool size_b64,
         const size_t per_message_overhead) {
 
-    auto impl = get_impl(false);
-    auto owner_st = impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
-    auto ownerid = exec_and_maybe_get<int64_t>(owner_st, pubkey);
+    auto conn = db_->conn();
+    auto owner_st = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
+    auto ownerid = exec_and_maybe_get<int64_t>(owner_st, pubkey.raw_bytes(), pubkey.type());
     if (!ownerid)
         return {};
 
@@ -958,12 +713,12 @@ std::pair<std::vector<message>, bool> Database::retrieve(
 
     std::optional<int64_t> last_id;
     if (!last_hash.empty()) {
-        auto st = impl->prepared_st(
+        auto st = conn.prepared_st(
                 "SELECT id FROM messages WHERE owner = ? AND namespace = ? AND hash = ?");
         last_id = exec_and_maybe_get<int64_t>(st, *ownerid, to_int(ns), last_hash);
     }
 
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             last_id ? "SELECT hash, namespace, timestamp, expiry, data FROM messages "
                       "WHERE owner = ? AND namespace = ? AND id > ? ORDER BY id LIMIT ?"
                     : "SELECT hash, namespace, timestamp, expiry, data FROM messages "
@@ -1004,10 +759,10 @@ std::pair<std::vector<message>, bool> Database::retrieve(
 }
 
 std::vector<message> Database::retrieve_all() {
-    auto impl = get_impl(false);
+    auto conn = db_->conn();
 
     std::vector<message> results;
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
             " FROM owned_messages ORDER BY mid");
 
@@ -1028,24 +783,24 @@ std::vector<message> Database::retrieve_all() {
 }
 
 std::vector<std::pair<namespace_id, std::string>> Database::delete_all(const user_pubkey& pubkey) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " RETURNING namespace, hash");
-    return get_all<namespace_id, std::string>(st, pubkey);
+    return get_all_pairs<namespace_id, std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
 std::vector<std::string> Database::delete_all(const user_pubkey& pubkey, namespace_id ns) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, pubkey, ns);
+    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), ns);
 }
 
 namespace {
@@ -1066,20 +821,20 @@ namespace {
 std::vector<std::string> Database::delete_by_hash(
         const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes) {
 
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     if (msg_hashes.size() == 1) {
         // Use an optimized prepared statement for very common single-hash deletions
-        auto st = impl->prepared_st(
+        auto st = conn.prepared_st(
                 "DELETE FROM messages"
                 " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
                 " AND hash = ?"
                 " RETURNING hash");
-        return get_all<std::string>(st, pubkey, msg_hashes[0]);
+        return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), msg_hashes[0]);
     }
 
     SQLite::Statement st{
-            impl->db,
+            conn.sql,
             multi_in_query(
                     "DELETE FROM messages"
                     " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
@@ -1087,36 +842,34 @@ std::vector<std::string> Database::delete_by_hash(
                     msg_hashes.size(),
                     ") RETURNING hash"sv)};
 
-    bind_pubkey(st, 1, 2, pubkey);
-    for (size_t i = 0; i < msg_hashes.size(); i++)
-        st.bindNoCopy(3 + i, msg_hashes[i]);
-    return get_all<std::string>(st);
+    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), bind_each{msg_hashes});
 }
 
 std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
         const user_pubkey& pubkey, std::chrono::system_clock::time_point timestamp) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ?"
             " RETURNING hash");
-    return get_all<namespace_id, std::string>(st, pubkey, to_epoch_ms(timestamp));
+    return get_all_pairs<namespace_id, std::string>(
+            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp));
 }
 
 std::vector<std::string> Database::delete_by_timestamp(
         const user_pubkey& pubkey,
         namespace_id ns,
         std::chrono::system_clock::time_point timestamp) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ? AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, pubkey, to_epoch_ms(timestamp), ns);
+    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
 }
 
 static constexpr auto ins_revoke_prefix = "INSERT INTO revoked_subaccounts (owner, token) "sv;
@@ -1129,29 +882,29 @@ void Database::revoke_subaccounts(
     if (subaccounts.empty())
         return;
 
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     if (subaccounts.size() == 1) {
-        auto insert_token = impl->prepared_st(fmt::format(
+        auto insert_token = conn.prepared_st(fmt::format(
                 "{} VALUES ((SELECT id FROM owners WHERE pubkey = ? AND type = ?), ?) {}",
                 ins_revoke_prefix,
                 ins_revoke_suffix));
-        exec_query(insert_token, pubkey, blob_binder{subaccounts[0].view()});
+        exec_query(insert_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
         return;
     }
 
-    SQLite::Transaction transaction{impl->db};
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
 
-    auto get_owner = impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
-    auto ownerid = exec_and_maybe_get<int64_t>(get_owner, pubkey);
+    auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
+    auto ownerid = exec_and_maybe_get<int64_t>(get_owner, pubkey.raw_bytes(), pubkey.type());
     if (!ownerid)
         return;
 
-    auto insert_token = impl->prepared_st(
+    auto insert_token = conn.prepared_st(
             fmt::format("{} VALUES (?, ?) {}", ins_revoke_prefix, ins_revoke_suffix));
 
     for (const auto& sa : subaccounts) {
-        exec_query(insert_token, *ownerid, blob_binder{sa.view()});
+        exec_query(insert_token, *ownerid, sa.view());
         insert_token->reset();
     }
 
@@ -1163,18 +916,18 @@ int Database::unrevoke_subaccounts(
     if (subaccounts.empty())
         return 0;
 
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     if (subaccounts.size() == 1) {
-        auto remove_token = impl->prepared_st(
+        auto remove_token = conn.prepared_st(
                 "DELETE FROM revoked_subaccounts"
                 " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
                 " AND token = ?");
-        return exec_query(remove_token, pubkey, blob_binder{subaccounts[0].view()});
+        return exec_query(remove_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
     }
 
     SQLite::Statement st{
-            impl->db,
+            conn.sql,
             multi_in_query(
                     "DELETE FROM revoked_subaccounts"
                     " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
@@ -1182,33 +935,32 @@ int Database::unrevoke_subaccounts(
                     subaccounts.size(),
                     ")"sv)};
 
-    bind_pubkey(st, 1, 2, pubkey);
-    for (size_t i = 0; i < subaccounts.size(); i++) {
-        auto sa = subaccounts[i].sview();
-        st.bindNoCopy(3 + i, static_cast<const void*>(sa.data()), sa.size());
-    }
+    std::vector<std::span<const std::byte>> tokens;
+    tokens.reserve(subaccounts.size());
+    for (const auto& sa : subaccounts)
+        tokens.push_back(sa.view());
 
-    return exec_query(st);
+    return exec_query(st, pubkey.raw_bytes(), pubkey.type(), bind_each{tokens});
 }
 
 bool Database::subaccount_revoked(const user_pubkey& pubkey, const subaccount_token& subaccount) {
-    auto impl = get_impl(false);
+    auto conn = db_->conn();
 
     auto count = exec_and_get<int64_t>(
-            impl->prepared_st("SELECT COUNT(*) FROM revoked_subaccounts WHERE token = ? AND "
-                              "owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"),
-            blob_binder{subaccount.view()},
-            pubkey);
+            conn.prepared_st("SELECT COUNT(*) FROM revoked_subaccounts WHERE token = ? AND "
+                             "owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"),
+            subaccount.view(),
+            pubkey.raw_bytes(),
+            pubkey.type());
     return count > 0;
 }
 
 std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey) {
-    auto impl = get_impl(false);
-    auto st = impl->prepared_st(
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(
             "SELECT token FROM revoked_subaccounts WHERE"
             " owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)");
-    return get_all<std::string>(st, pubkey);
-    ;
+    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
 std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Database::update_expiry(
@@ -1230,44 +982,48 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
                            : shorten_only ? " AND expiry > ?1"s
                                           : ""s;
 
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     if (msg_hashes.size() == 1) {
         // Pre-prepared version for the common single hash case
-        if (impl->prepared_exec(
+        if (conn.prepared_exec(
                     "UPDATE messages SET expiry = ? WHERE hash = ?"s + expiry_constraint +
                             " AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)",
                     to_epoch_ms(new_exp[0]),
                     msg_hashes[0],
-                    pubkey) > 0)
+                    pubkey.raw_bytes(),
+                    pubkey.type()) > 0)
             result.emplace_back(msg_hashes[0], new_exp[0]);
 
     } else if (new_exp.size() == 1) {
         SQLite::Statement st{
-                impl->db,
+                conn.sql,
                 multi_in_query(
                         "UPDATE messages SET expiry = ?"
                         " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"s +
                                 expiry_constraint + " AND hash IN (",  // ?,?,?,...,?
                         msg_hashes.size(),
                         ") RETURNING hash"sv)};
-        st.bind(1, to_epoch_ms(new_exp[0]));
-        bind_pubkey(st, 2, 3, pubkey);
-        for (size_t i = 0; i < msg_hashes.size(); i++)
-            st.bindNoCopy(4 + i, msg_hashes[i]);
-
-        for (auto& hash : get_all<std::string>(st))
+        for (auto& hash : get_all<std::string>(
+                     st,
+                     to_epoch_ms(new_exp[0]),
+                     pubkey.raw_bytes(),
+                     pubkey.type(),
+                     bind_each{msg_hashes}))
             result.emplace_back(hash, new_exp[0]);
     } else {
+        SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+
         int64_t owner;
         if (auto maybe = exec_and_maybe_get<int64_t>(
-                    impl->prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
-                    pubkey))
+                    conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+                    pubkey.raw_bytes(),
+                    pubkey.type()))
             owner = *maybe;
         else
             return result;
 
-        auto st = impl->prepared_st(
+        auto st = conn.prepared_st(
                 "UPDATE messages SET expiry = ? WHERE hash = ?"s + expiry_constraint +
                 " AND owner = ?");
         for (size_t i = 0; i < msg_hashes.size(); i++) {
@@ -1276,66 +1032,67 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
             if (exec_query(st, to_epoch_ms(new_exp[i]), msg_hashes[i], owner) > 0)
                 result.emplace_back(msg_hashes[i], new_exp[i]);
         }
+
+        transaction.commit();
     }
     return result;
 }
 
 std::map<std::string, int64_t> Database::get_expiries(
         const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes) {
-    auto impl = get_impl(false);
+    auto conn = db_->conn();
 
     if (msg_hashes.size() == 1) {
         // Pre-prepared version for the common single hash case
-        auto st = impl->prepared_st(
+        auto st = conn.prepared_st(
                 "SELECT hash, expiry FROM messages WHERE hash = ?"
                 " AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)");
-        return get_map<std::string, int64_t>(st, msg_hashes[0], pubkey);
+        return get_map<std::string, int64_t>(st, msg_hashes[0], pubkey.raw_bytes(), pubkey.type());
     }
 
     SQLite::Statement st{
-            impl->db,
+            conn.sql,
             multi_in_query(
                     "SELECT hash, expiry FROM messages"
                     " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
                     " AND hash IN ("sv,  // ?,?,?,...,?
                     msg_hashes.size(),
                     ")"sv)};
-    bind_pubkey(st, 1, 2, pubkey);
-    for (size_t i = 0; i < msg_hashes.size(); i++)
-        st.bindNoCopy(3 + i, msg_hashes[i]);
-
-    return get_map<std::string, int64_t>(st);
+    return get_map<std::string, int64_t>(
+            st, pubkey.raw_bytes(), pubkey.type(), bind_each{msg_hashes});
 }
 
 std::vector<std::pair<namespace_id, std::string>> Database::update_all_expiries(
         const user_pubkey& pubkey, std::chrono::system_clock::time_point new_exp) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     auto new_exp_ms = to_epoch_ms(new_exp);
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "UPDATE messages SET expiry = ?"
             " WHERE expiry > ? AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " RETURNING namespace, hash");
-    return get_all<namespace_id, std::string>(st, new_exp_ms, new_exp_ms, pubkey);
+    return get_all_pairs<namespace_id, std::string>(
+            st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type());
 }
 
 std::vector<std::string> Database::update_all_expiries(
         const user_pubkey& pubkey, namespace_id ns, std::chrono::system_clock::time_point new_exp) {
-    auto impl = get_impl(true);
+    auto conn = db_->conn();
 
     auto new_exp_ms = to_epoch_ms(new_exp);
-    auto st = impl->prepared_st(
+    auto st = conn.prepared_st(
             "UPDATE messages SET expiry = ?"
             " WHERE expiry > ? AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, new_exp_ms, new_exp_ms, pubkey, ns);
+    return get_all<std::string>(st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type(), ns);
 }
 
-// Hack used by the test suite to simulate a blocking/busy thread:
-void oxenss::Database::test_suite_block_for(std::chrono::milliseconds duration) {
-    auto impl = get_impl(false);
-    std::this_thread::sleep_for(duration);
+void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
+    auto conn = db_->conn();
+    conn.prepared_exec(
+            "UPDATE retry_node_requests SET next_retry = next_retry - ?",
+            std::chrono::duration<double>{age}.count());
 }
 
 int64_t Database::add_retry_request(
@@ -1343,21 +1100,27 @@ int64_t Database::add_retry_request(
         const std::string& cmd,
         const std::string& payload,
         int64_t req_id) {
-    auto impl = get_impl(/*write =*/true);
+    auto conn = db_->conn();
+
+    // The two inserts have to land together: the second one is what makes the first one reachable,
+    // so a failure between them would leave an orphaned retry_requests row that nothing retries.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
 
     // insert into request table if not present
     if (req_id == 0) {
-        req_id = impl->prepared_get<int64_t>(
+        req_id = conn.prepared_get<int64_t>(
                 "INSERT INTO retry_requests (command, payload) values (?,?) RETURNING id",
                 cmd,
                 payload);
     }
 
-    impl->prepared_exec(
+    conn.prepared_exec(
             "INSERT INTO retry_node_reqs (rr_id, pubkey, next_retry) VALUES(?, ?, ?)",
             req_id,
             key.str(),
             to_epoch_double(std::chrono::system_clock::now() + RETRY_INITIAL_DELAY));
+
+    transaction.commit();
 
     return req_id;
 }
@@ -1367,15 +1130,15 @@ void Database::foreach_ready_retry_request(std::function<
                                                 const std::string& cmd,
                                                 const std::string& payload,
                                                 int64_t req_id)> callback) {
-    auto impl = get_impl(/*write =*/true);
+    auto conn = db_->conn();
 
     // Collect everything first: SQLite does not guarantee a SELECT cursor sees consistent results
     // if the table it is reading is updated on the same connection mid-iteration.
     //
     // See the retry_requests.created default for why this isn't `unixepoch('now', 'subsec')`.
     auto ready = get_all<int64_t, std::string, std::string, std::string>(
-            impl->prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
-                              " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
+            conn.prepared_st("SELECT rr_id, pubkey, command, payload FROM retry_node_reqs"
+                             " WHERE next_retry < (julianday('now') - 2440587.5) * 86400.0"));
 
     // The next retry time is set here, before the outcome of the request is known, rather than
     // when the request times out: a successful or definitively failed request deletes the row
@@ -1384,18 +1147,28 @@ void Database::foreach_ready_retry_request(std::function<
     auto sent_retry = to_epoch_double(now + RETRY_INTERVAL);
     auto unsent_retry = to_epoch_double(now + RETRY_NO_CONTACT_INTERVAL);
 
+    // The callback dispatches network requests, so the updates are accumulated here and applied
+    // together afterwards rather than one per iteration: a transaction around this loop would hold
+    // the write lock open across every dispatch.  If we die partway through then the rows already
+    // dispatched keep their old next_retry and simply come up for retry again sooner, which is
+    // harmless.
+    std::vector<std::pair<int64_t, double>> updates;
+    updates.reserve(ready.size());
     for (auto& [req_id, key_str, cmd, payload] : ready) {
         bool sent = callback(crypto::legacy_pubkey::from_bytes(key_str), cmd, payload, req_id);
-        impl->prepared_exec(
-                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?",
-                sent ? sent_retry : unsent_retry,
-                req_id);
+        updates.emplace_back(req_id, sent ? sent_retry : unsent_retry);
     }
+
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    for (const auto& [req_id, next_retry] : updates)
+        conn.prepared_exec(
+                "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?", next_retry, req_id);
+    transaction.commit();
 }
 
 int64_t Database::retry_request_count() {
-    auto impl = get_impl(/*write =*/false);
-    return impl->prepared_get<int64_t>("SELECT COUNT(*) from retry_node_reqs");
+    auto conn = db_->conn();
+    return conn.prepared_get<int64_t>("SELECT COUNT(*) from retry_node_reqs");
 }
 
 void Database::foreach_swarm_message(
@@ -1410,7 +1183,7 @@ void Database::foreach_swarm_message(
         return;
     }
 
-    auto impl = get_impl(/*write =*/false);
+    auto conn = db_->conn();
 
     constexpr size_t batch_size = 100;
 
@@ -1419,7 +1192,7 @@ void Database::foreach_swarm_message(
     // weird case of their exists exactly one swarm, which should be impossible
     if (lower_bound == upper_bound) {
         statement = SQLite::Statement{
-                impl->db,
+                conn.sql,
                 "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
                 " FROM owned_messages ORDER BY mid"};
     } else {
@@ -1437,7 +1210,7 @@ WHERE
 ORDER BY mid;
         )"_format(zero_inclusive ? "=" : "");
 
-        statement = SQLite::Statement{impl->db, query};
+        statement = SQLite::Statement{conn.sql, query};
 
         int pos = 1;
         statement->bind(pos++, (int64_t)(lower_bound >> 32));
@@ -1469,31 +1242,31 @@ ORDER BY mid;
 }
 
 void Database::remove_node_retry_request(int64_t req_id) {
-    auto impl = get_impl(/*write =*/true);
-    impl->prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
+    auto conn = db_->conn();
+    conn.prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
 }
 
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
-    auto impl = get_impl(/*write =*/true);
+    auto conn = db_->conn();
 
     // FIXME: retry requests don't have an expiry, so we need to pick a good expiration time
     //        for these retries.  For now, using 4 hours ago.  Tests will pass 4 hours from
     //        now.
-    impl->prepared_exec("DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - 4h));
+    conn.prepared_exec("DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - 4h));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {
     auto as_hex = oxenc::bt_serialize<uint64_t>(swarm_id);
-    auto impl = get_impl(/*write =*/true);
-    impl->prepared_exec(
+    auto conn = db_->conn();
+    conn.prepared_exec(
             "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)", as_hex);
 }
 
 std::optional<uint64_t> Database::get_current_swarm() {
-    auto impl = get_impl(/*write =*/false);
+    auto conn = db_->conn();
     try {
-        auto as_hex = impl->prepared_get<std::string>(
-                "SELECT value FROM state_kv WHERE key = 'swarm_id'");
+        auto as_hex =
+                conn.prepared_get<std::string>("SELECT value FROM state_kv WHERE key = 'swarm_id'");
         return oxenc::bt_deserialize<uint64_t>(as_hex);
     } catch (const std::exception& e) {
         return std::nullopt;

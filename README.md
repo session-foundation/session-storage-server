@@ -28,7 +28,7 @@ built statically as part of the build:
 * gnutls and ngtcp2 (required by oxen-libquic)
 
 These are used from the system if found, and otherwise built from the bundled submodules:
-* oxen-libquic >= 1.8
+* oxen-libquic >= 1.9
 * oxen-mq >= 1.3
 * oxen-encoding >= 1.5
 * nlohmann-json >= 3.11

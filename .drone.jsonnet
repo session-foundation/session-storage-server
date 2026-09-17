@@ -17,7 +17,6 @@ local default_deps_base = [
   // use the system library exercise that path.
   'libmicrohttpd-dev',
   'libsqlite3-dev',
-  'libssl-dev',
   'libsystemd-dev',
   'libngtcp2-dev',
   'libngtcp2-crypto-gnutls-dev',
@@ -27,6 +26,10 @@ local default_deps_base = [
 ];
 local default_deps_nocxx = ['libsodium-dev'] + default_deps_base;  // libsodium-dev needs to be >= 1.0.18
 local default_deps = ['g++'] + default_deps_nocxx;  // g++ sometimes needs replacement
+// Only the (off by default) uWebSockets HTTPS backend wants OpenSSL.
+local uws_deps = default_deps + ['libssl-dev'];
+// The default build must not link OpenSSL; this is run after it.
+local check_no_openssl = 'if objdump -p oxen-storage | grep -E "NEEDED.*lib(ssl|crypto)"; then echo "OpenSSL is linked"; exit 1; fi';
 local docker_base = 'registry.oxen.rocks/';
 
 local submodules_commands = [
@@ -164,7 +167,7 @@ local static_check_and_upload = [
   },
 
   // Various debian builds
-  debian_pipeline('Debian (amd64)', docker_base + 'debian-sid', lto=true),
+  debian_pipeline('Debian (amd64)', docker_base + 'debian-sid', lto=true, extra_cmds=[check_no_openssl]),
   debian_pipeline('Debian Debug (amd64)', docker_base + 'debian-sid', build_type='Debug'),
   clang(19, lto=true),
   debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386', werror=false),
@@ -172,17 +175,16 @@ local static_check_and_upload = [
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
   debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm', oxen_repo=true),
 
-  // Single-HTTPS-backend builds, so that neither backend can quietly stop compiling on its own.
-  // The libmicrohttpd-only build is also the one with no OpenSSL in it, which is checked.
+  // The default build is libmicrohttpd only.  These keep the uWebSockets backend compiling, alone
+  // and alongside libmicrohttpd, so that it stays usable for comparison.
   debian_pipeline('Debian sid, uWebSockets only (amd64)',
                   docker_base + 'debian-sid',
-                  cmake_extra='-DHTTPS_BACKEND_MICROHTTPD=OFF'),
-  debian_pipeline('Debian sid, libmicrohttpd only (amd64)',
+                  deps=uws_deps,
+                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON -DHTTPS_BACKEND_MICROHTTPD=OFF'),
+  debian_pipeline('Debian sid, both HTTPS backends (amd64)',
                   docker_base + 'debian-sid',
-                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=OFF',
-                  extra_cmds=[
-                    'if objdump -p oxen-storage | grep -E "NEEDED.*lib(ssl|crypto)"; then echo "OpenSSL is still linked"; exit 1; fi',
-                  ]),
+                  deps=uws_deps,
+                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON'),
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),

@@ -55,12 +55,12 @@ see supported run-time options.
 
 ## HTTPS backends
 
-The HTTPS listener has two interchangeable implementations: one on uWebSockets (which brings in
-OpenSSL) and one on libmicrohttpd (GnuTLS, which the rest of the program already uses).  Both are
-built by default and can be switched at startup with `--https-backend uwebsockets|microhttpd`; the
-default is `uwebsockets`.  Either can be left out of the build with `-D HTTPS_BACKEND_UWEBSOCKETS=OFF`
-or `-D HTTPS_BACKEND_MICROHTTPD=OFF` (at least one must remain), and a build without the uWebSockets
-backend has no OpenSSL dependency at all.
+The HTTPS listener has two interchangeable implementations: one on libmicrohttpd (GnuTLS, which the
+rest of the program already uses) and the previous one on uWebSockets (which brings in OpenSSL).
+By default only libmicrohttpd is built, and the resulting binary has no OpenSSL dependency.  The
+uWebSockets backend can be added with `-D HTTPS_BACKEND_UWEBSOCKETS=ON` (or built alone, with
+`-D HTTPS_BACKEND_MICROHTTPD=OFF` as well); when both are present, `--https-backend
+uwebsockets|microhttpd` selects one at startup, defaulting to `microhttpd`.
 
 # Running
 

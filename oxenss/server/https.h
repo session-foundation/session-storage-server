@@ -33,6 +33,7 @@ inline constexpr uint64_t MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024;
 // time (see the HTTPS_BACKEND_* cmake options); which one is used is decided at startup.
 enum class HttpsBackend {
     uwebsockets,
+    microhttpd,
 };
 
 std::string_view to_string(HttpsBackend b);

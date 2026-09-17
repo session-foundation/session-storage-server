@@ -206,7 +206,21 @@ void HTTPS_uWS::handle(HttpResponse* res, uWS::HttpRequest* req) {
     auto call = std::make_shared<uws_call>(*this, *res, std::move(request));
     res->onAborted([call] { call->aborted = true; });
     res->onData([call = std::move(call)](std::string_view d, bool done) mutable {
-        call->request.body += d;
+        if (call->replied)
+            return;
+        auto& body = call->request.body;
+        if (body.size() + d.size() > MAX_REQUEST_BODY_SIZE) {
+            // Only reachable without a (truthful) Content-Length, which on_headers() already
+            // checked; unlike libmicrohttpd, uWS lets us reply from here.
+            log::warning(
+                    logcat,
+                    "Received HTTPS request from {} with too-large body (> {}), dropping",
+                    call->request.remote_addr,
+                    MAX_REQUEST_BODY_SIZE);
+            call->reply(rpc::Response{http::PAYLOAD_TOO_LARGE, "Request body too large"sv}, true);
+            return;
+        }
+        body += d;
         if (done)
             call->https.dispatch(std::move(call));
     });

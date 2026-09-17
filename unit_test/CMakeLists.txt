@@ -22,9 +22,12 @@ target_link_libraries(Test
     common storage utils crypto snode rpc server
     Catch2::Catch2)
 
-# certificates.cpp drives the backend's TLS setup directly.
+# certificates.cpp drives each backend's TLS setup directly.
 if(HTTPS_BACKEND_UWEBSOCKETS)
     target_link_libraries(Test PRIVATE uWebSockets)
+endif()
+if(HTTPS_BACKEND_MICROHTTPD)
+    target_link_libraries(Test PRIVATE sessiondep::libmicrohttpd)
 endif()
 
 target_include_directories(Test PRIVATE ..)

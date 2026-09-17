@@ -28,7 +28,9 @@ session_dep(gnutls 3.6)
 # reach the HTTPS port can trigger.  No current Debian/Ubuntu stable ships that, so this is a
 # static build nearly everywhere for now; lower the floor for a distro only once its package has
 # those fixes backported.
-session_dep(libmicrohttpd 1.0.8)
+if(HTTPS_BACKEND_MICROHTTPD)
+    session_dep(libmicrohttpd 1.0.8)
+endif()
 
 # oxenss/http drives curl from libquic's event loop, so it needs libevent itself rather than just
 # inheriting it from libquic (which isn't built at all when a system liboxenquic is used).

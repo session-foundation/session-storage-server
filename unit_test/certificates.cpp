@@ -5,8 +5,12 @@
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
 #include <uWebSockets/App.h>
 #endif
+#ifdef OXENSS_HTTPS_MICROHTTPD
+#include <microhttpd.h>
+#endif
 
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 
@@ -25,6 +29,45 @@ struct temp_dir {
     }
     ~temp_dir() { std::filesystem::remove_all(path); }
 };
+
+#ifdef OXENSS_HTTPS_MICROHTTPD
+std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f{p, std::ios::binary};
+    return {std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+}
+
+// Starts (and immediately stops) a TLS daemon on an ephemeral port with the given PEMs, returning
+// whether libmicrohttpd accepted them.  This is the same call the https server makes.
+bool mhd_accepts(const std::string& key_pem, const std::string& cert_pem) {
+    auto handler = [](void*,
+                      MHD_Connection*,
+                      const char*,
+                      const char*,
+                      const char*,
+                      const char*,
+                      size_t*,
+                      void**) -> MHD_Result { return MHD_NO; };
+    MHD_OptionItem opts[] = {
+            {MHD_OPTION_HTTPS_MEM_KEY, 0, const_cast<char*>(key_pem.c_str())},
+            {MHD_OPTION_HTTPS_MEM_CERT, 0, const_cast<char*>(cert_pem.c_str())},
+            {MHD_OPTION_END, 0, nullptr},
+    };
+    auto* d = MHD_start_daemon(
+            MHD_USE_AUTO_INTERNAL_THREAD | MHD_USE_TLS,
+            0,
+            nullptr,
+            nullptr,
+            +handler,
+            nullptr,
+            MHD_OPTION_ARRAY,
+            opts,
+            MHD_OPTION_END);
+    if (!d)
+        return false;
+    MHD_stop_daemon(d);
+    return true;
+}
+#endif
 
 }  // namespace
 
@@ -62,6 +105,19 @@ TEST_CASE("certificate generation", "[certs]") {
         auto cert_s = cert.string(), key_s = other_key.string();
         uWS::SSLApp app{{.key_file_name = key_s.c_str(), .cert_file_name = cert_s.c_str()}};
         CHECK(app.constructorFailed());
+    }
+#endif
+
+#ifdef OXENSS_HTTPS_MICROHTTPD
+    SECTION("libmicrohttpd accepts what gnutls wrote") {
+        CHECK(mhd_accepts(slurp(key), slurp(cert)));
+    }
+
+    SECTION("libmicrohttpd rejects a mismatched key") {
+        auto other_cert = dir.path / "other-cert.pem";
+        auto other_key = dir.path / "other-key.pem";
+        generate_cert(other_cert, other_key);
+        CHECK_FALSE(mhd_accepts(slurp(other_key), slurp(cert)));
     }
 #endif
 }

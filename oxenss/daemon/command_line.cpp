@@ -9,6 +9,7 @@
 
 #include <CLI/CLI.hpp>
 #include <CLI/Error.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 
@@ -164,6 +165,11 @@ parse_result parse_cli_args(int argc, char* argv[]) {
     std::vector<std::string> https_backends;
     for (auto b : server::available_https_backends())
         https_backends.emplace_back(server::to_string(b));
+    // The compiled-in default is the preferred backend, but a build can leave it out; fall back to
+    // whatever is available rather than shipping a binary that refuses to start without a flag.
+    if (std::find(https_backends.begin(), https_backends.end(), options.https_backend) ==
+        https_backends.end())
+        options.https_backend = https_backends.front();
     cli.add_option(
                "--https-backend",
                options.https_backend,

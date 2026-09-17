@@ -20,6 +20,9 @@
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
 #include "https_uws.h"
 #endif
+#ifdef OXENSS_HTTPS_MICROHTTPD
+#include "https_mhd.h"
+#endif
 
 namespace oxenss::server {
 
@@ -32,12 +35,16 @@ namespace {
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
             HttpsBackend::uwebsockets,
 #endif
+#ifdef OXENSS_HTTPS_MICROHTTPD
+            HttpsBackend::microhttpd,
+#endif
     };
 }  // namespace
 
 std::string_view to_string(HttpsBackend b) {
     switch (b) {
         case HttpsBackend::uwebsockets: return "uwebsockets"sv;
+        case HttpsBackend::microhttpd: return "microhttpd"sv;
     }
     return "unknown"sv;
 }
@@ -45,6 +52,8 @@ std::string_view to_string(HttpsBackend b) {
 std::optional<HttpsBackend> parse_https_backend(std::string_view name) {
     if (name == "uwebsockets"sv || name == "uws"sv)
         return HttpsBackend::uwebsockets;
+    if (name == "microhttpd"sv || name == "mhd"sv)
+        return HttpsBackend::microhttpd;
     return std::nullopt;
 }
 
@@ -351,6 +360,13 @@ std::unique_ptr<HTTPS> make_https(
         case HttpsBackend::uwebsockets:
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
             return std::make_unique<HTTPS_uWS>(
+                    sn, rh, rl, std::move(bind), ssl_cert, ssl_key, std::move(legacy_keys));
+#else
+            break;
+#endif
+        case HttpsBackend::microhttpd:
+#ifdef OXENSS_HTTPS_MICROHTTPD
+            return std::make_unique<HTTPS_MHD>(
                     sn, rh, rl, std::move(bind), ssl_cert, ssl_key, std::move(legacy_keys));
 #else
             break;

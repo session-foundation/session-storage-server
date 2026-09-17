@@ -358,9 +358,10 @@ MHD_Daemon* HTTPS_MHD::start_daemon(const std::string& addr, uint16_t port, bool
     };
 
     MHD_OptionItem opts[] = {
+            // First, so that complaints about any of the options below reach our log too.
+            {MHD_OPTION_EXTERNAL_LOGGER, fn_ptr(+logger), this},
             {MHD_OPTION_SOCK_ADDR, 0, &ss},
             {MHD_OPTION_NOTIFY_COMPLETED, fn_ptr(+completed), this},
-            {MHD_OPTION_EXTERNAL_LOGGER, fn_ptr(+logger), this},
             {MHD_OPTION_CONNECTION_TIMEOUT, connection_timeout_s, nullptr},
             {MHD_OPTION_CONNECTION_MEMORY_LIMIT,
              static_cast<intptr_t>(connection_memory_limit),

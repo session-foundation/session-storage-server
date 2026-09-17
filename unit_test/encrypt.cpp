@@ -12,23 +12,6 @@ const auto alice_keys = x25519_keypair::from_secret_hex(
 const auto bob_keys = x25519_keypair::from_secret_hex(
         "f512f68e81a932aa2ff6d8723baa260a43a6f789d61c91b71f73e4f284e3600a");
 
-TEST_CASE("AES-CBC encryption", "[encrypt][cbc]") {
-    ChannelEncryption alice_box{alice_keys};
-    ChannelEncryption bob_box{bob_keys};
-
-    auto ctext_bob = alice_box.encrypt_cbc(plaintext_data, bob_keys.pub);
-    CHECK(ctext_bob.size() == plaintext_data.size() + 29);
-    auto ptext_bob = bob_box.decrypt_cbc(ctext_bob, alice_keys.pub);
-
-    CHECK(ptext_bob == plaintext_data);
-
-    auto ctext_alice = bob_box.encrypt_cbc(plaintext_data, alice_keys.pub);
-    CHECK(ctext_alice.size() == plaintext_data.size() + 29);
-    auto ptext_alice = alice_box.decrypt_cbc(ctext_alice, bob_keys.pub);
-
-    CHECK(ptext_alice == plaintext_data);
-}
-
 TEST_CASE("AES-GCM encryption", "[encrypt][gcm]") {
     ChannelEncryption alice_box{alice_keys};
     ChannelEncryption bob_box{bob_keys};

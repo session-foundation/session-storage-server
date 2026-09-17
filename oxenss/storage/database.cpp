@@ -1196,18 +1196,20 @@ void Database::foreach_swarm_message(
                 "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
                 " FROM owned_messages ORDER BY mid"};
     } else {
-        // there's probably a better way to do this, but it should be fine
+        // Not via the owned_messages view: the range filter needs owners.swarm_space_{hi,lo},
+        // which the view does not carry, and joining owners onto the view to get them makes
+        // `type` and `pubkey` ambiguous.
         std::string query = R"(
-SELECT type, pubkey, hash, namespace, timestamp, expiry, data
-FROM owned_messages
-JOIN owners ON oid = id
+SELECT owners.type, owners.pubkey, messages.hash, messages.namespace,
+       messages.timestamp, messages.expiry, messages.data
+FROM messages JOIN owners ON messages.owner = owners.id
 WHERE
         )";
         query += R"(
     (owners.swarm_space_hi >{0} ?1 OR (owners.swarm_space_hi == ?1 AND owners.swarm_space_lo >{0} ?2))
     AND
-    (owners.swarm_space_hi <= ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4))
-ORDER BY mid;
+    (owners.swarm_space_hi < ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4))
+ORDER BY messages.id;
         )"_format(zero_inclusive ? "=" : "");
 
         statement = SQLite::Statement{conn.sql, query};

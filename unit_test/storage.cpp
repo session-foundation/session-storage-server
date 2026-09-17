@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <future>
@@ -564,4 +565,53 @@ TEST_CASE("storage - ready retry requests", "[storage]") {
     CHECK_FALSE(saw("cmd1"));
     CHECK(saw("cmd2"));
     CHECK(saw("cmd3"));
+}
+
+TEST_CASE("storage - foreach_swarm_message", "[storage][swarm]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    // Two owners; the trigger on owners fills in their swarm space from the pubkey.  Swarm space
+    // is the XOR of the pubkey's four 8-byte words, so the keys must not be a repeated pattern
+    // (that XORs to 0).
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    REQUIRE(pk2.load("05a1b2c3d4e5f60718293a4b5c6d7e8f900f1e2d3c4b5a69781122334455667788"));
+    const auto s1 = pubkey_to_swarm_space(pk1), s2 = pubkey_to_swarm_space(pk2);
+    REQUIRE(s1 != 0);
+    REQUIRE(s2 != 0);
+    REQUIRE(s1 < s2);
+
+    const auto now = std::chrono::system_clock::now();
+    REQUIRE(storage.store({pk1, "hash1", namespace_id::Default, now, now + 1h, "one"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk2, "hash2", namespace_id::Default, now, now + 1h, "two"}) ==
+            StoreResult::New);
+
+    std::set<std::string> seen;
+    auto collect = [&seen](const std::vector<message>& msgs) {
+        for (const auto& m : msgs)
+            seen.insert(m.hash);
+    };
+    using set = std::set<std::string>;
+
+    // lower < upper: the single range query.  (0, max] covers everything but swarm space 0.
+    storage.foreach_swarm_message(collect, 0, std::numeric_limits<uint64_t>::max());
+    CHECK(seen == set{"hash1", "hash2"});
+
+    // The lower bound is exclusive and the upper inclusive.
+    seen.clear();
+    storage.foreach_swarm_message(collect, s1 - 1, s1);
+    CHECK(seen == set{"hash1"});
+    seen.clear();
+    storage.foreach_swarm_message(collect, s1, s2 - 1);
+    CHECK(seen.empty());
+    seen.clear();
+    storage.foreach_swarm_message(collect, s1, s2);
+    CHECK(seen == set{"hash2"});
+
+    // lower > upper wraps around: (s2, max] plus [0, s1], which takes in hash1 but not hash2.
+    seen.clear();
+    storage.foreach_swarm_message(collect, s2, s1);
+    CHECK(seen == set{"hash1"});
 }

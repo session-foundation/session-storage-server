@@ -217,6 +217,10 @@ void QUIC::on_conn_established(quic::Connection& c) {
         replaced->close_connection();
     for (auto& cb : waiting)
         cb(use);
+
+    // Anything queued for this node that was waiting for it to be reachable can go now.
+    service_node_->omq_server()->inject_task(
+            "quic", "quic:(sn_connected)", "", [this] { service_node_->resume_transfers(); });
 }
 
 void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
@@ -303,14 +307,79 @@ void QUIC::sweep_sn_connections() {
         c->close_connection(CONN_CLOSE_NOT_SN);
 }
 
+bool QUIC::sn_connected(const snode::contact& ct) {
+    std::lock_guard lock{sn_conns_mutex_};
+    auto it = sn_conns_.find(ct.pubkey_ed25519);
+    return it != sn_conns_.end() && !it->second.empty();
+}
+
 bool QUIC::sn_quic_capable(const snode::contact& ct) {
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        if (auto it = sn_conns_.find(ct.pubkey_ed25519);
-            it != sn_conns_.end() && !it->second.empty())
-            return true;
-    }
-    return ct.version >= snode::SN_QUIC_VERSION;
+    return sn_connected(ct) || ct.version >= snode::SN_QUIC_VERSION;
+}
+
+bool QUIC::sn_request(
+        const snode::contact& ct,
+        std::string_view cmd,
+        std::vector<std::string> parts,
+        sn_reply_callback cb,
+        std::chrono::milliseconds timeout) {
+    if (!sn_quic_capable(ct))
+        return false;
+
+    std::string body;
+    if (parts.size() == 1)
+        body = std::move(parts[0]);
+    else if (!parts.empty())
+        body = oxenc::bt_serialize(parts);
+
+    // Replies come in on the QUIC loop; hand them to an oxenmq task like every other QUIC event,
+    // so that the loop never runs storage server logic (see handle_request).
+    auto reply = [this, cb = std::make_shared<sn_reply_callback>(std::move(cb))](
+                         bool success, std::vector<std::string> parts) {
+        service_node_->omq_server()->inject_task(
+                "quic", "quic:(sn_reply)", "", [cb, success, parts = std::move(parts)]() mutable {
+                    (*cb)(success, std::move(parts));
+                });
+    };
+
+    const bool storage_cc = cmd == "storage_cc";
+    sn_connect(
+            ct,
+            [this, cmd = std::string{cmd}, body = std::move(body), reply, storage_cc, timeout](
+                    std::shared_ptr<quic::Connection> conn) {
+                if (!conn)
+                    return reply(false, {"TIMEOUT"s});
+
+                sn_stream(*conn)->command(cmd, body, timeout, [reply, storage_cc](quic::message m) {
+                    if (m.timed_out)
+                        return reply(false, {"TIMEOUT"s});
+                    std::string b{m.body()};
+                    if (!storage_cc)
+                        return reply(true, {std::move(b)});
+
+                    // A forwarded client request's reply has the QUIC client-RPC framing;
+                    // reshape it into oxenmq's: [code, reason] for a failure (from
+                    // "CODE REASON\n\nbody"), the bare result for a success (from the
+                    // [code, result] list).
+                    if (m.is_error()) {
+                        auto code = b.substr(0, b.find(' '));
+                        auto nl = b.find("\n\n");
+                        return reply(
+                                true,
+                                {std::move(code), nl == std::string::npos ? "" : b.substr(nl + 2)});
+                    }
+                    try {
+                        oxenc::bt_list_consumer l{b};
+                        l.consume_integer<int>();
+                        return reply(true, {std::string{l.consume_dict_data()}});
+                    } catch (const std::exception&) {
+                        // Unparseable; passing it through as-is makes the caller treat it
+                        // as a bad peer response.
+                        return reply(true, {std::move(b)});
+                    }
+                });
+            });
+    return true;
 }
 
 void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {

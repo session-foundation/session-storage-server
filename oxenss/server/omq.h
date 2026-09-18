@@ -250,6 +250,14 @@ class OMQ : public MQBase {
 
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
 
+    // Always sends: oxenmq is the transport for every node not (yet) reached over QUIC.
+    bool sn_request(
+            const snode::contact& ct,
+            std::string_view cmd,
+            std::vector<std::string> parts,
+            sn_reply_callback cb,
+            std::chrono::milliseconds timeout) override;
+
   private:
     // Fire-and-forget push of `notification` to the OMQ connections in `conns`, using `command`
     // as the endpoint name.

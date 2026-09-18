@@ -494,7 +494,7 @@ void ServiceNode::check_new_members() {
             }
         };
 
-        if (c->version >= SN_DATA_READY_WITH_REQUEST_VERSION) {
+        if (peer_is_current(*c)) {
             // Build 'data ready' request
             bool needs_db_dump{false};
             {
@@ -519,15 +519,10 @@ void ServiceNode::check_new_members() {
                     "Initiating contact with new swarm member {}{}",
                     pk,
                     needs_db_dump ? " (requesting DB dump)" : "");
-            omq_server_->request(
-                    c->pubkey_x25519.view(),
-                    "sn.data_ready",
-                    on_sn_data_ready_response,
-                    std::move(d).str());
+            sn_request(*c, "data_ready", {std::move(d).str()}, on_sn_data_ready_response, 15s);
         } else {
             log::debug(logcat, "Initiating contact with new swarm member {}", pk);
-            omq_server_->request(
-                    c->pubkey_x25519.view(), "sn.data_ready", on_sn_data_ready_response);
+            sn_request(*c, "data_ready", {}, on_sn_data_ready_response, 15s);
         }
     }
 }
@@ -756,6 +751,29 @@ void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
             params.dump());
 }
 
+void ServiceNode::sn_request(
+        const contact& ct,
+        std::string_view cmd,
+        std::vector<std::string> parts,
+        std::function<void(bool success, std::vector<std::string> parts)> cb,
+        std::chrono::milliseconds timeout) {
+    for (auto it = mq_servers_.rbegin(); it != mq_servers_.rend(); ++it)
+        if ((*it)->sn_request(ct, cmd, parts, cb, timeout))
+            return;
+    log::error(
+            logcat, "Internal error: no transport took a {} request to {}", cmd, ct.pubkey_ed25519);
+    cb(false, {"TIMEOUT"s});
+}
+
+bool ServiceNode::peer_is_current(const contact& ct) {
+    if (ct.version >= SN_QUIC_VERSION)
+        return true;
+    for (auto* s : mq_servers_)
+        if (s->sn_connected(ct))
+            return true;
+    return false;
+}
+
 std::string ServiceNode::data_ready_handshake(
         const crypto::legacy_pubkey& pk, std::string_view payload) {
     if (!swarm_.is_member(pk))
@@ -850,15 +868,15 @@ void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
     log::debug(logcat, "Delivering {} messages whose store forward failed to {}", msgs.size(), pk);
     deliveries_in_flight_[pk] = {static_cast<int>(parts.size()), false};
     for (auto& part : parts)
-        omq_server_->request(
-                ct->pubkey_x25519.view(),
-                "sn.data",
+        sn_request(
+                *ct,
+                "data",
+                {std::move(part)},
                 [this, pk, ids](bool success, std::vector<std::string> data) {
                     // Pre-2.12 nodes acknowledge with an empty reply.
                     on_delivery_reply(pk, ids, success && (data.empty() || data[0] == "OK"sv));
                 },
-                std::move(part),
-                oxenmq::send_option::request_timeout{DUMP_REQUEST_TIMEOUT});
+                DUMP_REQUEST_TIMEOUT);
 }
 
 void ServiceNode::on_delivery_reply(
@@ -983,9 +1001,10 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
                 pk);
 
         for (auto& part : parts)
-            omq_server_->request(
-                    ct->pubkey_x25519.view(),
-                    "sn.data",
+            sn_request(
+                    *ct,
+                    "data",
+                    {std::move(part)},
                     [this, key, last_id, generation = w.generation](
                             bool success, std::vector<std::string> data) {
                         // Pre-2.12 nodes acknowledge with an empty reply.
@@ -995,8 +1014,7 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
                                 generation,
                                 success && (data.empty() || data[0] == "OK"sv));
                     },
-                    std::move(part),
-                    oxenmq::send_option::request_timeout{DUMP_REQUEST_TIMEOUT});
+                    DUMP_REQUEST_TIMEOUT);
     }
 }
 
@@ -1530,13 +1548,7 @@ void ServiceNode::check_retry_requests() {
                 db->remove_node_retry_request(req_id);
             }
         };
-        omq_server()->request(
-                ct->pubkey_x25519.view(),
-                "sn.storage_cc",
-                on_request_done,
-                cmd,
-                payload,
-                oxenmq::send_option::request_timeout{RETRY_REQUEST_TIMEOUT});
+        sn_request(*ct, "storage_cc", {cmd, payload}, on_request_done, RETRY_REQUEST_TIMEOUT);
         return true;
     });
 }

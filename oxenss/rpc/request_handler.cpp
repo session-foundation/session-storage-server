@@ -464,10 +464,12 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
             continue;
         }
 
-        sn.omq_server()->request(
-                ct->pubkey_x25519.view(),
-                "sn.storage_cc",
-                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](bool success, auto parts) {
+        sn.sn_request(
+                *ct,
+                "storage_cc",
+                {res->cmd, res->req_payload},
+                [res, peer, peer_ed = ct->pubkey_ed25519, &sn](
+                        bool success, std::vector<std::string> parts) {
                     json peer_result;
                     SNStorageCCResult store_result =
                             interpret_sn_storage_cc_response_parts(success, parts);
@@ -523,9 +525,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                     if (send_reply)
                         reply_or_fail(res);
                 },
-                res->cmd,
-                res->req_payload,
-                oxenmq::send_option::request_timeout{5s});
+                5s);
     }
 }
 

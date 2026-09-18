@@ -338,6 +338,25 @@ class ServiceNode {
     // reason the handshake was refused.
     std::string data_ready_handshake(const crypto::legacy_pubkey& pk, std::string_view payload);
 
+    // Sends a node-to-node request to `ct` over whichever registered transport carries such
+    // traffic with that node (see server::MQBase::sn_request), asking the most recently registered
+    // first: QUIC for nodes that speak it, oxenmq for the rest.
+    void sn_request(
+            const contact& ct,
+            std::string_view cmd,
+            std::vector<std::string> parts,
+            std::function<void(bool success, std::vector<std::string> parts)> cb,
+            std::chrono::milliseconds timeout);
+
+    // True if the node runs SN_QUIC_VERSION or later: it reports so, or it holds a node-to-node
+    // QUIC connection with us, which only such a version makes.  (The reported version lags an
+    // upgrade by up to an hour.)
+    bool peer_is_current(const contact& ct);
+
+    // Called when a connection with another storage server is established: starts or resumes any
+    // dump or delivery that was waiting on the node being reachable.
+    void resume_transfers() { check_dumps(); }
+
     // Delivers our stored message with the given hash to swarm peer `pk` over sn.data, retrying
     // until it arrives or the message is gone.  Used when forwarding a client's store to `pk`
     // failed: replaying the store request instead would be refused by the peer once the client's

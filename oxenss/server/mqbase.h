@@ -29,6 +29,7 @@ namespace rpc {
 namespace snode {
     class ServiceNode;
     struct sn_test;
+    struct contact;
 }  // namespace snode
 
 struct message;
@@ -171,6 +172,27 @@ class MQBase {
     // Called after each service node list update so that connections held open to nodes that are
     // no longer service nodes can be closed.  The default does nothing.
     virtual void sweep_sn_connections() {}
+
+    // True if this transport currently holds a node-to-node connection with the given node.  The
+    // default (for transports that connect on demand) is false.
+    virtual bool sn_connected(const snode::contact&) { return false; }
+
+    using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
+
+    // Sends node-to-node request `cmd` ("data", "data_ready" or "storage_cc") with the given
+    // message parts to `ct` over this transport, if this transport carries node-to-node traffic
+    // with that node; returns false, without sending, if it does not (the default: no such
+    // traffic).  Whatever the transport, the reply reaches `cb` in oxenmq's shape: `success` is
+    // false on timeout (with parts {"TIMEOUT"}), otherwise the parts are the reply body, or
+    // [code, reason] for a refused storage_cc.
+    virtual bool sn_request(
+            const snode::contact&,
+            std::string_view,
+            std::vector<std::string>,
+            sn_reply_callback,
+            std::chrono::milliseconds) {
+        return false;
+    }
 
     virtual ~MQBase() = default;
 

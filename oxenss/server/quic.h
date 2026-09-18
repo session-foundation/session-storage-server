@@ -73,6 +73,19 @@ class QUIC : public MQBase {
 
     void sweep_sn_connections() override;
 
+    bool sn_connected(const snode::contact& ct) override;
+
+    // Sends over the held connection when the node speaks QUIC (sn_quic_capable), establishing
+    // the connection first if needed; a node that does not is left to the next transport.  A
+    // single part is the request body as-is, several are sent as a bt list (see
+    // handle_sn_storage_cc).  Replies are delivered off the QUIC loop, via an oxenmq task.
+    bool sn_request(
+            const snode::contact& ct,
+            std::string_view cmd,
+            std::vector<std::string> parts,
+            sn_reply_callback cb,
+            std::chrono::milliseconds timeout) override;
+
     using sn_conn_callback = std::function<void(std::shared_ptr<quic::Connection>)>;
 
     // True if node-to-node traffic with this node goes over QUIC.  An SN_ALPN connection we

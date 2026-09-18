@@ -137,8 +137,10 @@ class reachability_testing {
     // Called when this storage server receives an incoming HTTP, OMQ or QUIC ping
     void incoming_ping(ReachType type, const clock::time_point& now = clock::now());
 
-    // Check whether we received incoming pings recently
-    void check_incoming_tests(const clock::time_point& now);
+    // Check whether we received incoming pings recently, and warn if not.  `omq_tested` says
+    // whether any node on the network still tests oxenmq ports (see
+    // ServiceNode::test_reachability); when none does, no OxenMQ ping is expected.
+    void check_incoming_tests(const clock::time_point& now, bool omq_tested);
 };
 
 }  // namespace oxenss::snode

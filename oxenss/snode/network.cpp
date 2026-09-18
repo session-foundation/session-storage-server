@@ -125,6 +125,20 @@ void Network::update_swarms(
         all_nodes_blob_.reset();
 
     swarms_ = std::move(new_swarms);
+
+    std::array<uint16_t, 3> min_version{};
+    bool any = false;
+    for (const auto& [pk, c] : new_contacts)
+        if (c && (!any || c.version < min_version)) {
+            min_version = c.version;
+            any = true;
+        }
+    min_peer_version_ = min_version;
+}
+
+std::array<uint16_t, 3> Network::min_peer_version() const {
+    std::shared_lock lock{mut_};
+    return min_peer_version_;
 }
 
 static constexpr size_t PER_SNODE_BLOB_SIZE = 51;

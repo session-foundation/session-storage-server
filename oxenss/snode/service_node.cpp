@@ -1114,8 +1114,10 @@ void ServiceNode::ping_peers() {
 
     auto now = std::chrono::steady_clock::now();
 
-    // Check if we've been tested (reached) recently ourselves
-    reach_records_.check_incoming_tests(now);
+    // Check if we've been tested (reached) recently ourselves.  Only nodes older than
+    // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an oxenmq
+    // ping is not expected.
+    reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
 
     if (status_ == SnodeStatus::DECOMMISSIONED) {
         log::trace(logcat, "Skipping peer testing (decommissioned)");
@@ -1163,15 +1165,21 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
         return;
     }
 
+    // From SN_QUIC_VERSION a node is reached over HTTPS and QUIC only: clients use nothing else,
+    // and node-to-node traffic with it goes over QUIC.  Its oxenmq listener stays up for older
+    // peers but is not tested, so that it can go away once every node is at that version.
+    const bool test_omq = !peer_is_current(*c);
+
     auto test = std::make_shared<sn_test>(
             sn,
-            1 + mq_servers_.size(),
+            1 + mq_servers_.size() - (test_omq ? 0 : 1),
             [this, previous_failures](const crypto::legacy_pubkey& sn, bool passed) {
                 report_reachability(sn, passed, previous_failures);
             });
 
     for (auto* mq : mq_servers_)
-        mq->reachability_test(test);
+        if (test_omq || mq != &omq_server_)
+            mq->reachability_test(test);
 
     auto url = fmt::format("https://{}:{}/ping_test/v1", c->ip, c->https_port);
     std::optional<std::string> host;

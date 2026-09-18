@@ -43,6 +43,9 @@ class Network {
     // any contact info changes.
     mutable std::shared_ptr<std::vector<std::byte>> all_nodes_blob_;
 
+    // The lowest storage server version among contactable nodes, {0,0,0} until we have any.
+    std::array<uint16_t, 3> min_peer_version_{};
+
     // Processes a swarm update; this replaces the current swarm map with the given one, and updates
     // contacts to remove any no-longer-present nodes, add any new ones, and update any changed
     // contact info.  As part of the update, swarm.update() is called at the end to have the current
@@ -61,6 +64,10 @@ class Network {
 
     // swarm_boundaries() on the current swarm list.
     std::pair<uint64_t, uint64_t> get_swarm_boundaries(swarm_id_t swarm) const;
+
+    // The lowest storage server version any contactable node on the network reports, as of the
+    // last swarm update; {0,0,0} before the first.
+    std::array<uint16_t, 3> min_peer_version() const;
 
     swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
     swarms_t::const_iterator _find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const;

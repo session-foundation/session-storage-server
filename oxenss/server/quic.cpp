@@ -105,13 +105,18 @@ QUIC::QUIC(
                 return true;
             });
 
-    // Add a category to OMQ for handling incoming quic request jobs
+    // Everything arriving over QUIC is handed to oxenmq workers as injected tasks; these categories
+    // give them threads and a queue.  Node-to-node work gets its own so that a node ingesting dumps
+    // from several peers does not queue client requests behind them (or drop them when the queue
+    // fills), mirroring oxenmq's own separate `sn` category.
     service_node_->omq_server()->add_category(
             "quic",
             oxenmq::AuthLevel::basic,
             2,    // minimum # of threads reserved threads for this category
             1000  // max queued requests
     );
+    service_node_->omq_server()->add_category(
+            "quicsn", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
 }
 
 void QUIC::startup_endpoint() {
@@ -236,7 +241,7 @@ void QUIC::on_conn_established(quic::Connection& c) {
 
     // Anything queued for this node that was waiting for it to be reachable can go now.
     service_node_->omq_server()->inject_task(
-            "quic", "quic:(sn_connected)", "", [this] { service_node_->resume_transfers(); });
+            "quicsn", "quic:(sn_connected)", "", [this] { service_node_->resume_transfers(); });
 }
 
 void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
@@ -348,7 +353,7 @@ void QUIC::sn_request(
     auto reply = [this, cb = std::make_shared<sn_reply_callback>(std::move(cb))](
                          bool success, std::vector<std::string> parts) {
         service_node_->omq_server()->inject_task(
-                "quic", "quic:(sn_reply)", "", [cb, success, parts = std::move(parts)]() mutable {
+                "quicsn", "quic:(sn_reply)", "", [cb, success, parts = std::move(parts)]() mutable {
                     (*cb)(success, std::move(parts));
                 });
     };
@@ -567,7 +572,7 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
     // `sn_mutex_` we could deadlock (because the `open_stream` we do in reachability testing is
     // synchronous, but is also called with the `sn_mutex_` held).
     omq.inject_task(
-            "quic",
+            peer ? "quicsn" : "quic",
             "quic:{}"_format(msg.endpoint()),
             remote_host.host(),
             [this, msg, remote_ip, ep_idx, peer]() mutable {
@@ -789,7 +794,7 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
     // applies here.
     auto report = [this](std::shared_ptr<snode::sn_test> test, bool passed) {
         service_node_->omq_server()->inject_task(
-                "quic", "quic:(reach_report)", "", [test = std::move(test), passed]() {
+                "quicsn", "quic:(reach_report)", "", [test = std::move(test), passed]() {
                     test->add_result(passed);
                 });
     };

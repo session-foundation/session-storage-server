@@ -44,6 +44,10 @@ inline constexpr auto SN_PING_TIMEOUT = 5s;
 // Timeout for bootstrap node OMQ requests
 inline constexpr auto BOOTSTRAP_TIMEOUT = 10s;
 
+// At startup our oxend is taken to be synced if its top block is at most this old.  Only an oxend
+// that is behind sends us to the bootstrap nodes to find out how far behind it is.
+inline constexpr auto MAX_SYNCED_BLOCK_AGE = 1h;
+
 /// We test based on the height a few blocks back to minimise discrepancies between nodes (we
 /// could also use checkpoints, but that is still not bulletproof: swarms are calculated based
 /// on the latest block, so they might be still different and thus derive different pairs)
@@ -142,9 +146,15 @@ class ServiceNode {
     // swarm's messages if we need one).
     void check_new_members();
 
-    // Called if our oxend looks like it is missing lots of records when we first get data from it
-    // to load initial data (especially contact info) from the bootstrap nodes.
+    // Asks the bootstrap nodes for their view of the network: the height they are at (which tells
+    // us when our own oxend has caught up) and their contact info for the nodes.  Used at startup
+    // when our oxend is behind, or has a full node list but hardly any contact details (a fresh
+    // oxend receives those over the network for up to an hour).
     void bootstrap_fallback();
+
+    // Blocks until our oxend tells us how old its top block is.  Throws after a few failed
+    // attempts, which aborts startup.
+    std::chrono::seconds oxend_top_block_age();
 
     // Queues dumps of the messages we hold for each of the given swarms (all swarms, if empty) to
     // that swarm's members.  Used when a new swarm appears next to ours, and when our own swarm
@@ -298,8 +308,10 @@ class ServiceNode {
     std::string get_status_line() const;
 
     // Called once we have established the initial connection to our local oxend to set up
-    // initial data and timers that rely on an oxend connection.  This blocks until we get an
-    // initial service node block update back from oxend.
+    // initial data and timers that rely on an oxend connection.  This blocks until we know whether
+    // oxend is synced (see MAX_SYNCED_BLOCK_AGE) and have its service node list; when it is
+    // synced, that list is in effect by the time this returns, so listeners started afterwards
+    // recognize the network from their first request.
     void on_oxend_connected();
 
     // Called when oxend notifies us of a new block to update swarm info

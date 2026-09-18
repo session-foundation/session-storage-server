@@ -120,11 +120,60 @@ ServiceNode::ServiceNode(
     omq_server_->add_timer([this] { check_dumps(); }, DUMP_CHECK_INTERVAL);
 }
 
+std::chrono::seconds ServiceNode::oxend_top_block_age() {
+    for (int attempt = 1;; attempt++) {
+        std::promise<std::chrono::seconds> prom;
+        omq_server_.oxend_request(
+                "rpc.get_last_block_header", [&prom](bool success, std::vector<std::string> data) {
+                    try {
+                        if (!success || data.size() < 2 || data[0] != "200")
+                            throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
+                        auto header = json::parse(data[1]).at("block_header");
+                        std::chrono::sys_seconds mined{
+                                std::chrono::seconds{header.at("timestamp").get<int64_t>()}};
+                        auto now = std::chrono::floor<std::chrono::seconds>(
+                                std::chrono::system_clock::now());
+                        auto age = std::max(0s, now - mined);
+                        log::info(
+                                logcat,
+                                "oxend is at height {}; its top block is {} old",
+                                header.at("height").get<uint64_t>(),
+                                util::friendly_duration(age));
+                        prom.set_value(age);
+                    } catch (...) {
+                        prom.set_exception(std::current_exception());
+                    }
+                });
+        try {
+            return prom.get_future().get();
+        } catch (const std::exception& e) {
+            if (attempt >= 5)
+                throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
+            log::warning(logcat, "Failed to get the top block from oxend: {}; retrying", e.what());
+        }
+        std::this_thread::sleep_for(1s);
+    }
+}
+
 void ServiceNode::on_oxend_connected() {
     // This should be the first time we ever trigger a block update from Oxen, i.e. the initial
     // call to `update_swarms` should not early out which would cause a deadlock on the promise.
     assert(!updating_swarms_.load());
     auto started = std::chrono::steady_clock::now();
+
+    // Whether oxend's node list can be used as-is is a question of whether oxend is synced, and
+    // the age of its top block answers that directly.  This has to be settled before the list
+    // arrives: process_snodes_update() drops the list of an oxend that is still syncing.
+    {
+        auto block_age = oxend_top_block_age();
+        std::lock_guard lock{sn_mutex_};
+        syncing_ = block_age > MAX_SYNCED_BLOCK_AGE;
+        if (syncing_)
+            log::warning(
+                    logcat,
+                    "oxend's top block is {} old; treating oxend as still syncing",
+                    util::friendly_duration(block_age));
+    }
 
     bool success;
     do {
@@ -1057,40 +1106,45 @@ void ServiceNode::process_snodes_update(std::string_view data) {
 
     if (maybe_bu && !got_first_response_.exchange(true)) {
         log::info(logcat, "Got initial swarm information from local Oxend");
-        // On our very first response we *may* want to fall back to the bootstrap nodes *if* the
-        // response looks sparse: this will typically happen for a fresh service node because
-        // IP/port distribution through the network can take up to an hour.  We don't really want
-        // to hit the bootstrap nodes when we don't have to, though, so only do it if the response
-        // is missing more than 3% of proof data (IPs/ports/ed25519/x25519 pubkeys) or has fewer
-        // than 100 SNs (10 on testnet).  This has to be judged from the response itself: until we
-        // decide we are not syncing, on_snodes_update() below does not store anything from it.
-        //
-        // (In the future it would be nice to eliminate this by putting all the required data on
-        // chain, and get rid of needing to consult bootstrap nodes: but currently we still need
-        // this to deal with the lag).
         const int total = maybe_bu->contacts.size();
         const int contactable = std::ranges::count_if(
                 maybe_bu->contacts, [](const auto& c) { return c.second.contactable(); });
         const int missing = total - contactable;
 
-        if (skip_bootstrap_ ||
-            (total >= (oxenss::is_mainnet ? 100 : 10) &&
-             missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
+        if (syncing_) {
+            if (skip_bootstrap_) {
+                log::warning(
+                        logcat,
+                        "oxend looks behind but bootstrap nodes are disabled; assuming its data "
+                        "is current");
+                syncing_ = false;
+            } else {
+                log::info(
+                        logcat,
+                        "oxend is still syncing; asking bootstrap nodes for the network's height "
+                        "and node data");
+                bootstrap_fallback();
+            }
+        } else if (
+                !skip_bootstrap_ &&
+                (total < (oxenss::is_mainnet ? 100 : 10) ||
+                 missing > MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
+            // A synced oxend can still have hardly any contact details: it learns IPs, ports and
+            // pubkeys from uptime proofs, which take up to an hour to reach a fresh oxend.  The
+            // list is used as it is, and the bootstrap nodes fill in what it lacks.
+            log::info(
+                    logcat,
+                    "Initialized from oxend, but only {}/{} service nodes are contactable; asking "
+                    "bootstrap nodes for contact info",
+                    contactable,
+                    total);
+            bootstrap_fallback();
+        } else
             log::info(
                     logcat,
                     "Initialized from oxend with {}/{} contactable service nodes",
                     contactable,
                     total);
-            syncing_ = false;
-        } else {
-            log::info(
-                    logcat,
-                    "Detected some missing SN data ({}/{} contactable); "
-                    "falling back to bootstrap nodes for help",
-                    contactable,
-                    total);
-            bootstrap_fallback();
-        }
     }
 
     if (maybe_bu) {

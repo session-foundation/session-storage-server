@@ -303,6 +303,28 @@ class Database {
     std::pair<std::vector<message>, int64_t> next_dump_batch(
             int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget);
 
+    // Pending deliveries: messages whose forwarded store did not reach a swarm peer, to be sent
+    // to it later over sn.data.  A pending delivery references the message and is removed with
+    // it, so a message that is deleted or expires first is never delivered.
+
+    // Queues delivery of the stored message with the given hash to `pubkey`.  Does nothing if no
+    // such message is stored.
+    void queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash);
+
+    // The nodes with at least one pending delivery.
+    std::vector<crypto::legacy_pubkey> delivery_peers();
+
+    // The next batch of pending deliveries to `pubkey`, in message id order, stopping after the
+    // message that takes the batch past `byte_budget`.  Returns the messages and their ids.
+    std::pair<std::vector<message>, std::vector<int64_t>> next_delivery_batch(
+            const crypto::legacy_pubkey& pubkey, size_t byte_budget);
+
+    // Removes the given (delivered) messages from `pubkey`'s pending deliveries.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey, const std::vector<int64_t>& ids);
+
+    // Removes all pending deliveries to `pubkey`.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey);
+
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);

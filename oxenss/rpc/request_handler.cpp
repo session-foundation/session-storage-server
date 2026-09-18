@@ -380,7 +380,27 @@ struct swarm_response {
     std::string req_payload;
     std::chrono::system_clock::time_point expiry;
     int64_t db_req_id{0};
+
+    // For `store`: the message hash, set once the message is stored locally, and the peers whose
+    // forward failed before that.  Their copy is delivered over sn.data rather than by replaying
+    // the request, which a peer refuses once the client's signature timestamp is stale.
+    std::string stored_hash;
+    std::vector<crypto::legacy_pubkey> undelivered_peers;
 };
+
+// Handles a forward of res.cmd to `peer` that failed in a way worth retrying (no contact info, or
+// no reply).  Requires res.mutex to be held.
+static void forward_failed(
+        snode::ServiceNode& sn, swarm_response& res, const crypto::legacy_pubkey& peer) {
+    if (res.cmd == "store") {
+        if (res.stored_hash.empty())
+            res.undelivered_peers.push_back(peer);
+        else
+            sn.queue_delivery(peer, res.stored_hash);
+    } else {
+        res.db_req_id = sn.db->add_retry_request(peer, res.cmd, res.req_payload, res.db_req_id);
+    }
+}
 
 // Replies to a swarm request via its callback; sends an http::OK unless all of the
 // swarm entries returned things with "failed" in them or in the case of a non-recursive request,
@@ -440,8 +460,7 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
             // Replies to peers we already sent to in this loop may be arriving on worker threads.
             std::lock_guard lock{res->mutex};
             res->pending--;
-            res->db_req_id = sn.db->add_retry_request(
-                    peer.first, res->cmd, res->req_payload, res->db_req_id);
+            forward_failed(sn, *res, peer.first);
             continue;
         }
 
@@ -492,10 +511,8 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                                 timeout ? "will be retried" : "unretryable due to error",
                                 peer_result.dump());
 
-                        if (timeout) {
-                            res->db_req_id = sn.db->add_retry_request(
-                                    peer.first, res->cmd, res->req_payload, res->db_req_id);
-                        }
+                        if (timeout)
+                            forward_failed(sn, *res, peer.first);
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");
                             it != peer_result.end() && it->is_string())
@@ -633,6 +650,13 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
         mine["reason"] = e.what();
     }
     if (success) {
+        // The message exists locally now, so peers whose forward already failed can have their
+        // delivery queued; forwards that fail from here on queue their own.
+        res->stored_hash = message_hash;
+        for (const auto& peer : res->undelivered_peers)
+            service_node_.queue_delivery(peer, message_hash);
+        res->undelivered_peers.clear();
+
         mine["hash"] = message_hash;
         auto sig = create_signature(ed25519_sk_, message_hash);
         mine["signature"] =

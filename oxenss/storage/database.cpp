@@ -297,6 +297,15 @@ CREATE TABLE IF NOT EXISTS pending_dumps (
     next_attempt DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY(pubkey, swarm)
 );
+
+CREATE TABLE IF NOT EXISTS pending_deliveries (
+    pubkey BLOB NOT NULL,
+    message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY(pubkey, message)
+) WITHOUT ROWID;
+
+-- Deleting a message has to find its pending deliveries, if any
+CREATE INDEX IF NOT EXISTS pending_deliveries_message ON pending_deliveries(message);
         )");
 
         views_triggers_indices();
@@ -1330,6 +1339,78 @@ ORDER BY messages.id)"_format(swarm_range_sql(lower, upper))};
                 std::move(data));
     }
     return result;
+}
+
+void Database::queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash) {
+    db_->conn().prepared_exec(
+            "INSERT OR IGNORE INTO pending_deliveries (pubkey, message)"
+            " SELECT ?, id FROM messages WHERE hash = ?",
+            pubkey.str(),
+            hash);
+}
+
+std::vector<crypto::legacy_pubkey> Database::delivery_peers() {
+    auto conn = db_->conn();
+    std::vector<crypto::legacy_pubkey> peers;
+    auto st = conn.prepared_st("SELECT DISTINCT pubkey FROM pending_deliveries");
+    while (st->executeStep())
+        peers.push_back(crypto::legacy_pubkey::from_bytes(get<std::string>(st)));
+    return peers;
+}
+
+std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_batch(
+        const crypto::legacy_pubkey& pubkey, size_t byte_budget) {
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(
+            "SELECT messages.id, owners.type, owners.pubkey, hash, namespace, timestamp, expiry,"
+            " data"
+            " FROM pending_deliveries"
+            " JOIN messages ON messages.id = pending_deliveries.message"
+            " JOIN owners ON owners.id = messages.owner"
+            " WHERE pending_deliveries.pubkey = ?"
+            " ORDER BY messages.id");
+    st->bind(1, pubkey.str());
+
+    std::pair<std::vector<message>, std::vector<int64_t>> result;
+    auto& [messages, ids] = result;
+    size_t size = 0;
+    while (size < byte_budget && st->executeStep()) {
+        auto [id, type, pubkey, hash, ns, ts, exp, data] =
+                get<int64_t,
+                    uint8_t,
+                    std::string,
+                    std::string,
+                    namespace_id,
+                    int64_t,
+                    int64_t,
+                    std::string>(st);
+        size += data.size() + hash.size() + 80;
+        ids.push_back(id);
+        messages.emplace_back(
+                load_pubkey(type, pubkey),
+                std::move(hash),
+                ns,
+                from_epoch_ms(ts),
+                from_epoch_ms(exp),
+                std::move(data));
+    }
+    return result;
+}
+
+void Database::remove_deliveries(
+        const crypto::legacy_pubkey& pubkey, const std::vector<int64_t>& ids) {
+    auto conn = db_->conn();
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto st = conn.prepared_st("DELETE FROM pending_deliveries WHERE pubkey = ? AND message = ?");
+    for (auto id : ids) {
+        exec_query(st, pubkey.str(), id);
+        st->reset();
+    }
+    transaction.commit();
+}
+
+void Database::remove_deliveries(const crypto::legacy_pubkey& pubkey) {
+    db_->conn().prepared_exec("DELETE FROM pending_deliveries WHERE pubkey = ?", pubkey.str());
 }
 
 void Database::remove_node_retry_request(int64_t req_id) {

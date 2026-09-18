@@ -599,6 +599,64 @@ TEST_CASE("storage - removing retry requests", "[storage]") {
     CHECK_THROWS(storage.add_retry_request(pk1, "cmd", "payload", req));
 }
 
+TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    const auto now = std::chrono::system_clock::now();
+    const std::string data(100, 'x');
+    for (int i = 1; i <= 3; i++)
+        REQUIRE(storage.store({pk, "h{}"_format(i), namespace_id::Default, now, now + 1h, data}) ==
+                StoreResult::New);
+
+    const auto peer1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto peer2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+    using pks = std::vector<crypto::legacy_pubkey>;
+
+    CHECK(storage.delivery_peers().empty());
+
+    storage.queue_delivery(peer1, "h1");
+    storage.queue_delivery(peer1, "h3");
+    storage.queue_delivery(peer1, "h3");            // already queued: no-op
+    storage.queue_delivery(peer1, "no such hash");  // nothing to deliver: no-op
+    CHECK(storage.delivery_peers() == pks{peer1});
+
+    auto [msgs, ids] = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0].hash == "h1");
+    CHECK(msgs[1].hash == "h3");
+    CHECK(ids == std::vector<int64_t>{1, 3});
+
+    // The byte budget splits batches as for dumps
+    CHECK(storage.next_delivery_batch(peer1, 1).first.size() == 1);
+
+    storage.remove_deliveries(peer1, {1});
+    std::tie(msgs, ids) = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].hash == "h3");
+
+    // Deleting the message takes its pending delivery with it
+    CHECK(storage.delete_by_hash(pk, {"h3"}) == std::vector<std::string>{"h3"});
+    CHECK(storage.next_delivery_batch(peer1, 1 << 20).first.empty());
+    CHECK(storage.delivery_peers().empty());
+
+    // ... as does expiry
+    REQUIRE(storage.store({pk, "h4", namespace_id::Default, now, now - 1s, data}) ==
+            StoreResult::New);
+    storage.queue_delivery(peer1, "h4");
+    storage.queue_delivery(peer2, "h2");
+    CHECK(storage.delivery_peers().size() == 2);
+    storage.clean_expired();
+    CHECK(storage.delivery_peers() == pks{peer2});
+
+    storage.remove_deliveries(peer2);
+    CHECK(storage.delivery_peers().empty());
+}
+
 TEST_CASE("storage - swarm space range queries", "[storage][swarm]") {
     StorageDeleter fixture;
     Database storage{"."};

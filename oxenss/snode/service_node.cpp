@@ -776,6 +776,87 @@ void ServiceNode::queue_dump(const crypto::legacy_pubkey& pk, swarm_id_t swarm) 
 void ServiceNode::check_dumps() {
     std::lock_guard lock{dumps_mutex_};
     check_dumps_locked();
+    check_deliveries_locked();
+}
+
+void ServiceNode::queue_delivery(const crypto::legacy_pubkey& pk, const std::string& hash) {
+    db->queue_delivery(pk, hash);
+    std::lock_guard lock{dumps_mutex_};
+    send_deliveries(pk);
+}
+
+void ServiceNode::check_deliveries_locked() {
+    for (const auto& pk : db->delivery_peers())
+        send_deliveries(pk);
+}
+
+void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
+    if (deliveries_in_flight_.count(pk))
+        return;
+
+    auto now = std::chrono::system_clock::now();
+    if (auto it = delivery_retry_after_.find(pk); it != delivery_retry_after_.end()) {
+        if (it->second > now)
+            return;
+        delivery_retry_after_.erase(it);
+    }
+
+    if (!swarm_.is_member(pk)) {
+        log::debug(logcat, "Dropping pending deliveries to {}: no longer in our swarm", pk);
+        db->remove_deliveries(pk);
+        return;
+    }
+
+    auto ct = network_.contacts.find(pk);
+    if (!ct || !*ct) {
+        delivery_retry_after_[pk] = now + DUMP_RETRY_DELAY;
+        return;
+    }
+
+    auto [msgs, ids] = db->next_delivery_batch(pk, DUMP_BATCH_BYTES);
+    if (msgs.empty())
+        return;
+
+    auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+    log::debug(logcat, "Delivering {} messages whose store forward failed to {}", msgs.size(), pk);
+    deliveries_in_flight_[pk] = {static_cast<int>(parts.size()), false};
+    for (auto& part : parts)
+        omq_server_->request(
+                ct->pubkey_x25519.view(),
+                "sn.data",
+                [this, pk, ids](bool success, std::vector<std::string> data) {
+                    // Pre-2.12 nodes acknowledge with an empty reply.
+                    on_delivery_reply(pk, ids, success && (data.empty() || data[0] == "OK"sv));
+                },
+                std::move(part),
+                oxenmq::send_option::request_timeout{DUMP_REQUEST_TIMEOUT});
+}
+
+void ServiceNode::on_delivery_reply(
+        const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok) {
+    std::lock_guard lock{dumps_mutex_};
+    auto it = deliveries_in_flight_.find(pk);
+    if (it == deliveries_in_flight_.end())
+        return;
+    auto& [parts, failed] = it->second;
+    failed = failed || !ok;
+    if (--parts > 0)
+        return;
+    const bool delivered = !failed;
+    deliveries_in_flight_.erase(it);
+
+    if (delivered) {
+        db->remove_deliveries(pk, ids);
+        send_deliveries(pk);
+    } else {
+        log::info(
+                logcat,
+                "Delivery of {} messages to {} failed; retrying in {}",
+                ids.size(),
+                pk,
+                DUMP_RETRY_DELAY);
+        delivery_retry_after_[pk] = std::chrono::system_clock::now() + DUMP_RETRY_DELAY;
+    }
 }
 
 void ServiceNode::check_dumps_locked() {

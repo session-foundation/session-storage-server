@@ -171,7 +171,7 @@ class ServiceNode {
     uint64_t dump_generation_ = 0;
 
     void queue_dump(const crypto::legacy_pubkey& pk, swarm_id_t swarm);
-    // Periodic: starts or resumes any dump that is due.
+    // Periodic: starts or resumes any dump or delivery that is due.
     void check_dumps();
     // The following require dumps_mutex_ to be held.
     void check_dumps_locked();
@@ -179,6 +179,17 @@ class ServiceNode {
     // may be invalidated (the window erased) by this call.
     void advance_dump(const dump_key& key, dump_window& w);
     void on_dump_batch_reply(const dump_key& key, int64_t last_id, uint64_t generation, bool ok);
+
+    // Pending deliveries (Database::queue_delivery) go out over sn.data with one batch in flight
+    // per node, sharing the dump batch size, timeout and retry delay.  The in-flight entry counts
+    // the batch's parts still awaiting a reply and whether any failed.
+    std::map<crypto::legacy_pubkey, std::pair<int, bool>> deliveries_in_flight_;
+    std::map<crypto::legacy_pubkey, std::chrono::system_clock::time_point> delivery_retry_after_;
+    // These require dumps_mutex_ to be held.
+    void check_deliveries_locked();
+    void send_deliveries(const crypto::legacy_pubkey& pk);
+    void on_delivery_reply(
+            const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok);
 
     /// Distribute all our data to where it belongs
     /// (called when our old node got dissolved)
@@ -316,6 +327,12 @@ class ServiceNode {
     // swarm member asks for one in its sn.data_ready handshake.  Does nothing if we are not in a
     // swarm.
     void queue_swarm_dump(const crypto::legacy_pubkey& pk);
+
+    // Delivers our stored message with the given hash to swarm peer `pk` over sn.data, retrying
+    // until it arrives or the message is gone.  Used when forwarding a client's store to `pk`
+    // failed: replaying the store request instead would be refused by the peer once the client's
+    // signature timestamp is more than a minute old.
+    void queue_delivery(const crypto::legacy_pubkey& pk, const std::string& hash);
 
     server::OMQ& omq_server() { return omq_server_; }
 

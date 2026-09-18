@@ -215,8 +215,17 @@ void QUIC::on_conn_established(quic::Connection& c) {
 
     if (replaced)
         replaced->close_connection();
+    // This runs on the QUIC loop, which does not survive an exception escaping a callback.
     for (auto& cb : waiting)
-        cb(use);
+        try {
+            cb(use);
+        } catch (const std::exception& e) {
+            log::error(
+                    logcat,
+                    "Exception in connection-established handler for {}: {}",
+                    *pk,
+                    e.what());
+        }
 
     // Anything queued for this node that was waiting for it to be reachable can go now.
     service_node_->omq_server()->inject_task(
@@ -261,7 +270,11 @@ void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
     }
 
     for (auto& cb : waiting)
-        cb(nullptr);
+        try {
+            cb(nullptr);
+        } catch (const std::exception& e) {
+            log::error(logcat, "Exception in connection-failed handler for {}: {}", *pk, e.what());
+        }
 }
 
 void QUIC::close_redundant_sn_conns() {
@@ -350,7 +363,15 @@ bool QUIC::sn_request(
                 if (!conn)
                     return reply(false, {"TIMEOUT"s});
 
-                sn_stream(*conn)->command(cmd, body, timeout, [reply, storage_cc](quic::message m) {
+                std::shared_ptr<quic::BTRequestStream> stream;
+                try {
+                    stream = sn_stream(*conn);
+                } catch (const std::exception& e) {
+                    // The connection is on its way out; the caller retries later.
+                    log::debug(logcat, "Could not open a stream for {} request: {}", cmd, e.what());
+                    return reply(false, {"TIMEOUT"s});
+                }
+                stream->command(cmd, body, timeout, [reply, storage_cc](quic::message m) {
                     if (m.timed_out)
                         return reply(false, {"TIMEOUT"s});
                     std::string b{m.body()};
@@ -724,7 +745,18 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
                                 test->pubkey);
                         return report(std::move(test), false);
                     }
-                    ping(std::move(test), *sn_stream(*conn), false);
+                    std::shared_ptr<quic::BTRequestStream> stream;
+                    try {
+                        stream = sn_stream(*conn);
+                    } catch (const std::exception& e) {
+                        log::debug(
+                                logcat,
+                                "QUIC reachability test failed for {}: {}",
+                                test->pubkey,
+                                e.what());
+                        return report(std::move(test), false);
+                    }
+                    ping(std::move(test), *stream, false);
                 });
         return;
     }

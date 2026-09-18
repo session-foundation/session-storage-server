@@ -19,7 +19,6 @@ Requirements:
 
 These are used from the system when a new enough version is installed, and otherwise downloaded and
 built statically as part of the build:
-* OpenSSL >= 3 (only for the uWebSockets HTTPS backend; see below)
 * libmicrohttpd >= 1.0.8 (only for the libmicrohttpd HTTPS backend; the floor is a security fix
   level, not an API one, so most distro packages are currently too old and it gets built statically)
 * libsodium >= 1.0.18
@@ -28,6 +27,10 @@ built statically as part of the build:
 * libzmq >= 4.3
 * sqlite >= 3.35.5
 * gnutls and ngtcp2 (required by oxen-libquic)
+
+The uWebSockets HTTPS backend (see below) additionally needs OpenSSL >= 3, which must come from the
+system: it is never built as part of the build, and that backend cannot be part of a
+`BUILD_STATIC_DEPS` build.
 
 These are used from the system if found, and otherwise built from the bundled submodules:
 * oxen-libquic >= 1.9
@@ -56,8 +59,9 @@ see supported run-time options.
 ## HTTPS backends
 
 The HTTPS listener has two interchangeable implementations: one on libmicrohttpd (GnuTLS, which the
-rest of the program already uses) and the previous one on uWebSockets (which brings in OpenSSL).
-By default only libmicrohttpd is built, and the resulting binary has no OpenSSL dependency.  The
+rest of the program already uses) and the previous one on uWebSockets (which brings in the system's
+OpenSSL).  By default only libmicrohttpd is built, and the resulting binary has no OpenSSL
+dependency.  The
 uWebSockets backend can be added with `-D HTTPS_BACKEND_UWEBSOCKETS=ON` (or built alone, with
 `-D HTTPS_BACKEND_MICROHTTPD=OFF` as well); when both are present, `--https-backend
 uwebsockets|microhttpd` selects one at startup, defaulting to `microhttpd`.

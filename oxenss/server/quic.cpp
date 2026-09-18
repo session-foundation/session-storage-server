@@ -135,7 +135,7 @@ void QUIC::startup_endpoint() {
         ep_idx++;
     }
 
-    reach_ep->job_queue.add_timer(SN_CONN_REDUNDANT_LINGER, [this] { close_redundant_sn_conns(); });
+    loop.add_timer(SN_CONN_REDUNDANT_LINGER, [this] { close_redundant_sn_conns(); });
 }
 
 std::shared_ptr<quic::Connection> QUIC::sn_conn::preferred() const {
@@ -514,9 +514,9 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
         case sn_stream_kind::onion: break;
     }
 
-    // The stream counters live on the QUIC loop (one loop for all our endpoints), so read them
-    // all in one trip rather than one round trip per stream.
-    return reach_ep->job_queue.call_get([&onion = streams->onion] {
+    // The stream counters live on the QUIC loop, so read them all in one trip rather than one
+    // round trip per stream.
+    return loop.call_get([&onion = streams->onion] {
         std::shared_ptr<quic::BTRequestStream> best;
         size_t best_outstanding = 0;
         for (auto& s : onion) {

@@ -182,6 +182,7 @@ class QUIC : public MQBase {
     void handle_sn_data(quic::message msg);
     void handle_sn_data_ready(quic::message msg, const crypto::ed25519_pubkey& peer);
     void handle_sn_storage_cc(quic::message msg);
+    void handle_sn_onion_request(quic::message msg);
 
     void handle_onion_request(quic::message msg);
 

@@ -398,17 +398,17 @@ void ServiceNode::send_onion_to_sn(
         const contact& ct,
         std::string_view payload,
         rpc::OnionRequestMetadata&& data,
-        std::function<void(bool success, std::vector<std::string> data)> cb) const {
+        std::function<void(bool success, std::vector<std::string> data)> cb) {
     // Since HF18 we bencode everything (which is a bit more compact than sending the eph_key in
     // hex, plus flexible enough to allow other metadata such as the hop number and the
     // encryption type).
     data.hop_no++;
-    omq_server_->request(
-            ct.pubkey_x25519.view(),
-            "sn.onion_request",
+    sn_request(
+            ct,
+            "onion_request",
+            {server::OMQ::encode_onion_data(payload, data)},
             std::move(cb),
-            oxenmq::send_option::request_timeout{30s},
-            omq_server_.encode_onion_data(payload, data));
+            30s);
 }
 
 void ServiceNode::record_proxy_request() {

@@ -267,7 +267,7 @@ class ServiceNode {
             const contact& ct,
             std::string_view payload,
             rpc::OnionRequestMetadata&& data,
-            std::function<void(bool success, std::vector<std::string> data)> cb) const;
+            std::function<void(bool success, std::vector<std::string> data)> cb);
 
     const hf_revision& hf() const { return hardfork_; }
 

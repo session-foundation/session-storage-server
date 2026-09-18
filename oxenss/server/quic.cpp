@@ -365,11 +365,16 @@ bool QUIC::sn_request(
                 });
     };
 
-    const bool storage_cc = cmd == "storage_cc";
+    const bool storage_cc = cmd == "storage_cc", onion = cmd == "onion_request";
     sn_connect(
             ct,
-            [this, cmd = std::string{cmd}, body = std::move(body), reply, storage_cc, timeout](
-                    std::shared_ptr<quic::Connection> conn) {
+            [this,
+             cmd = std::string{cmd},
+             body = std::move(body),
+             reply,
+             storage_cc,
+             onion,
+             timeout](std::shared_ptr<quic::Connection> conn) {
                 if (!conn)
                     return reply(false, {"TIMEOUT"s});
 
@@ -387,10 +392,29 @@ bool QUIC::sn_request(
                 }
                 if (!stream)
                     return reply(false, {"TIMEOUT"s});
-                stream->command(cmd, body, timeout, [reply, storage_cc](quic::message m) {
+                stream->command(cmd, body, timeout, [reply, storage_cc, onion](quic::message m) {
                     if (m.timed_out)
                         return reply(false, {"TIMEOUT"s});
                     std::string b{m.body()};
+
+                    if (onion) {
+                        // A hop reply is a bt list of [code, body] (see handle_sn_onion_request);
+                        // oxenmq sends the same two as separate parts.
+                        if (m.is_error())
+                            return reply(
+                                    true, {std::to_string(http::BAD_GATEWAY.first), std::move(b)});
+                        try {
+                            oxenc::bt_list_consumer l{b};
+                            auto code = l.consume_integer<int>();
+                            return reply(true, {std::to_string(code), l.consume_string()});
+                        } catch (const std::exception&) {
+                            return reply(
+                                    true,
+                                    {std::to_string(http::INTERNAL_SERVER_ERROR.first),
+                                     "Invalid response from snode"s});
+                        }
+                    }
+
                     if (!storage_cc)
                         return reply(true, {std::move(b)});
 
@@ -537,7 +561,7 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
     if (conn->selected_alpn() == SN_ALPN) {
         peer = sn_key(*conn);
         if (!peer || !(name == "snode_ping" || name == "data" || name == "data_ready" ||
-                       name == "storage_cc"))
+                       name == "storage_cc" || name == "onion_request"))
             throw quic::no_such_endpoint{};
     } else if (!(name == "snode_ping" || name == "monitor" || name == "onion_req" ||
                  rpc::RequestHandler::client_rpc_endpoints.count(name)))
@@ -560,6 +584,8 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
                         return handle_sn_data(std::move(msg));
                     if (name == "data_ready")
                         return handle_sn_data_ready(std::move(msg), *peer);
+                    if (name == "onion_request")
+                        return handle_sn_onion_request(std::move(msg));
                     return handle_sn_storage_cc(std::move(msg));
                 }
                 if (name == "monitor")
@@ -624,6 +650,41 @@ void QUIC::handle_sn_storage_cc(quic::message msg) {
             /*forwarded=*/true);
     if (!found)
         msg.respond("Unknown forwarded command {}"_format(name), true);
+}
+
+// A hop of an onion request from another storage server, in oxenmq's sn.onion_request encoding.
+// The reply carries oxenmq's two parts, status code and body, as a bt list.
+void QUIC::handle_sn_onion_request(quic::message msg) {
+    auto respond = [msg](int code, std::string_view body) {
+        msg.respond(oxenc::bt_serialize(oxenc::bt_list{code, std::string{body}}));
+    };
+
+    std::string_view payload;
+    rpc::OnionRequestMetadata data;
+    try {
+        auto decoded = OMQ::decode_onion_data(msg.body());
+        payload = decoded.first;
+        data = std::move(decoded.second);
+    } catch (const std::exception& e) {
+        auto err = "Invalid internal onion request: "s + e.what();
+        log::error(logcat, "{}", err);
+        return respond(http::BAD_REQUEST.first, err);
+    }
+
+    data.cb = [respond](rpc::Response res) {
+        if (auto* js = std::get_if<nlohmann::json>(&res.body))
+            respond(res.status.first, js->dump());
+        else if (auto* binary = std::get_if<std::span<const std::byte>>(&res.body))
+            respond(res.status.first,
+                    {reinterpret_cast<const char*>(binary->data()), binary->size()});
+        else
+            respond(res.status.first, rpc::view_body(res));
+    };
+
+    if (data.hop_no > rpc::MAX_ONION_HOPS)
+        return data.cb({http::BAD_REQUEST, "onion request max path length exceeded"sv});
+
+    request_handler_->process_onion_req(payload, std::move(data));
 }
 
 void QUIC::handle_onion_request(quic::message msg) {

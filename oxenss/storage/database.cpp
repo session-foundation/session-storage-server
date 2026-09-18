@@ -154,6 +154,10 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
                     "Upgrading database schema: adding swarm space cache, runtime state, "
                     "retryable requests, and public namespace unique constraint");
 
+            // All or nothing: the guard above is the existence of state_kv, created last, so a
+            // partial upgrade would fail on the ALTER TABLE at every subsequent start.
+            SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
+
             // swarm space is 64-bit unsigned, which means unfortunately we can't do queries
             // on it with arithmetic properly (sqlite INTEGER is 64-bit signed).  As such, we
             // store it as two separate columns so we can query on it.
@@ -261,6 +265,8 @@ ON messages(owner, namespace)
 WHERE namespace < 0 AND namespace % 20 = -1;
 
             )");
+
+            transaction.commit();
         }
 
         // Unreleased development builds created state_kv with a TEXT value column holding a

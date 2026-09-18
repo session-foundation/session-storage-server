@@ -79,7 +79,7 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     }
 
     if (needs_db_dump)
-        service_node_->set_member_needs_db_dump(*pk);
+        service_node_->queue_swarm_dump(*pk);
 
     log::debug(logcat, "sn.data_ready from {} processed (needs db dump: {})", *pk, needs_db_dump);
     message.send_reply("OK");
@@ -94,13 +94,10 @@ void OMQ::handle_sn_data(oxenmq::Message& message) {
     }
 
     // TODO: process push batch should move to "Request handler"
-    service_node_->process_push_batch(message.data[0], message.conn.to_string());
+    if (!service_node_->process_push_batch(message.data[0], message.conn.to_string()))
+        return message.send_reply("Failed to store messages");
 
-    log::debug(logcat, "[OMQ] send reply");
-
-    // TODO: Investigate if the above could fail and whether we should report
-    // that to the sending SN
-    message.send_reply();
+    message.send_reply("OK");
 };
 
 void OMQ::handle_ping(oxenmq::Message& message) {

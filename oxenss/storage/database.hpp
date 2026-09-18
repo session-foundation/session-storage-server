@@ -267,16 +267,49 @@ class Database {
     // to take several seconds longer to execute, per call.
     int64_t retry_request_count();
 
-    // executes the provided callback for every swarm message (in batches) for the swarm with the
-    // given swarm space boundaries.  The lower bound is exclusive; the upper inclusive.
-    // if the lower bound is higher than the upper bound (i.e. overflow wrapping), will be called
-    // recursively on both sides of the overflow.  In this case, zero as the lower bound *will*
-    // be inclusive
-    void foreach_swarm_message(
-            std::function<void(const std::vector<message>&)> callback,
-            uint64_t lower_bound,
-            uint64_t upper_bound,
-            bool zero_inclusive = false);
+    // Swarm space ranges below are (lower, upper] on the circular uint64 swarm space, as returned
+    // by Network::get_swarm_boundaries(): lower < upper is an ordinary interval, lower > upper
+    // wraps around past UINT64_MAX, and lower == upper (only when there is a single swarm) is the
+    // whole space.
+
+    // True if any message owner falls in the given swarm space range.
+    bool has_owners_in_range(uint64_t lower, uint64_t upper);
+
+    // The highest message id in the database, or 0 if there are no messages.
+    int64_t max_message_id();
+
+    // A queued or in-progress dump of our messages to another service node: every message with id
+    // in [next_id, end_id] whose owner is in `swarm`'s swarm space range still has to be sent.
+    struct pending_dump {
+        crypto::legacy_pubkey pubkey;
+        uint64_t swarm;
+        int64_t next_id;
+        int64_t end_id;
+        std::chrono::system_clock::time_point next_attempt;
+    };
+
+    // Queues a dump to `pubkey` of all current messages (up to and including `end_id`) for the
+    // given swarm.  If a dump to that node for that swarm is already queued it is restarted from
+    // the beginning with the later end id, so that nothing the new request covers is skipped.
+    void queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, int64_t end_id);
+
+    std::vector<pending_dump> pending_dumps();
+
+    // Records progress on a dump: `next_id` is the first id not yet confirmed received, and
+    // `next_attempt` the earliest time to send more.
+    void update_dump(
+            const crypto::legacy_pubkey& pubkey,
+            uint64_t swarm,
+            int64_t next_id,
+            std::chrono::system_clock::time_point next_attempt);
+
+    void remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm);
+
+    // Returns the next batch of a dump: messages with id in [from_id, end_id] whose owner is in the
+    // swarm space range, in id order, stopping after the message that takes the batch past
+    // `byte_budget`.  The second element is the id of the last message returned (0 if none).
+    std::pair<std::vector<message>, int64_t> next_dump_batch(
+            int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget);
 
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.

@@ -5,7 +5,6 @@
 #include <SQLiteCpp/Transaction.h>
 #include <session/sqlite.hpp>
 #include <oxenss/logging/oxen_logger.h>
-#include <limits>
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 #include <oxenss/common/format.h>
@@ -265,6 +264,19 @@ WHERE namespace < 0 AND namespace % 20 = -1;
 
             )");
         }
+
+        // Not part of the block above: databases that already went through it exist, and this is
+        // cheap to apply unconditionally.
+        db.exec(R"(
+CREATE TABLE IF NOT EXISTS pending_dumps (
+    pubkey BLOB NOT NULL,
+    swarm INTEGER NOT NULL,
+    next_id INTEGER NOT NULL,
+    end_id INTEGER NOT NULL,
+    next_attempt DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY(pubkey, swarm)
+);
+        )");
 
         views_triggers_indices();
         log::info(logcat, "Database setup complete");
@@ -1171,62 +1183,125 @@ int64_t Database::retry_request_count() {
     return conn.prepared_get<int64_t>("SELECT COUNT(*) from retry_node_reqs");
 }
 
-void Database::foreach_swarm_message(
-        std::function<void(const std::vector<message>&)> callback,
-        uint64_t lower_bound,
-        uint64_t upper_bound,
-        bool zero_inclusive) {
+namespace {
 
-    if (lower_bound > upper_bound) {
-        foreach_swarm_message(callback, lower_bound, std::numeric_limits<uint64_t>::max());
-        foreach_swarm_message(callback, 0, upper_bound, /*zero_inclusive=*/true);
-        return;
+    // WHERE fragment selecting owners in the (lower, upper] swarm space range, using parameters
+    // ?1-?4 for the high and low 32-bit halves of lower and upper.  Swarm space is unsigned 64-bit
+    // and sqlite integers are signed, so the halves are stored separately and compared as a row
+    // value.
+    std::string swarm_range_sql(uint64_t lower, uint64_t upper) {
+        if (lower == upper)
+            return "1";
+        return "((owners.swarm_space_hi, owners.swarm_space_lo) > (?1, ?2) {}"
+               " (owners.swarm_space_hi, owners.swarm_space_lo) <= (?3, ?4))"_format(
+                       lower < upper ? "AND" : "OR");
     }
 
+    void bind_swarm_range(SQLite::Statement& st, uint64_t lower, uint64_t upper) {
+        if (lower == upper)
+            return;
+        st.bind(1, static_cast<int64_t>(lower >> 32));
+        st.bind(2, static_cast<int64_t>(lower & 0xffffffff));
+        st.bind(3, static_cast<int64_t>(upper >> 32));
+        st.bind(4, static_cast<int64_t>(upper & 0xffffffff));
+    }
+
+}  // namespace
+
+bool Database::has_owners_in_range(uint64_t lower, uint64_t upper) {
     auto conn = db_->conn();
+    SQLite::Statement st{
+            conn.sql,
+            "SELECT EXISTS(SELECT 1 FROM owners WHERE {})"_format(swarm_range_sql(lower, upper))};
+    bind_swarm_range(st, lower, upper);
+    st.executeStep();
+    return get<int64_t>(st) != 0;
+}
 
-    constexpr size_t batch_size = 100;
+int64_t Database::max_message_id() {
+    return db_->conn().prepared_get<int64_t>("SELECT COALESCE(MAX(id), 0) FROM messages");
+}
 
-    std::optional<SQLite::Statement> statement;
+void Database::queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, int64_t end_id) {
+    auto conn = db_->conn();
+    conn.prepared_exec(
+            "INSERT INTO pending_dumps (pubkey, swarm, next_id, end_id) VALUES (?, ?, 1, ?)"
+            " ON CONFLICT (pubkey, swarm) DO UPDATE SET"
+            " next_id = 1, end_id = MAX(pending_dumps.end_id, excluded.end_id), next_attempt = 0",
+            pubkey.str(),
+            static_cast<int64_t>(swarm),
+            end_id);
+}
 
-    // weird case of their exists exactly one swarm, which should be impossible
-    if (lower_bound == upper_bound) {
-        statement = SQLite::Statement{
-                conn.sql,
-                "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
-                " FROM owned_messages ORDER BY mid"};
-    } else {
-        // Not via the owned_messages view: the range filter needs owners.swarm_space_{hi,lo},
-        // which the view does not carry, and joining owners onto the view to get them makes
-        // `type` and `pubkey` ambiguous.
-        std::string query = R"(
-SELECT owners.type, owners.pubkey, messages.hash, messages.namespace,
+std::vector<Database::pending_dump> Database::pending_dumps() {
+    auto conn = db_->conn();
+    std::vector<pending_dump> result;
+    for (auto& [pk, swarm, next_id, end_id, next_attempt] :
+         get_all<std::string, int64_t, int64_t, int64_t, double>(conn.prepared_st(
+                 "SELECT pubkey, swarm, next_id, end_id, next_attempt FROM pending_dumps")))
+        result.push_back(
+                {crypto::legacy_pubkey::from_bytes(pk),
+                 static_cast<uint64_t>(swarm),
+                 next_id,
+                 end_id,
+                 from_epoch_double(next_attempt)});
+    return result;
+}
+
+void Database::update_dump(
+        const crypto::legacy_pubkey& pubkey,
+        uint64_t swarm,
+        int64_t next_id,
+        std::chrono::system_clock::time_point next_attempt) {
+    auto conn = db_->conn();
+    conn.prepared_exec(
+            "UPDATE pending_dumps SET next_id = ?, next_attempt = ? WHERE pubkey = ? AND swarm = ?",
+            next_id,
+            to_epoch_double(next_attempt),
+            pubkey.str(),
+            static_cast<int64_t>(swarm));
+}
+
+void Database::remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm) {
+    auto conn = db_->conn();
+    conn.prepared_exec(
+            "DELETE FROM pending_dumps WHERE pubkey = ? AND swarm = ?",
+            pubkey.str(),
+            static_cast<int64_t>(swarm));
+}
+
+std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
+        int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget) {
+    auto conn = db_->conn();
+    SQLite::Statement st{
+            conn.sql,
+            R"(
+SELECT messages.id, owners.type, owners.pubkey, messages.hash, messages.namespace,
        messages.timestamp, messages.expiry, messages.data
 FROM messages JOIN owners ON messages.owner = owners.id
-WHERE
-        )";
-        query += R"(
-    (owners.swarm_space_hi >{0} ?1 OR (owners.swarm_space_hi == ?1 AND owners.swarm_space_lo >{0} ?2))
-    AND
-    (owners.swarm_space_hi < ?3 OR (owners.swarm_space_hi == ?3 AND owners.swarm_space_lo <= ?4))
-ORDER BY messages.id;
-        )"_format(zero_inclusive ? "=" : "");
+WHERE messages.id >= ?5 AND messages.id <= ?6 AND {}
+ORDER BY messages.id)"_format(swarm_range_sql(lower, upper))};
+    bind_swarm_range(st, lower, upper);
+    st.bind(5, from_id);
+    st.bind(6, end_id);
 
-        statement = SQLite::Statement{conn.sql, query};
-
-        int pos = 1;
-        statement->bind(pos++, (int64_t)(lower_bound >> 32));
-        statement->bind(pos++, (int64_t)(lower_bound & 0xffffffff));
-        statement->bind(pos++, (int64_t)(upper_bound >> 32));
-        statement->bind(pos++, (int64_t)(upper_bound & 0xffffffff));
-    }
-
-    auto& st = *statement;
-    std::vector<message> messages;
-    while (st.executeStep()) {
-        auto [type, pubkey, hash, ns, ts, exp, data] =
-                get<uint8_t, std::string, std::string, namespace_id, int64_t, int64_t, std::string>(
-                        st);
+    std::pair<std::vector<message>, int64_t> result{{}, 0};
+    auto& [messages, last_id] = result;
+    size_t size = 0;
+    while (size < byte_budget && st.executeStep()) {
+        auto [id, type, pubkey, hash, ns, ts, exp, data] =
+                get<int64_t,
+                    uint8_t,
+                    std::string,
+                    std::string,
+                    namespace_id,
+                    int64_t,
+                    int64_t,
+                    std::string>(st);
+        // Approximately the serialized size; the constant covers the pubkey, timestamps, namespace
+        // and bt framing.
+        size += data.size() + hash.size() + 80;
+        last_id = id;
         messages.emplace_back(
                 load_pubkey(type, pubkey),
                 std::move(hash),
@@ -1234,13 +1309,8 @@ ORDER BY messages.id;
                 from_epoch_ms(ts),
                 from_epoch_ms(exp),
                 std::move(data));
-        if (messages.size() >= batch_size) {
-            callback(messages);
-            messages.clear();
-        }
     }
-    if (messages.size())
-        callback(messages);
+    return result;
 }
 
 void Database::remove_node_retry_request(int64_t req_id) {

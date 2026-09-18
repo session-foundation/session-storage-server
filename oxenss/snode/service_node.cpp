@@ -56,6 +56,19 @@ constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
 // original request since the peer has already failed to answer within that once.
 constexpr auto RETRY_REQUEST_TIMEOUT = 10s;
 
+// Dumps of swarm messages to another node go out in batches of about this many bytes, with at most
+// DUMP_WINDOW batches unacknowledged at once.  Together these bound how much of the connection to
+// that node a dump occupies (everything else sent to it, onion requests included, queues behind
+// the batches in flight) while still filling a 100Mbit link at a few hundred ms of latency.
+constexpr size_t DUMP_BATCH_BYTES = 1'000'000;
+constexpr int DUMP_WINDOW = 5;
+constexpr auto DUMP_REQUEST_TIMEOUT = 30s;
+// How long a dump pauses after a batch fails or when the node is not contactable.
+constexpr auto DUMP_RETRY_DELAY = 15s;
+// How often to look for dumps that are due to start or resume; once running they are driven by the
+// acknowledgements.
+constexpr auto DUMP_CHECK_INTERVAL = 5s;
+
 ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
@@ -115,6 +128,7 @@ ServiceNode::ServiceNode(
             1h);
 
     omq_server_->add_timer([this] { check_retry_requests(); }, RETRY_REQUEST_CHECK_INTERVAL);
+    omq_server_->add_timer([this] { check_dumps(); }, DUMP_CHECK_INTERVAL);
 }
 
 void ServiceNode::on_oxend_connected() {
@@ -527,20 +541,6 @@ void ServiceNode::check_new_members() {
                     c->pubkey_x25519.view(), "sn.data_ready", on_sn_data_ready_response);
         }
     }
-
-    if (auto send_now = swarm_.extract_contacts_needing_db_dump(); !send_now.empty()) {
-        log::debug(
-                logcat,
-                "Initiating swarm message dump to swarm member(s): {}",
-                fmt::join(send_now, ", "));
-        auto boundaries = network_.get_swarm_boundaries(swarm_.cur_swarm_id_);
-        db->foreach_swarm_message(
-                [&send_now, this](const std::vector<message>& messages) {
-                    relay_messages(messages, send_now);
-                },
-                boundaries.first,
-                boundaries.second);
-    }
 }
 
 static void write_metadata(
@@ -622,15 +622,16 @@ bool ServiceNode::process_store(
     return result != StoreResult::Full;
 }
 
-void ServiceNode::save_bulk(const std::vector<message>& msgs) {
+bool ServiceNode::save_bulk(const std::vector<message>& msgs) {
     try {
         db->bulk_store(msgs);
     } catch (const std::exception& e) {
         log::error(logcat, "failed to save batch to the database: {}", e.what());
-        return;
+        return false;
     }
 
     log::trace(logcat, "saved messages count: {}", msgs.size());
+    return true;
 }
 
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
@@ -764,10 +765,175 @@ void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
             params.dump());
 }
 
-void ServiceNode::set_member_needs_db_dump(const crypto::legacy_pubkey& pk) {
-    std::lock_guard lock{network().mut_};  // Use the same lock as Swarm member functions
-    if (SwarmMemberState* state = swarm_.is_member_locked(pk); state)
-        state->their_ss_needs_db_dump = true;
+void ServiceNode::queue_swarm_dump(const crypto::legacy_pubkey& pk) {
+    auto swarm = swarm_.our_swarm_id();
+    if (swarm == INVALID_SWARM_ID)
+        return;
+    queue_dump(pk, swarm);
+}
+
+void ServiceNode::queue_dump(const crypto::legacy_pubkey& pk, swarm_id_t swarm) {
+    // Anything stored after this point reaches the node through the normal store relay, so the
+    // dump stops here.
+    auto end_id = db->max_message_id();
+
+    std::lock_guard lock{dumps_mutex_};
+    db->queue_dump(pk, swarm, end_id);
+    dump_windows_.erase({pk, swarm});
+    log::info(logcat, "Queued dump of swarm {:x} messages (ids up to {}) to {}", swarm, end_id, pk);
+    check_dumps_locked();
+}
+
+void ServiceNode::check_dumps() {
+    std::lock_guard lock{dumps_mutex_};
+    check_dumps_locked();
+}
+
+void ServiceNode::check_dumps_locked() {
+    auto now = std::chrono::system_clock::now();
+    for (const auto& d : db->pending_dumps()) {
+        dump_key key{d.pubkey, d.swarm};
+        auto it = dump_windows_.find(key);
+        if (it == dump_windows_.end()) {
+            if (d.next_attempt > now)
+                continue;
+            it = dump_windows_
+                         .emplace(
+                                 key,
+                                 dump_window{
+                                         .next_id = d.next_id,
+                                         .end_id = d.end_id,
+                                         .sent_next_id = d.next_id,
+                                         .generation = ++dump_generation_})
+                         .first;
+        }
+        advance_dump(it->first, it->second);
+    }
+}
+
+void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
+    // Copies: erasing the window below invalidates the references.
+    const auto key = key_ref;
+    const auto& [pk, swarm] = key;
+
+    auto finish = [&] {
+        log::info(
+                logcat,
+                "Finished dump of {} swarm {:x} messages to {}",
+                w.sent_messages,
+                swarm,
+                pk);
+        db->remove_dump(pk, swarm);
+        dump_windows_.erase(key);
+    };
+
+    auto members = network_.get_swarm(swarm);
+    if (!members || !members->count(pk)) {
+        log::info(logcat, "Dropping dump to {}: no longer a member of swarm {:x}", pk, swarm);
+        db->remove_dump(pk, swarm);
+        dump_windows_.erase(key);
+        return;
+    }
+
+    if (w.exhausted) {
+        if (w.in_flight == 0)
+            finish();
+        return;
+    }
+    if (w.in_flight >= DUMP_WINDOW)
+        return;
+
+    auto ct = network_.contacts.find(pk);
+    if (!ct || !*ct) {
+        log::debug(logcat, "Pausing dump to {}: node is not currently contactable", pk);
+        db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
+        dump_windows_.erase(key);
+        return;
+    }
+
+    std::pair<uint64_t, uint64_t> bounds;
+    try {
+        bounds = network_.get_swarm_boundaries(swarm);
+    } catch (const std::logic_error&) {
+        // The swarm list changed between the membership check above and here; the next check will
+        // sort out whether the dump still applies.
+        return;
+    }
+
+    while (w.in_flight < DUMP_WINDOW) {
+        auto [msgs, last_id] = db->next_dump_batch(
+                w.sent_next_id, w.end_id, bounds.first, bounds.second, DUMP_BATCH_BYTES);
+        if (msgs.empty()) {
+            w.exhausted = true;
+            if (w.in_flight == 0)
+                finish();
+            return;
+        }
+
+        auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+        w.batches[last_id] = parts.size();
+        w.in_flight++;
+        w.sent_next_id = last_id + 1;
+        w.sent_messages += msgs.size();
+        log::debug(
+                logcat,
+                "Sending {} messages (through id {}) of swarm {:x} dump to {}",
+                msgs.size(),
+                last_id,
+                swarm,
+                pk);
+
+        for (auto& part : parts)
+            omq_server_->request(
+                    ct->pubkey_x25519.view(),
+                    "sn.data",
+                    [this, key, last_id, generation = w.generation](
+                            bool success, std::vector<std::string> data) {
+                        // Pre-2.12 nodes acknowledge with an empty reply.
+                        on_dump_batch_reply(
+                                key,
+                                last_id,
+                                generation,
+                                success && (data.empty() || data[0] == "OK"sv));
+                    },
+                    std::move(part),
+                    oxenmq::send_option::request_timeout{DUMP_REQUEST_TIMEOUT});
+    }
+}
+
+void ServiceNode::on_dump_batch_reply(
+        const dump_key& key, int64_t last_id, uint64_t generation, bool ok) {
+    std::lock_guard lock{dumps_mutex_};
+    auto it = dump_windows_.find(key);
+    if (it == dump_windows_.end() || it->second.generation != generation)
+        return;
+    auto& w = it->second;
+    const auto& [pk, swarm] = key;
+
+    if (!ok) {
+        log::info(
+                logcat,
+                "Dump batch to {} failed; resuming from message id {} in {}",
+                pk,
+                w.next_id,
+                DUMP_RETRY_DELAY);
+        db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
+        dump_windows_.erase(it);
+        return;
+    }
+
+    auto b = w.batches.find(last_id);
+    if (b == w.batches.end() || --b->second > 0)
+        return;
+    w.in_flight--;
+
+    while (!w.batches.empty() && w.batches.begin()->second == 0) {
+        w.next_id = w.batches.begin()->first + 1;
+        w.batches.erase(w.batches.begin());
+    }
+    db->update_dump(pk, swarm, w.next_id, {});
+
+    advance_dump(it->first, w);
 }
 
 void ServiceNode::process_snodes_update(std::string_view data) {
@@ -1058,74 +1224,25 @@ void ServiceNode::report_reachability(
     }
 }
 
-void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) const {
+void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) {
     std::lock_guard guard(sn_mutex_);
 
-    const std::set<swarm_id_t>* swarms_ptr = &swarms;
-    std::optional<std::set<swarm_id_t>> all_swarms;
-
-    if (swarms.empty()) {
+    std::set<swarm_id_t> targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
+    if (swarms.empty())
         log::info(logcat, "Bootstrapping all swarms");
-        all_swarms = network_.get_all_swarm_ids();
-        if (all_swarms->empty()) {
-            log::warning(logcat, "Bootstrapping all swarms, but there are none?");
-            return;
-        }
-        swarms_ptr = &*all_swarms;
-    } else if (logcat->level() <= log::Level::info)
-        log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(*swarms_ptr, ", "));
+    else if (logcat->level() <= log::Level::info)
+        log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(swarms, ", "));
 
-    for (const auto& swarm_id : *swarms_ptr) {
-        if (auto swarm = network_.get_swarm(swarm_id)) {
-            auto boundaries = network_.get_swarm_boundaries(swarm_id);
-            db->foreach_swarm_message(
-                    [&swarm, this](const std::vector<message>& messages) {
-                        relay_messages(messages, *swarm);
-                    },
-                    boundaries.first,
-                    boundaries.second);
-        }
-    }
-}
-
-void ServiceNode::relay_messages(
-        const std::vector<message>& messages, const std::set<crypto::legacy_pubkey>& snodes) const {
-    std::vector<std::string> batches =
-            serialize_messages(messages.begin(), messages.end(), SERIALIZATION_VERSION_BT);
-
-    if (logcat->level() <= log::Level::debug) {
-        log::debug(logcat, "Relaying messages:");
-        for (auto msg : batches)
-            log::trace(logcat, "    {}", msg);
-        log::debug(logcat, "To Snodes:");
-        for (auto sn : snodes)
-            log::debug(logcat, "    {}", sn);
-
-        log::debug(logcat, "Serialised batches: {}", batches.size());
-    }
-
-    for (const auto& sn : snodes) {
-        auto ct = network_.contacts.find(sn);
-        if (ct && *ct) {
-            for (auto& batch : batches) {
-                log::debug(
-                        logcat, "Relaying data to: {} (x25519 pubkey {})", sn, ct->pubkey_x25519);
-
-                omq_server_->request(
-                        ct->pubkey_x25519.view(),
-                        "sn.data",
-                        [](bool success, auto&& /*data*/) {
-                            if (!success)
-                                log::error(logcat, "Failed to relay batch data: timeout");
-                        },
-                        batch);
-            }
-        } else {
-            log::warning(
-                    logcat,
-                    "Unable to relay messages to {}: node is not currently contactable",
-                    sn);
-        }
+    for (const auto& swarm_id : targets) {
+        auto members = network_.get_swarm(swarm_id);
+        if (!members)
+            continue;
+        auto [lower, upper] = network_.get_swarm_boundaries(swarm_id);
+        if (!db->has_owners_in_range(lower, upper))
+            continue;
+        for (const auto& pk : *members)
+            if (pk != our_keys_.pub)
+                queue_dump(pk, swarm_id);
     }
 }
 
@@ -1265,9 +1382,9 @@ std::string ServiceNode::get_status_line() const {
             util::short_duration(window));
 }
 
-void ServiceNode::process_push_batch(std::string_view blob, std::string_view sender) {
+bool ServiceNode::process_push_batch(std::string_view blob, std::string_view sender) {
     if (blob.empty())
-        return;
+        return true;
 
     std::vector<message> items;
     try {
@@ -1278,15 +1395,12 @@ void ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
                 "Failed to deserialize incoming message batch from {}: {}",
                 sender,
                 e.what());
+        return false;
     }
-
-    log::trace(logcat, "Saving all: begin");
 
     log::debug(logcat, "Got {} messages from peers, size: {}", items.size(), blob.size());
 
-    save_bulk(items);
-
-    log::trace(logcat, "Saving all: end");
+    return save_bulk(items);
 }
 
 void ServiceNode::check_retry_requests() {

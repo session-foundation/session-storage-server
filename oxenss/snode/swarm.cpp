@@ -292,23 +292,6 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contact_pending_members() {
     return result;
 }
 
-std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
-    std::lock_guard lock{network.mut_};
-
-    std::set<crypto::legacy_pubkey> result;
-    for (auto& it : members_) {
-        if (it.second.status == SwarmMemberStatus::Ready) {
-            const crypto::legacy_pubkey& pk = it.first;
-            if (it.second.their_ss_needs_db_dump) {
-                it.second.their_ss_needs_db_dump = false;
-                result.insert(pk);
-            }
-        }
-    }
-
-    return result;
-}
-
 namespace {
 
     // The fields we publish about a swarm member, listed once so that the json and bt encodings

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -127,8 +128,9 @@ class ServiceNode {
 
     void send_notifies(message m);
 
-    // Save multiple messages to the database at once (i.e. in a single transaction)
-    void save_bulk(const std::vector<message>& msgs);
+    // Save multiple messages to the database at once (i.e. in a single transaction).  Returns
+    // false if they could not be saved.
+    bool save_bulk(const std::vector<message>& msgs);
 
     void process_snodes_update(std::string_view data);
 
@@ -136,14 +138,47 @@ class ServiceNode {
 
     void on_snodes_update(block_update&& bu);
 
-    // Called periodically to attempt to initiate transfers to new snode members
+    // Called periodically to handshake with new swarm members (asking them for a dump of the
+    // swarm's messages if we need one).
     void check_new_members();
 
     // Called if our oxend looks like it is missing lots of records when we first get data from it
     // to load initial data (especially contact info) from the bootstrap nodes.
     void bootstrap_fallback();
 
-    void bootstrap_swarms(const std::set<swarm_id_t>& swarms = {}) const;
+    // Queues dumps of the messages we hold for each of the given swarms (all swarms, if empty) to
+    // that swarm's members.  Used when a new swarm appears next to ours, and when our own swarm
+    // dissolves.
+    void bootstrap_swarms(const std::set<swarm_id_t>& swarms = {});
+
+    // Dumps of our messages to other nodes.  Each dump is a database row holding the persisted
+    // cursor (see Database::pending_dump) plus, while it is being sent, one of these tracking the
+    // batches in flight.  Batches are acknowledged individually and possibly out of order, so the
+    // persisted cursor advances only across the contiguous prefix of acknowledged batches.
+    struct dump_window {
+        int64_t next_id;                 // first id not yet acknowledged; mirrors the database row
+        int64_t end_id;                  // last id the dump covers
+        int64_t sent_next_id;            // first id not yet sent
+        std::map<int64_t, int> batches;  // last id of each sent batch -> parts awaiting an ack
+        int in_flight = 0;               // batches with parts awaiting an ack
+        bool exhausted = false;          // nothing left to send before end_id
+        uint64_t generation;             // tells acks for a discarded window from a restarted one
+        int64_t sent_messages = 0;
+    };
+    using dump_key = std::pair<crypto::legacy_pubkey, swarm_id_t>;
+    std::mutex dumps_mutex_;
+    std::map<dump_key, dump_window> dump_windows_;
+    uint64_t dump_generation_ = 0;
+
+    void queue_dump(const crypto::legacy_pubkey& pk, swarm_id_t swarm);
+    // Periodic: starts or resumes any dump that is due.
+    void check_dumps();
+    // The following require dumps_mutex_ to be held.
+    void check_dumps_locked();
+    // Sends batches of the dump until the window is full or the dump is finished.  `key` and `w`
+    // may be invalidated (the window erased) by this call.
+    void advance_dump(const dump_key& key, dump_window& w);
+    void on_dump_batch_reply(const dump_key& key, int64_t last_id, uint64_t generation, bool ok);
 
     /// Distribute all our data to where it belongs
     /// (called when our old node got dissolved)
@@ -154,10 +189,6 @@ class ServiceNode {
             const std::string& blob,
             const crypto::legacy_pubkey& snpk,
             const contact& ct) const;  // mutex not needed
-
-    void relay_messages(
-            const std::vector<message>& msgs,
-            const std::set<crypto::legacy_pubkey>& snodes) const;  // mutex not needed
 
     // Conducts any ping peer tests that are due; (this is designed to be called frequently and
     // does nothing if there are no tests currently due).
@@ -257,8 +288,9 @@ class ServiceNode {
             bool* new_msg = nullptr,
             std::chrono::system_clock::time_point* expiry = nullptr);
 
-    /// Process incoming blob of messages: add to DB if new
-    void process_push_batch(std::string_view blob, std::string_view sender);
+    /// Process incoming blob of messages: add to DB if new.  Returns false if the blob could not be
+    /// decoded or the messages could not be stored.
+    bool process_push_batch(std::string_view blob, std::string_view sender);
 
     // Stats for session clients that want to know the version number
     std::string get_stats_for_session_client() const;
@@ -280,11 +312,10 @@ class ServiceNode {
     // Called when oxend notifies us of a new block to update swarm info
     void update_swarms(std::promise<bool>* on_completion = nullptr);
 
-    // Mark the swarm member identified by 'pk' as needing a dump of the DB. When the 'check new
-    // members' routine for swarms is periodically executed, swarm members marked with this flag
-    // will then get the entire DB synchronised to them. No-op if the key does not match anyone in
-    // the swarm.
-    void set_member_needs_db_dump(const crypto::legacy_pubkey& pk);
+    // Queues a dump to `pk` of all the messages we currently hold for our swarm.  Called when a
+    // swarm member asks for one in its sn.data_ready handshake.  Does nothing if we are not in a
+    // swarm.
+    void queue_swarm_dump(const crypto::legacy_pubkey& pk);
 
     server::OMQ& omq_server() { return omq_server_; }
 

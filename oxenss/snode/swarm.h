@@ -50,8 +50,7 @@ struct SwarmEvents {
 };
 
 enum struct SwarmMemberStatus {
-    // Pubkeys of new members into our swarm who we haven't yet established communications with;
-    // once we do, we push all our swarm's messages to them.
+    // A member we have not yet completed an sn.data_ready handshake with.
     ContactDetailsPending,
     Ready,
 };
@@ -70,12 +69,6 @@ struct SwarmMemberState {
     // member. 'Nil' if no action is to be taken, otherwise this flag transition from
     // 'NeedsToRequest' to 'RequestUnderway' to 'Done' via the outgoing data ready handshake.
     SwarmRequestedDBDump our_ss_requested_db_dump;
-
-    // Set if this swarm member has requested a DB dump from us in the data ready handshake. If set
-    // they are assumed to not have any of the messages for the swarm yet so a full DB dump will be
-    // initiated for messages we own that belong to the swarm when the 'check new members' routine
-    // occurs.
-    bool their_ss_needs_db_dump;
 
     // The earliest timestamp at which the swarm will check if they have received contact
     // information for this member yet and can send them data. Only utilised when status is
@@ -159,10 +152,6 @@ class Swarm {
     // contacted to establish liveness in prep for transitioning to a contact that we can push swarm
     // messages to.
     std::set<crypto::legacy_pubkey> extract_contact_pending_members();
-
-    // Returns the pubkeys of any new swarm members that have joined that we now have contact
-    // details for, mark them as ready and need a dump of the DB.
-    std::set<crypto::legacy_pubkey> extract_contacts_needing_db_dump();
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

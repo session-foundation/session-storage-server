@@ -12,6 +12,7 @@ namespace oxenss::snode {
 Network::Network(oxenmq::OxenMQ& omq) : contacts{omq} {}
 
 std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm) const {
+    std::shared_lock lock{mut_};
     if (swarms_.size() <= 1)
         return {0, 0};
 
@@ -180,6 +181,7 @@ std::shared_ptr<std::vector<std::byte>> Network::all_nodes_blob() const {
 }
 
 std::set<swarm_id_t> Network::get_all_swarm_ids() const {
+    std::shared_lock lock{mut_};
     std::set<swarm_id_t> ret;
 
     for (const auto& [id, swarm] : swarms_)

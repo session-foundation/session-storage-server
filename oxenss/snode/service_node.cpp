@@ -56,32 +56,6 @@ constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
 // original request since the peer has already failed to answer within that once.
 constexpr auto RETRY_REQUEST_TIMEOUT = 10s;
 
-// TODO: if these *are* going to be named constants rather than just existing in 2 places
-//       (where this is serialized and where it is deserialized), they should live in the header
-//       or something.
-namespace data_ready_req {
-    constexpr std::string_view VERSION_KEY = "@";
-    constexpr std::string_view STATUS_KEY = "s";
-    constexpr std::string_view NEED_DB_DUMP_KEY = "t";
-}  // namespace data_ready_req
-
-std::string serialise_data_ready_request(bool needs_db_dump) {
-    uint32_t version = 0;
-    static_assert(data_ready_req::VERSION_KEY < data_ready_req::STATUS_KEY);
-    static_assert(data_ready_req::STATUS_KEY < data_ready_req::NEED_DB_DUMP_KEY);
-
-    oxenc::bt_dict_producer d;
-    d.append(data_ready_req::VERSION_KEY, version);
-    d.append(data_ready_req::NEED_DB_DUMP_KEY, needs_db_dump);
-    return std::move(d).str();
-}
-
-bool deserialise_data_ready_request(std::string_view data) {
-    oxenc::bt_dict_consumer d{data};
-    [[maybe_unused]] auto version = d.require<uint8_t>(data_ready_req::VERSION_KEY);
-    return d.require<bool>(data_ready_req::NEED_DB_DUMP_KEY);
-}
-
 ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
@@ -417,10 +391,6 @@ bool ServiceNode::snode_ready(std::string* reason) {
     return problems.empty() || force_start_;
 }
 
-std::optional<SwarmMemberState> ServiceNode::is_swarm_peer(const crypto::x25519_pubkey& xpk) {
-    return swarm_.is_member(xpk);
-}
-
 void ServiceNode::send_onion_to_sn(
         const contact& ct,
         std::string_view payload,
@@ -535,8 +505,12 @@ void ServiceNode::check_new_members() {
                 }
             }
 
-            // Serialise our response and send it off
-            auto serialised = snode::serialise_data_ready_request(needs_db_dump);
+            // Request payload: "@" is the format version (the receiver rejects versions it does
+            // not know), "t" is whether we want the peer to send us its copy of the swarm's
+            // messages.
+            oxenc::bt_dict_producer d;
+            d.append("@", 0);
+            d.append("t", needs_db_dump);
             log::debug(
                     logcat,
                     "Initiating contact with new swarm member {}{}",
@@ -546,7 +520,7 @@ void ServiceNode::check_new_members() {
                     c->pubkey_x25519.view(),
                     "sn.data_ready",
                     on_sn_data_ready_response,
-                    std::move(serialised));
+                    std::move(d).str());
         } else {
             log::debug(logcat, "Initiating contact with new swarm member {}", pk);
             omq_server_->request(

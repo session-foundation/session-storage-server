@@ -58,37 +58,30 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
 
     crypto::x25519_pubkey xpk;
     std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
-    if (!service_node_->is_swarm_peer(xpk))
+    auto pk = service_node_->contacts().lookup(xpk);
+    if (!pk || !service_node_->swarm().is_member(*pk))
         return message.send_reply("Swarm mismatch");
 
-    std::optional<oxenss::snode::contact> ct = service_node_->contacts().find(xpk);
-    if (!ct)
-        return message.send_reply("Contact info missing");
-
-    if (ct->version >= snode::SN_DATA_READY_WITH_REQUEST_VERSION) {
-        if (message.data.empty())
-            return message.send_reply("Request payload missing");
-
-        bool needs_db_dump{false};
+    // Storage servers before SN_DATA_READY_WITH_REQUEST_VERSION send a bare request: they are just
+    // checking that we are reachable before pushing their messages to us, and never ask for ours.
+    bool needs_db_dump = false;
+    if (!message.data.empty()) {
         try {
-            needs_db_dump = snode::deserialise_data_ready_request(message.data[0]);
+            oxenc::bt_dict_consumer d{message.data[0]};
+            if (auto version = d.require<uint32_t>("@"); version != 0)
+                return message.send_reply(
+                        fmt::format("Unsupported sn.data_ready request version {}", version));
+            needs_db_dump = d.require<bool>("t");
         } catch (const std::exception& e) {
-            log::info(logcat, "DataReadyRequest deserialization error: {}", e.what());
-            return message.send_reply("Request payload malformed.");
-        }
-
-        if (needs_db_dump)
-            service_node_->set_member_needs_db_dump(crypto::legacy_pubkey{ct->pubkey_ed25519});
-
-        if (log::get_level(logcat) <= log::Level::debug) {
-            log::debug(
-                    logcat,
-                    "sn.data ready processed (edpk: {}, needs db dump: {})",
-                    ct->pubkey_ed25519,
-                    needs_db_dump);
+            log::info(logcat, "Malformed sn.data_ready request from {}: {}", *pk, e.what());
+            return message.send_reply("Request payload malformed");
         }
     }
 
+    if (needs_db_dump)
+        service_node_->set_member_needs_db_dump(*pk);
+
+    log::debug(logcat, "sn.data_ready from {} processed (needs db dump: {})", *pk, needs_db_dump);
     message.send_reply("OK");
 }
 

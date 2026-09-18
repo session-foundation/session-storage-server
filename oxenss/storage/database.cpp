@@ -433,6 +433,23 @@ CREATE TABLE messages (
 
         SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
 
+        // Earlier releases defined messages_owner with a trailing timestamp column; see the CREATE
+        // INDEX below for why it is gone.  (The lookup is finished before the DROP: a statement
+        // still open on sqlite_master locks the schema against it.)
+        bool old_messages_owner = false;
+        {
+            SQLite::Statement st{
+                    db,
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = "
+                    "'messages_owner'"};
+            old_messages_owner = st.executeStep() &&
+                                 st.getColumn(0).getString().find("timestamp") != std::string::npos;
+        }
+        if (old_messages_owner) {
+            log::info(logcat, "Upgrading database schema: rebuilding messages_owner index");
+            db.exec("DROP INDEX messages_owner");
+        }
+
         db.exec(R"(
 CREATE TRIGGER IF NOT EXISTS owner_autoclean
     AFTER DELETE ON messages FOR EACH ROW WHEN NOT EXISTS (SELECT * FROM messages WHERE owner = old.owner)
@@ -441,8 +458,14 @@ CREATE TRIGGER IF NOT EXISTS owner_autoclean
     END;
 
 CREATE INDEX IF NOT EXISTS messages_expiry ON messages(expiry);
-CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, namespace, timestamp);
-CREATE INDEX IF NOT EXISTS messages_hash ON messages(hash);
+
+-- Every index entry ends in the rowid, so within one (owner, namespace) this index is in id order,
+-- which lets retrieve() page by id from its last-hash cursor straight off the index.  A trailing
+-- timestamp column here would order ties by that instead and force a sort on every retrieve.
+CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, namespace);
+
+-- UNIQUE(hash) on the table already provides this index; earlier releases created a duplicate.
+DROP INDEX IF EXISTS messages_hash;
 
 DROP INDEX IF EXISTS owners_swarm_hi;
 DROP INDEX IF EXISTS owners_swarm_lo;
@@ -1368,6 +1391,10 @@ std::vector<crypto::legacy_pubkey> Database::delivery_peers() {
 std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_batch(
         const crypto::legacy_pubkey& pubkey, size_t byte_budget) {
     auto conn = db_->conn();
+    // Ordered by pending_deliveries.message rather than the equal messages.id: the primary key
+    // (pubkey, message) already yields the peer's rows in that order, but the planner does not
+    // carry the join equality into ORDER BY and would sort the whole backlog before the byte
+    // budget could stop the scan.
     auto st = conn.prepared_st(
             "SELECT messages.id, owners.type, owners.pubkey, hash, namespace, timestamp, expiry,"
             " data"
@@ -1375,7 +1402,7 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
             " JOIN messages ON messages.id = pending_deliveries.message"
             " JOIN owners ON owners.id = messages.owner"
             " WHERE pending_deliveries.pubkey = ?"
-            " ORDER BY messages.id");
+            " ORDER BY pending_deliveries.message");
     st->bind(1, pubkey.str());
 
     std::pair<std::vector<message>, std::vector<int64_t>> result;

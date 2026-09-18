@@ -14,6 +14,8 @@ Available schemas:
     messages(id INTEGER PK, hash TEXT UNIQUE, owner→owners, namespace INTEGER,
              timestamp INTEGER, expiry INTEGER, data BLOB)
     revoked_subaccounts(owner→owners, token BLOB, timestamp INTEGER)
+    indices: messages_expiry(expiry), messages_owner(owner, namespace, timestamp),
+             messages_hash(hash) — the latter a duplicate of the UNIQUE(hash) autoindex
 
   post-swarm-space  (current)
     owners: added swarm_space_hi INTEGER, swarm_space_lo INTEGER
@@ -21,6 +23,8 @@ Available schemas:
              via custom SQLite functions func_swarm_space_hi/lo registered by C++ at open time)
             new trigger: swarm_space_trigger auto-populates these on INSERT
             new index: owners_swarm(swarm_space_hi, swarm_space_lo)
+    indices: messages_owner rebuilt as (owner, namespace) — ordered by id within an account's
+             namespace so retrieve pages without sorting; messages_hash dropped
     messages: public outbox namespaces (namespace < 0 AND namespace % 20 = -1, i.e. -1,-21,-41,…)
               reduced to the newest message per (owner, namespace) (by timestamp, then id), then
               UNIQUE INDEX message_outbox_singleton added on (owner, namespace) — enforces the
@@ -61,6 +65,10 @@ CREATE TABLE revoked_subaccounts (
     token BLOB NOT NULL,
     timestamp INTEGER NOT NULL DEFAULT (CAST((julianday('now') - 2440587.5)*86400000 AS INTEGER))
 );
+
+CREATE INDEX messages_expiry ON messages(expiry);
+CREATE INDEX messages_owner ON messages(owner, namespace, timestamp);
+CREATE INDEX messages_hash ON messages(hash);
 """)
 
     # Pubkeys: 32-byte blobs (type prefix stored separately in the type column).

@@ -1331,7 +1331,7 @@ ORDER BY messages.id)"_format(swarm_range_sql(lower, upper))};
 
 void Database::remove_node_retry_request(int64_t req_id) {
     auto conn = db_->conn();
-    conn.prepared_exec("DELETE FROM retry_node_reqs WHERE id = ?", req_id);
+    conn.prepared_exec("DELETE FROM retry_node_requests WHERE id = ?", req_id);
 }
 
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {

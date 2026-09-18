@@ -567,6 +567,38 @@ TEST_CASE("storage - ready retry requests", "[storage]") {
     CHECK(saw("cmd3"));
 }
 
+TEST_CASE("storage - removing retry requests", "[storage]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    const auto pk1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto pk2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+
+    // One request, retried to two nodes
+    auto req = storage.add_retry_request(pk1, "cmd", "payload");
+    storage.add_retry_request(pk2, "cmd", "payload", req);
+    REQUIRE(storage.retry_request_count() == 2);
+
+    TestSuiteHacks::db_backdate_retries(storage, 1h);
+    std::vector<int64_t> node_reqs;
+    storage.foreach_ready_retry_request(
+            [&node_reqs](const auto&, const auto&, const auto&, int64_t id) {
+                node_reqs.push_back(id);
+                return true;
+            });
+    REQUIRE(node_reqs.size() == 2);
+
+    storage.remove_node_retry_request(node_reqs[0]);
+    CHECK(storage.retry_request_count() == 1);
+    storage.remove_node_retry_request(node_reqs[1]);
+    CHECK(storage.retry_request_count() == 0);
+
+    // The request itself goes with its last node entry, so it can no longer be added to:
+    CHECK_THROWS(storage.add_retry_request(pk1, "cmd", "payload", req));
+}
+
 TEST_CASE("storage - swarm space range queries", "[storage][swarm]") {
     StorageDeleter fixture;
     Database storage{"."};

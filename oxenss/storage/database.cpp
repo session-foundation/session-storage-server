@@ -432,10 +432,7 @@ DROP INDEX IF EXISTS owners_swarm_hi;
 DROP INDEX IF EXISTS owners_swarm_lo;
 CREATE INDEX IF NOT EXISTS owners_swarm ON owners(swarm_space_hi, swarm_space_lo);
 
-CREATE VIEW IF NOT EXISTS owned_messages AS
-    SELECT owners.id AS oid, type, pubkey, messages.id AS mid, hash, namespace, timestamp, expiry, data
-    FROM messages JOIN owners ON messages.owner = owners.id;
-
+DROP VIEW IF EXISTS owned_messages;
 DROP TRIGGER IF EXISTS owned_messages_insert;
 DROP TRIGGER IF EXISTS owned_messages_upsert;
 )");
@@ -563,8 +560,8 @@ int64_t Database::get_used_bytes() {
 std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     auto conn = db_->conn();
     auto st = conn.prepared_st(
-            "SELECT hash, type, pubkey, namespace, timestamp, expiry, data"
-            " FROM owned_messages WHERE hash = ?");
+            "SELECT hash, owners.type, owners.pubkey, namespace, timestamp, expiry, data"
+            " FROM messages JOIN owners ON messages.owner = owners.id WHERE hash = ?");
     st->bindNoCopy(1, msg_hash);
     std::optional<message> msg;
     while (st->executeStep()) {
@@ -797,8 +794,8 @@ std::vector<message> Database::retrieve_all() {
 
     std::vector<message> results;
     auto st = conn.prepared_st(
-            "SELECT type, pubkey, hash, namespace, timestamp, expiry, data"
-            " FROM owned_messages ORDER BY mid");
+            "SELECT owners.type, owners.pubkey, hash, namespace, timestamp, expiry, data"
+            " FROM messages JOIN owners ON messages.owner = owners.id ORDER BY messages.id");
 
     while (st->executeStep()) {
         auto [type, pubkey, hash, ns, ts, exp, data] =

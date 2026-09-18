@@ -125,17 +125,15 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
             "quic",
             "quic:{}"_format(msg.endpoint()),
             remote_host.host(),
-            [this, msg, remote_ip, ep_idx] {
+            [this, msg, remote_ip, ep_idx]() mutable {
                 auto name = msg.endpoint();
 
                 if (name == "snode_ping")
-                    handle_ping(std::move(msg));
-
+                    return handle_ping(std::move(msg));
                 if (name == "monitor")
-                    handle_monitor_message(std::move(msg), ep_idx);
-
+                    return handle_monitor_message(std::move(msg), ep_idx);
                 if (name == "onion_req")
-                    handle_onion_request(std::move(msg));
+                    return handle_onion_request(std::move(msg));
 
                 handle_client_rpc(
                         name,

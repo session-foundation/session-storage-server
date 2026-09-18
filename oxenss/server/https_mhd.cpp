@@ -9,6 +9,7 @@
 #include <fstream>
 #include <optional>
 #include <thread>
+#include <tuple>
 
 extern "C" {
 #include <arpa/inet.h>
@@ -197,8 +198,8 @@ MHD_Result HTTPS_MHD::queue(MHD_Connection* conn, rpc::Response response, bool f
         log::error(logcat, "Failed to allocate HTTP response");
         return MHD_NO;
     }
-    // MHD's callback owns it from here.
-    (void)held.release();
+    // MHD's callback owns it from here, so leak our copy of the pointer:
+    std::ignore = held.release();
     for (const auto& [h, v] : rendered.headers)
         MHD_add_response_header(r, h.c_str(), v.c_str());
     if (force_close || closing())

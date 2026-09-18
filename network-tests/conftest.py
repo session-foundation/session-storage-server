@@ -6,7 +6,13 @@ import transport
 
 
 def pytest_addoption(parser):
-    parser.addoption("--exclude", action="store", default="")
+    parser.addoption(
+        "--exclude",
+        action="store",
+        default="",
+        metavar="PUBKEY",
+        help="ed25519 pubkey of a node the tests should never pick as a swarm member",
+    )
     parser.addoption(
         "--transport",
         action="store",

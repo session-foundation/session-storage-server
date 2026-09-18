@@ -49,6 +49,13 @@ inline constexpr auto SN_CONN_IDLE_TIMEOUT = 60s;
 // The peer opens its own set for what it sends us; our handler treats every incoming stream alike.
 inline constexpr size_t SN_ONION_STREAMS = 4;
 
+// Onion hops are queued on the stream without bound, so a client pushing a lot of data through a
+// path whose next hop is slow would have us buffer all of it.  A hop goes on the peer's
+// least-loaded onion stream; if even that one has this much unsent, every stream to the peer does
+// (so at least SN_ONION_STREAMS times this is queued) and the hop is refused with a 503 so that the
+// client reroutes rather than waits.  Generous: a healthy 100Mbit link clears this in seconds.
+inline constexpr size_t SN_ONION_STREAM_MAX_BACKLOG = 50 * 1024 * 1024;
+
 enum class sn_stream_kind { command, data, onion };
 
 class QUIC : public MQBase {
@@ -151,8 +158,9 @@ class QUIC : public MQBase {
     void sn_connect(const snode::contact& ct, sn_conn_callback cb);
 
     // The stream to send the given kind of traffic on, on the given SN connection.  For onion
-    // requests this is whichever onion stream currently has the least data outstanding.  Returns
-    // nullptr if the connection has no stream set (it is not an established SN connection).
+    // requests this is whichever onion stream currently has the least data outstanding, or nullptr
+    // when even that one has SN_ONION_STREAM_MAX_BACKLOG unsent.  Also nullptr if the connection
+    // has no stream set (it is not an established SN connection).
     std::shared_ptr<quic::BTRequestStream> sn_stream(
             const quic::Connection& c, sn_stream_kind kind) const;
 

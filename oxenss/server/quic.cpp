@@ -401,8 +401,16 @@ void QUIC::sn_request(
                                 logcat, "Could not get a stream for {} request: {}", cmd, e.what());
                         return reply(false, {"TIMEOUT"s});
                     }
-                    if (!stream)
+                    if (!stream) {
+                        // For a hop this is the congestion refusal: tell the client now, as a hop
+                        // failure it can reroute on, rather than letting it wait out a timeout.
+                        if (onion)
+                            return reply(
+                                    true,
+                                    {std::to_string(http::SERVICE_UNAVAILABLE.first),
+                                     "Next hop congested"s});
                         return reply(false, {"TIMEOUT"s});
+                    }
 
                     stream->command(
                             cmd, body, timeout, [reply, storage_cc, onion](quic::message m) {
@@ -520,13 +528,22 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
     }
 
     std::shared_ptr<quic::BTRequestStream> best;
-    size_t best_outstanding = 0;
+    size_t best_outstanding = 0, best_unsent = 0;
     for (auto& s : streams.onion) {
         auto [acked, unacked, unsent, retained] = s->get_stats();
         if (!best || unacked + unsent < best_outstanding) {
             best = s;
             best_outstanding = unacked + unsent;
+            best_unsent = unsent;
         }
+    }
+    if (best_unsent >= SN_ONION_STREAM_MAX_BACKLOG) {
+        log::debug(
+                logcat,
+                "Refusing onion hop on {}: every onion stream has at least {} bytes queued",
+                c.reference_id(),
+                best_unsent);
+        return nullptr;
     }
     return best;
 }

@@ -1330,9 +1330,9 @@ std::string ServiceNode::get_stats() const {
     for (auto& [ns, count] : db->get_namespace_counts())
         ns_stats[fmt::format("{}", ns)] = count;
 
-    val["dbused"] = db->get_used_bytes();
-    val["dbtotal"] = db->get_total_bytes();
-    val["dbmax"] = Database::SIZE_LIMIT;
+    val["db_used"] = db->get_used_bytes();
+    val["db_total"] = db->get_total_bytes();
+    val["db_max"] = Database::SIZE_LIMIT;
 
     return val.dump();
 }

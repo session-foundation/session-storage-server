@@ -178,10 +178,6 @@ class ServiceNode {
     // oxend receives those over the network for up to an hour).
     void bootstrap_fallback();
 
-    // Blocks until our oxend tells us how old its top block is.  Throws after a few failed
-    // attempts, or startup_aborted when `keep_going` says to stop; either aborts startup.
-    std::chrono::seconds oxend_top_block_age(const std::function<bool()>& keep_going);
-
     // Queues dumps of the messages we hold for each of the given swarms (all swarms, if empty) to
     // that swarm's members.  Used when a new swarm appears next to ours, and when our own swarm
     // dissolves.

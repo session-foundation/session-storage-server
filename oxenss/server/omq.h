@@ -216,6 +216,10 @@ class OMQ : public MQBase {
             oxenmq::address oxend_rpc,
             const std::function<bool()>& keep_going);
 
+    // Blocks until oxend tells us how old its top block is.  Throws after a few failed attempts,
+    // or snode::startup_aborted when `keep_going` says to stop; either aborts startup.
+    std::chrono::seconds oxend_top_block_age(const std::function<bool()>& keep_going);
+
     /// Dereferencing via * or -> accesses the contained OxenMQ instance.
     oxenmq::OxenMQ& operator*() { return omq_; }
     oxenmq::OxenMQ* operator->() { return &omq_; }

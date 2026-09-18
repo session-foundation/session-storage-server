@@ -320,6 +320,44 @@ void OMQ::connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bo
     }
 }
 
+std::chrono::seconds OMQ::oxend_top_block_age(const std::function<bool()>& keep_going) {
+    for (int attempt = 1;; attempt++) {
+        auto prom = std::make_shared<std::promise<std::chrono::seconds>>();
+        auto fut = prom->get_future();
+        oxend_request(
+                "rpc.get_last_block_header", [prom](bool success, std::vector<std::string> data) {
+                    try {
+                        if (!success || data.size() < 2 || data[0] != "200")
+                            throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
+                        auto header = nlohmann::json::parse(data[1]).at("block_header");
+                        std::chrono::sys_seconds mined{
+                                std::chrono::seconds{header.at("timestamp").get<int64_t>()}};
+                        auto now = std::chrono::floor<std::chrono::seconds>(
+                                std::chrono::system_clock::now());
+                        auto age = std::max(0s, now - mined);
+                        log::info(
+                                logcat,
+                                "oxend is at height {}; its top block is {} old",
+                                header.at("height").get<uint64_t>(),
+                                util::friendly_duration(age));
+                        prom->set_value(age);
+                    } catch (...) {
+                        prom->set_exception(std::current_exception());
+                    }
+                });
+        try {
+            return snode::await_startup(fut, keep_going, "oxend's top block");
+        } catch (const snode::startup_aborted&) {
+            throw;
+        } catch (const std::exception& e) {
+            if (attempt >= 5)
+                throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
+            log::warning(logcat, "Failed to get the top block from oxend: {}; retrying", e.what());
+        }
+        std::this_thread::sleep_for(1s);
+    }
+}
+
 void OMQ::init(
         snode::ServiceNode* sn,
         rpc::RequestHandler* rh,

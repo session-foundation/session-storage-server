@@ -420,8 +420,9 @@ CREATE INDEX IF NOT EXISTS messages_expiry ON messages(expiry);
 CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner, namespace, timestamp);
 CREATE INDEX IF NOT EXISTS messages_hash ON messages(hash);
 
-CREATE INDEX IF NOT EXISTS owners_swarm_hi ON owners(swarm_space_hi);
-CREATE INDEX IF NOT EXISTS owners_swarm_lo ON owners(swarm_space_lo);
+DROP INDEX IF EXISTS owners_swarm_hi;
+DROP INDEX IF EXISTS owners_swarm_lo;
+CREATE INDEX IF NOT EXISTS owners_swarm ON owners(swarm_space_hi, swarm_space_lo);
 
 CREATE VIEW IF NOT EXISTS owned_messages AS
     SELECT owners.id AS oid, type, pubkey, messages.id AS mid, hash, namespace, timestamp, expiry, data

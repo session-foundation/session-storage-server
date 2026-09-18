@@ -20,7 +20,7 @@ Available schemas:
             (upper/lower 32-bit halves of pubkey_to_swarm_space(); populated on migration
              via custom SQLite functions func_swarm_space_hi/lo registered by C++ at open time)
             new trigger: swarm_space_trigger auto-populates these on INSERT
-            new indices: owners_swarm_hi, owners_swarm_lo
+            new index: owners_swarm(swarm_space_hi, swarm_space_lo)
     messages: public outbox namespaces (namespace < 0 AND namespace % 20 = -1, i.e. -1,-21,-41,…)
               cleared entirely, then UNIQUE INDEX message_outbox_singleton added on
               (owner, namespace) — enforces singleton behaviour going forward

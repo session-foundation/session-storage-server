@@ -256,9 +256,16 @@ CREATE TABLE state_kv (
     value ANY
 ) STRICT, WITHOUT ROWID;
 
--- public namespaces are at most used for testing before this migration, so clear them before
--- adding the unique owner/namespace index
-DELETE FROM messages WHERE namespace < 0 AND namespace % 20 = -1;
+-- A public outbox holds one message, and from here on the unique index below enforces that with
+-- the newest message winning.  Older versions applied the rule only on a direct store, not on
+-- messages pushed by peers, so an outbox can hold several; keep the newest of each (by timestamp,
+-- then id) so the index can be created.
+DELETE FROM messages WHERE id IN (
+    SELECT id FROM (
+        SELECT id, row_number() OVER (PARTITION BY owner, namespace ORDER BY timestamp DESC, id DESC) AS rn
+        FROM messages WHERE namespace < 0 AND namespace % 20 = -1
+    ) WHERE rn > 1
+);
 
 CREATE UNIQUE INDEX message_outbox_singleton
 ON messages(owner, namespace)

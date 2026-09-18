@@ -95,7 +95,9 @@ class DatabaseImpl {
     DatabaseImpl(Database& parent, SQLite::Database& db) : parent{parent}, db{db} {}
 
     void initialize_database() {
-        parent._had_swarm_state_on_open = db.tableExists("state_kv");
+        // state_kv arrived with the swarm sync schema changes, so its absence marks a database
+        // from before them.
+        const bool pre_swarm_sync = !db.tableExists("state_kv");
 
         if (!db.tableExists("owners")) {
             create_schema();
@@ -146,7 +148,7 @@ CREATE TRIGGER IF NOT EXISTS revoked_autoclean
             )");
         }
 
-        if (!parent._had_swarm_state_on_open) {
+        if (pre_swarm_sync) {
             log::info(
                     logcat,
                     "Upgrading database schema: adding swarm space cache, runtime state, "

@@ -322,3 +322,79 @@ TEST_CASE("service nodes - swarm id to swarm space (pubkey range)") {
     REQUIRE(boundaries_694.second == (0x18d + 0x8000000000000000));
     REQUIRE(boundaries_694.second == boundaries_100.first);
 }
+
+TEST_CASE("swarm - when we ask our peers for the swarm's messages", "[swarm]") {
+    using oxenss::namespace_id;
+    using oxenss::crypto::legacy_pubkey;
+    using oxenss::snode::SwarmRequestedDBDump;
+    using oxenss::snode::swarms_t;
+    using pks = std::set<legacy_pubkey>;
+
+    const auto us = legacy_pubkey::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    const auto peer1 = legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto peer2 = legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+    const auto peer3 = legacy_pubkey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333");
+    const auto peer4 = legacy_pubkey::from_hex(
+            "4444444444444444444444444444444444444444444444444444444444444444");
+
+    swarms_t swarms;
+    swarms[100] = {us, peer1, peer2};
+    swarms[200] = {peer3};
+    swarms[300];
+
+    auto requested = [](const Swarm& swarm) {
+        pks result;
+        for (const auto& [pk, state] : swarm.members())
+            if (state.our_ss_requested_db_dump == SwarmRequestedDBDump::NeedsToRequest)
+                result.insert(pk);
+        return result;
+    };
+
+    oxenmq::OxenMQ omq;
+
+    SECTION("first update with none of our swarm's messages asks every peer") {
+        StorageDeleter fixture;
+        Network network{omq};
+        oxenss::Database db{"."};
+        Swarm swarm{network, us, db};
+
+        swarm.update_swarms(1, swarms_t{swarms}, {});
+        CHECK(requested(swarm) == pks{peer1, peer2});
+    }
+
+    SECTION("first update with our swarm's messages present asks nobody") {
+        StorageDeleter fixture;
+        Network network{omq};
+        oxenss::Database db{"."};
+
+        // A message whose owner has swarm space exactly 100, i.e. in swarm 100's range.
+        oxenss::user_pubkey pk;
+        REQUIRE(pk.load("05" + std::string(48, '0') + "0000000000000064"));
+        const auto now = std::chrono::system_clock::now();
+        REQUIRE(db.store({pk, "hash", namespace_id::Default, now, now + 1h, "data"}) ==
+                oxenss::StoreResult::New);
+
+        Swarm swarm{network, us, db};
+        swarm.update_swarms(1, swarms_t{swarms}, {});
+        CHECK(requested(swarm).empty());
+        // The peers are still tracked, for the handshake.
+        CHECK(swarm.members().size() == 2);
+
+        // A peer joining our swarm is not asked; it asks us.
+        swarms[100].insert(peer4);
+        swarm.update_swarms(2, swarms_t{swarms}, {});
+        CHECK(requested(swarm).empty());
+        CHECK(swarm.members().count(peer4) == 1);
+
+        // Moving to another swarm asks all of its members.
+        swarms[100].erase(us);
+        swarms[200].insert(us);
+        swarm.update_swarms(3, swarms_t{swarms}, {});
+        CHECK(requested(swarm) == pks{peer3});
+        CHECK(swarm.members().size() == 1);
+    }
+}

@@ -87,20 +87,9 @@ ServiceNode::ServiceNode(
         all_stats_{*omq_server} {
     mq_servers_.push_back(&omq_server);
 
-    if (auto id = db->get_current_swarm()) {
+    // Lets the first swarm update tell whether our swarm dissolved while we were down.
+    if (auto id = db->get_current_swarm())
         swarm_.cur_swarm_id_ = *id;
-    }
-
-    // Check if the DB was empty and remember if so for later when talking to swarm members on
-    // handshake that we need to request a DB dump from them to populate our DB. In the edge case
-    // where there _are_ 0 messages, this will request a DB dump of 0 messages and essentially
-    // no-op.
-    if (db->get_message_count() == 0) {
-        // The 'cur_swarm_id' might be INVALID_SWARM_ID. This will be the case if the DB was deletd
-        // (and so the blobs storing our swarms were also deleted). The swarm is then
-        // bootstrapped to a proper swarm when we process the first handshake from a swarm member.
-        swarm_.db_was_initially_empty_with_swarm_id = swarm_.cur_swarm_id_;
-    }
 
     omq_server->add_timer(
             [this] {

@@ -53,7 +53,15 @@ class Network {
             swarms_t&& new_swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts);
 
   public:
-    std::pair<uint64_t, uint64_t> get_swarm_boundaries(const uint64_t swarm) const;
+    // The (lower, upper] swarm space range owned by `swarm`, which must be a key of `swarms`: the
+    // lower bound is the midpoint to the previous swarm and the upper the midpoint to the next,
+    // wrapping around past UINT64_MAX; a pubkey exactly on a boundary belongs to the lower swarm.
+    // Returns (0, 0), meaning the whole space, when there is only one swarm.
+    static std::pair<uint64_t, uint64_t> swarm_boundaries(const swarms_t& swarms, swarm_id_t swarm);
+
+    // swarm_boundaries() on the current swarm list.
+    std::pair<uint64_t, uint64_t> get_swarm_boundaries(swarm_id_t swarm) const;
+
     swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
     swarms_t::const_iterator _find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const;
 

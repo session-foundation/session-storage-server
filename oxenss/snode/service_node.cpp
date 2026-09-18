@@ -120,11 +120,12 @@ ServiceNode::ServiceNode(
     omq_server_->add_timer([this] { check_dumps(); }, DUMP_CHECK_INTERVAL);
 }
 
-std::chrono::seconds ServiceNode::oxend_top_block_age() {
+std::chrono::seconds ServiceNode::oxend_top_block_age(const std::function<bool()>& keep_going) {
     for (int attempt = 1;; attempt++) {
-        std::promise<std::chrono::seconds> prom;
+        auto prom = std::make_shared<std::promise<std::chrono::seconds>>();
+        auto fut = prom->get_future();
         omq_server_.oxend_request(
-                "rpc.get_last_block_header", [&prom](bool success, std::vector<std::string> data) {
+                "rpc.get_last_block_header", [prom](bool success, std::vector<std::string> data) {
                     try {
                         if (!success || data.size() < 2 || data[0] != "200")
                             throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
@@ -139,13 +140,15 @@ std::chrono::seconds ServiceNode::oxend_top_block_age() {
                                 "oxend is at height {}; its top block is {} old",
                                 header.at("height").get<uint64_t>(),
                                 util::friendly_duration(age));
-                        prom.set_value(age);
+                        prom->set_value(age);
                     } catch (...) {
-                        prom.set_exception(std::current_exception());
+                        prom->set_exception(std::current_exception());
                     }
                 });
         try {
-            return prom.get_future().get();
+            return await_startup(fut, keep_going, "oxend's top block");
+        } catch (const startup_aborted&) {
+            throw;
         } catch (const std::exception& e) {
             if (attempt >= 5)
                 throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
@@ -155,7 +158,7 @@ std::chrono::seconds ServiceNode::oxend_top_block_age() {
     }
 }
 
-void ServiceNode::on_oxend_connected() {
+void ServiceNode::on_oxend_connected(const std::function<bool()>& keep_going) {
     // This should be the first time we ever trigger a block update from Oxen, i.e. the initial
     // call to `update_swarms` should not early out which would cause a deadlock on the promise.
     assert(!updating_swarms_.load());
@@ -165,7 +168,7 @@ void ServiceNode::on_oxend_connected() {
     // the age of its top block answers that directly.  This has to be settled before the list
     // arrives: process_snodes_update() drops the list of an oxend that is still syncing.
     {
-        auto block_age = oxend_top_block_age();
+        auto block_age = oxend_top_block_age(keep_going);
         std::lock_guard lock{sn_mutex_};
         syncing_ = block_age > MAX_SYNCED_BLOCK_AGE;
         if (syncing_)
@@ -177,14 +180,10 @@ void ServiceNode::on_oxend_connected() {
 
     bool success;
     do {
-        std::promise<bool> update_swarms_promise;
-        std::future<bool> update_swarms_result = update_swarms_promise.get_future();
-        update_swarms(&update_swarms_promise);
-
-        while (update_swarms_result.wait_for(5s) != std::future_status::ready)
-            log::warning(logcat, "Still waiting for initial block update from oxend...");
-
-        success = update_swarms_result.get();
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
+        update_swarms(prom);
+        success = await_startup(fut, keep_going, "the initial block update from oxend");
     } while (!success);
 
     log::info(
@@ -736,7 +735,7 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
         bootstrap_swarms();
 }
 
-void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
+void ServiceNode::update_swarms(std::shared_ptr<std::promise<bool>> on_finish) {
     if (updating_swarms_.exchange(true)) {
         log::debug(logcat, "Swarm update already in progress, not sending another update request");
         return;

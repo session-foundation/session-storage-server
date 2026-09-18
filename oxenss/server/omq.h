@@ -198,20 +198,23 @@ class OMQ : public MQBase {
     std::unordered_set<std::string> stats_access_keys_;
 
     // Connects (and blocks until connected) to oxend.  When this returns an oxend connection
-    // will be available (and oxend_conn_ will be set to the connection id to reach it).
-    void connect_oxend(const oxenmq::address& oxend_rpc);
+    // will be available (and oxend_conn_ will be set to the connection id to reach it).  Throws
+    // snode::startup_aborted if `keep_going` returns false while waiting.
+    void connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going);
 
   public:
     OMQ(const crypto::x25519_keypair& keys,
         const std::vector<crypto::x25519_pubkey>& stats_access_keys_hex);
 
-    // Initialize oxenmq; return a future that completes once we have connected to and
-    // initialized from oxend.
+    // Initialize oxenmq: connects to oxend, loads the initial state from it, then starts the
+    // oxenmq listener.  Blocks until done; `keep_going` is polled while waiting on oxend and a
+    // false return aborts startup with snode::startup_aborted.
     void init(
             snode::ServiceNode* sn,
             rpc::RequestHandler* rh,
             rpc::RateLimiter* rl,
-            oxenmq::address oxend_rpc);
+            oxenmq::address oxend_rpc,
+            const std::function<bool()>& keep_going);
 
     /// Dereferencing via * or -> accesses the contained OxenMQ instance.
     oxenmq::OxenMQ& operator*() { return omq_; }

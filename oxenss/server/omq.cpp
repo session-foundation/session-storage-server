@@ -283,32 +283,33 @@ OMQ::OMQ(
     omq_.EPHEMERAL_ROUTING_ID = false;
 }
 
-void OMQ::connect_oxend(const oxenmq::address& oxend_rpc) {
+void OMQ::connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going) {
     // Establish our persistent connection to oxend.
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        std::promise<bool> prom;
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
         log::info(logcat, "Establishing connection to oxend...");
         omq_.connect_remote(
                 oxend_rpc,
-                [this, &prom](auto cid) {
+                [this, prom](auto cid) {
                     oxend_conn_ = cid;
-                    prom.set_value(true);
+                    prom->set_value(true);
                 },
-                [&prom, &oxend_rpc](auto&&, std::string_view reason) {
+                [prom, oxend_rpc](auto&&, std::string_view reason) {
                     log::warning(
                             logcat,
                             "failed to connect to local oxend @ {}: {}; retrying",
                             oxend_rpc.full_address(),
                             reason);
-                    prom.set_value(false);
+                    prom->set_value(false);
                 },
                 // Turn this off since we are using oxenmq's own key and don't want to replace some
                 // existing connection to it that might also be using that pubkey:
                 oxenmq::connect_option::ephemeral_routing_id{},
                 oxenmq::AuthLevel::admin);
 
-        if (prom.get_future().get()) {
+        if (snode::await_startup(fut, keep_going, "the connection to oxend")) {
             log::info(
                     logcat,
                     "Connected to oxend in {}",
@@ -323,7 +324,8 @@ void OMQ::init(
         snode::ServiceNode* sn,
         rpc::RequestHandler* rh,
         rpc::RateLimiter* rl,
-        oxenmq::address oxend_rpc) {
+        oxenmq::address oxend_rpc,
+        const std::function<bool()>& keep_going) {
     // Initialization happens in 3 steps:
     // - connect to oxend
     // - get initial block update from oxend
@@ -334,10 +336,10 @@ void OMQ::init(
     rate_limiter_ = rl;
     omq_.start();
     // Block until we are connected to oxend:
-    connect_oxend(oxend_rpc);
+    connect_oxend(oxend_rpc, keep_going);
 
     // Block until we get a block update from oxend:
-    service_node_->on_oxend_connected();
+    service_node_->on_oxend_connected(keep_going);
 
     // start omq listener
     const auto port = service_node_->own_address().omq_quic_port;

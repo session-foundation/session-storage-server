@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 
 #include <oxenss/crypto/keys.h>
 #include <oxenss/common/message.h>
+#include <oxenss/logging/oxen_logger.h>
 #include <oxenss/storage/database.hpp>
 #include "network.h"
 #include "swarm.h"
@@ -47,6 +49,30 @@ inline constexpr auto BOOTSTRAP_TIMEOUT = 10s;
 // At startup our oxend is taken to be synced if its top block is at most this old.  Only an oxend
 // that is behind sends us to the bootstrap nodes to find out how far behind it is.
 inline constexpr auto MAX_SYNCED_BLOCK_AGE = 1h;
+
+// Thrown out of startup when the daemon is asked to stop (SIGINT/SIGTERM) before it is up.
+struct startup_aborted : std::exception {
+    const char* what() const noexcept override { return "startup aborted"; }
+};
+
+// Waits for the result of a startup step, checking `keep_going` every quarter second and throwing
+// startup_aborted when it says to stop, with a warning every few seconds while still waiting.  The
+// step's callback may fire after an abort, so it must own its promise (see the shared_ptr
+// promises in the callers) rather than point at the waiter's stack.
+template <typename T>
+T await_startup(
+        std::future<T>& fut,
+        const std::function<bool()>& keep_going,
+        std::string_view waiting_for) {
+    for (int ticks = 1;; ticks++) {
+        if (fut.wait_for(250ms) == std::future_status::ready)
+            return fut.get();
+        if (!keep_going())
+            throw startup_aborted{};
+        if (ticks % 20 == 0)
+            log::warning(log::Cat("snode"), "Still waiting for {}...", waiting_for);
+    }
+}
 
 /// We test based on the height a few blocks back to minimise discrepancies between nodes (we
 /// could also use checkpoints, but that is still not bulletproof: swarms are calculated based
@@ -153,8 +179,8 @@ class ServiceNode {
     void bootstrap_fallback();
 
     // Blocks until our oxend tells us how old its top block is.  Throws after a few failed
-    // attempts, which aborts startup.
-    std::chrono::seconds oxend_top_block_age();
+    // attempts, or startup_aborted when `keep_going` says to stop; either aborts startup.
+    std::chrono::seconds oxend_top_block_age(const std::function<bool()>& keep_going);
 
     // Queues dumps of the messages we hold for each of the given swarms (all swarms, if empty) to
     // that swarm's members.  Used when a new swarm appears next to ours, and when our own swarm
@@ -311,11 +337,13 @@ class ServiceNode {
     // initial data and timers that rely on an oxend connection.  This blocks until we know whether
     // oxend is synced (see MAX_SYNCED_BLOCK_AGE) and have its service node list; when it is
     // synced, that list is in effect by the time this returns, so listeners started afterwards
-    // recognize the network from their first request.
-    void on_oxend_connected();
+    // recognize the network from their first request.  Throws startup_aborted if `keep_going`
+    // returns false while waiting on oxend.
+    void on_oxend_connected(const std::function<bool()>& keep_going);
 
-    // Called when oxend notifies us of a new block to update swarm info
-    void update_swarms(std::promise<bool>* on_completion = nullptr);
+    // Called when oxend notifies us of a new block to update swarm info.  `on_completion`, if
+    // given, is set to whether the update succeeded once oxend has answered.
+    void update_swarms(std::shared_ptr<std::promise<bool>> on_completion = nullptr);
 
     // Queues a dump to `pk` of all the messages we currently hold for our swarm.  Called when a
     // swarm member asks for one in its sn.data_ready handshake.  Does nothing if we are not in a

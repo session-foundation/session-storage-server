@@ -208,7 +208,8 @@ int main(int argc, char* argv[]) {
                 &service_node,
                 &request_handler,
                 &rate_limiter,
-                oxenmq::address{options.oxend_omq_rpc});
+                oxenmq::address{options.oxend_omq_rpc},
+                [] { return signalled == 0; });
 
         quic->startup_endpoint();
 
@@ -242,6 +243,9 @@ int main(int argc, char* argv[]) {
         log::info(logcat, "Stopping omq server");
         oxenmq_server_ptr.reset();
         log::info(logcat, "Shutting down");
+    } catch (const snode::startup_aborted&) {
+        log::error(logcat, "Received signal {}, aborting startup", signalled.load());
+        return EXIT_FAILURE;
     } catch (const std::exception& e) {
         // It seems possible for logging to throw its own exception,
         // in which case it will be propagated to libc...

@@ -7,6 +7,7 @@
 #include "omq.h"
 #include "utils.h"
 
+#include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
 
 namespace oxenss::server {
@@ -51,14 +52,57 @@ QUIC::QUIC(
 
     endpoints.reserve(bind.size());
     for (auto& a : bind) {
-        endpoints.push_back(quic::Endpoint::endpoint(
-                loop, a, make_endpoint_static_secret(sk), quic::opt::alpns{ALPN}));
-        if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack)))
+        // Outbound connections to other storage servers override the ALPN per connection (see
+        // sn_connect); the default covers pings to pre-SN_QUIC_VERSION nodes, which only accept
+        // the client ALPN.
+        endpoints.push_back(
+                quic::Endpoint::endpoint(
+                        loop,
+                        a,
+                        make_endpoint_static_secret(sk),
+                        quic::opt::inbound_alpns{ALPN, SN_ALPN},
+                        quic::opt::outbound_alpns{ALPN}));
+        if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack))) {
             reach_ep = endpoints.back().get();
+            reach_ep_idx = endpoints.size() - 1;
+        }
     }
 
     if (!reach_ep)
         throw std::invalid_argument{"No IPv4 bind address given to QUIC listener!"};
+
+    // Runs on the QUIC loop during the handshake, so it must not wait on anything else.
+    static_cast<quic::GNUTLSCreds*>(tls_creds.get())
+            ->request_client_keys([this](std::span<const unsigned char> key,
+                                         std::string_view alpn) {
+                if (alpn != SN_ALPN)
+                    // Clients need not send a key, but one they do send has to look like one.
+                    return key.empty() || key.size() == sizeof(crypto::ed25519_pubkey);
+
+                if (key.size() != sizeof(crypto::ed25519_pubkey)) {
+                    log::warning(
+                            logcat,
+                            "Rejecting {} connection without a valid ed25519 key ({} bytes)",
+                            SN_ALPN,
+                            key.size());
+                    return false;
+                }
+                auto pk = crypto::ed25519_pubkey::from_bytes(
+                        {reinterpret_cast<const char*>(key.data()), key.size()});
+                if (pk == service_node_->own_address().pubkey_ed25519) {
+                    log::warning(logcat, "Rejecting {} connection claiming our own key", SN_ALPN);
+                    return false;
+                }
+                if (!service_node_->contacts().find(pk)) {
+                    log::warning(
+                            logcat,
+                            "Rejecting {} connection from {}: not a known service node",
+                            SN_ALPN,
+                            pk);
+                    return false;
+                }
+                return true;
+            });
 
     // Add a category to OMQ for handling incoming quic request jobs
     service_node_->omq_server()->add_category(
@@ -82,13 +126,252 @@ void QUIC::startup_endpoint() {
                         quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                     return e.loop.make_shared<quic::BTRequestStream>(c, e, handler);
                 },
-                // A closed connection never comes back, so its monitor subscriptions can never
-                // deliver anything again.  Note that this runs on the quic event loop.
-                quic::connection_closed_callback{[this, ep_idx](quic::Connection& c, uint64_t) {
-                    remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+                quic::connection_established_callback{
+                        [this](quic::Connection& c) { on_conn_established(c); }},
+                quic::connection_closed_callback{[this, ep_idx](quic::Connection& c, uint64_t ec) {
+                    on_conn_closed(c, ec, ep_idx);
                 }});
         ep_idx++;
     }
+
+    reach_ep->job_queue.add_timer(SN_CONN_REDUNDANT_LINGER, [this] { close_redundant_sn_conns(); });
+}
+
+std::shared_ptr<quic::Connection> QUIC::sn_conn::preferred() const {
+    if (inbound && outbound)
+        return inbound_wins ? inbound : outbound;
+    return inbound ? inbound : outbound;
+}
+
+std::shared_ptr<quic::Connection> QUIC::sn_conn::set(
+        std::shared_ptr<quic::Connection> c, bool is_inbound) {
+    auto& slot = is_inbound ? inbound : outbound;
+    auto replaced = std::move(slot);
+    slot = std::move(c);
+    return replaced;
+}
+
+std::shared_ptr<quic::Connection> QUIC::sn_conn::take(bool is_inbound) {
+    auto& slot = is_inbound ? inbound : outbound;
+    return std::move(slot);
+}
+
+// The peer's ed25519 key, if the connection carries one (SN_ALPN connections always do; so do
+// outbound connections of any ALPN, since we dialled by key).
+static std::optional<crypto::ed25519_pubkey> sn_key(quic::Connection& c) {
+    auto key = c.remote_key();
+    if (key.size() != sizeof(crypto::ed25519_pubkey))
+        return std::nullopt;
+    return crypto::ed25519_pubkey::from_bytes(
+            {reinterpret_cast<const char*>(key.data()), key.size()});
+}
+
+void QUIC::on_conn_established(quic::Connection& c) {
+    if (c.selected_alpn() != SN_ALPN)
+        return;
+    auto pk = sn_key(c);
+    if (!pk)
+        return;
+
+    std::shared_ptr<quic::Connection> conn;
+    for (auto& ep : endpoints)
+        if ((conn = ep->get_conn(c.reference_id())))
+            break;
+    if (!conn) {
+        log::error(logcat, "Internal error: established connection {} not found", c.reference_id());
+        return;
+    }
+
+    std::vector<sn_conn_callback> waiting;
+    std::shared_ptr<quic::Connection> use, replaced;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        auto [it, ins] = sn_conns_.try_emplace(
+                *pk, sn_conn{.inbound_wins = *pk < service_node_->own_address().pubkey_ed25519});
+        auto& sc = it->second;
+        replaced = sc.set(conn, c.is_inbound());
+        if (sc.inbound && sc.outbound)
+            sn_bidir_[*pk] = std::chrono::steady_clock::now();
+        use = sc.preferred();
+
+        log::debug(
+                logcat,
+                "{} {} connection with {}{}",
+                ins ? "Established" : "Added",
+                c.is_inbound() ? "inbound" : "outbound",
+                *pk,
+                sc.inbound && sc.outbound
+                        ? (sc.inbound_wins == c.is_inbound() ? " (replaces the other direction)"
+                                                             : " (redundant; will be closed)")
+                        : "");
+
+        if (c.is_outbound())
+            if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
+                waiting = std::move(pit->second);
+                pending_sn_conns_.erase(pit);
+            }
+    }
+
+    if (replaced)
+        replaced->close_connection();
+    for (auto& cb : waiting)
+        cb(use);
+}
+
+void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
+    // A closed connection never comes back, so its monitor subscriptions can never deliver
+    // anything again.
+    remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+
+    auto pk = sn_key(c);
+    if (!pk)
+        return;
+
+    std::vector<sn_conn_callback> waiting;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        if (auto it = sn_conns_.find(*pk); it != sn_conns_.end()) {
+            auto& sc = it->second;
+            auto& slot = c.is_inbound() ? sc.inbound : sc.outbound;
+            if (slot && slot->reference_id() == c.reference_id()) {
+                slot.reset();
+                sn_bidir_.erase(*pk);
+                log::debug(
+                        logcat,
+                        "Closed {} connection with {} (ec={}){}",
+                        c.is_inbound() ? "inbound" : "outbound",
+                        *pk,
+                        ec,
+                        ec == CONN_CLOSE_REDUNDANT ? " as redundant" : "");
+                if (sc.empty())
+                    sn_conns_.erase(it);
+            }
+        }
+        if (c.is_outbound())
+            if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
+                log::debug(logcat, "Connection to {} failed to establish (ec={})", *pk, ec);
+                waiting = std::move(pit->second);
+                pending_sn_conns_.erase(pit);
+            }
+    }
+
+    for (auto& cb : waiting)
+        cb(nullptr);
+}
+
+void QUIC::close_redundant_sn_conns() {
+    std::vector<std::shared_ptr<quic::Connection>> losers;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = sn_bidir_.begin(); it != sn_bidir_.end();) {
+            auto& [pk, since] = *it;
+            if (now < since + SN_CONN_REDUNDANT_LINGER) {
+                ++it;
+                continue;
+            }
+            if (auto cit = sn_conns_.find(pk); cit != sn_conns_.end())
+                if (auto loser = cit->second.take(!cit->second.inbound_wins))
+                    losers.push_back(std::move(loser));
+            it = sn_bidir_.erase(it);
+        }
+    }
+    // The slots are already empty, so on_conn_closed ignores these.
+    for (auto& c : losers)
+        c->close_connection(CONN_CLOSE_REDUNDANT);
+}
+
+void QUIC::sweep_sn_connections() {
+    std::vector<std::shared_ptr<quic::Connection>> gone;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        for (auto it = sn_conns_.begin(); it != sn_conns_.end();) {
+            if (service_node_->contacts().find(it->first)) {
+                ++it;
+                continue;
+            }
+            log::info(logcat, "Closing connection with {}: no longer a service node", it->first);
+            for (bool inbound : {true, false})
+                if (auto c = it->second.take(inbound))
+                    gone.push_back(std::move(c));
+            sn_bidir_.erase(it->first);
+            it = sn_conns_.erase(it);
+        }
+    }
+    for (auto& c : gone)
+        c->close_connection(CONN_CLOSE_NOT_SN);
+}
+
+bool QUIC::sn_quic_capable(const snode::contact& ct) {
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        if (auto it = sn_conns_.find(ct.pubkey_ed25519);
+            it != sn_conns_.end() && !it->second.empty())
+            return true;
+    }
+    return ct.version >= snode::SN_QUIC_VERSION;
+}
+
+void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
+    const auto& pk = ct.pubkey_ed25519;
+    std::shared_ptr<quic::Connection> existing;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        if (auto it = sn_conns_.find(pk); it != sn_conns_.end())
+            existing = it->second.preferred();
+        if (!existing) {
+            auto [pit, ins] = pending_sn_conns_.try_emplace(pk);
+            pit->second.push_back(std::move(cb));
+            if (!ins)
+                return;  // a connection attempt is already underway
+        }
+    }
+    if (existing)
+        return cb(std::move(existing));
+
+    log::debug(logcat, "Connecting to {} @ {}:{}", pk, ct.ip, ct.omq_quic_port);
+    try {
+        auto conn = reach_ep->connect(
+                {pk.view(), ct.ip, ct.omq_quic_port},
+                tls_creds,
+                quic::opt::outbound_alpns{SN_ALPN},
+                quic::opt::keep_alive{SN_CONN_KEEP_ALIVE},
+                quic::opt::idle_timeout{SN_CONN_IDLE_TIMEOUT},
+                quic::opt::handshake_timeout{5s},
+                // Streams the peer opens to us on this connection carry its requests:
+                [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
+                    return e.loop.make_shared<quic::BTRequestStream>(c, e, [this](quic::message m) {
+                        handle_request(std::move(m), reach_ep_idx);
+                    });
+                },
+                quic::connection_established_callback{
+                        [this](quic::Connection& c) { on_conn_established(c); }},
+                quic::connection_closed_callback{[this](quic::Connection& c, uint64_t ec) {
+                    on_conn_closed(c, ec, reach_ep_idx);
+                }});
+        // Our request stream; opening it now makes it stream 0 on this connection.
+        conn->open_stream<quic::BTRequestStream>(
+                [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); });
+    } catch (const std::exception& e) {
+        log::warning(logcat, "Failed to initiate connection to {}: {}", pk, e.what());
+        std::vector<sn_conn_callback> waiting;
+        {
+            std::lock_guard lock{sn_conns_mutex_};
+            if (auto pit = pending_sn_conns_.find(pk); pit != pending_sn_conns_.end()) {
+                waiting = std::move(pit->second);
+                pending_sn_conns_.erase(pit);
+            }
+        }
+        for (auto& w : waiting)
+            w(nullptr);
+    }
+}
+
+std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(quic::Connection& c) {
+    if (auto s = c.get_stream<quic::BTRequestStream>(0))
+        return s;
+    return c.open_stream<quic::BTRequestStream>(
+            [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); });
 }
 
 void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
@@ -253,40 +536,74 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
         return;
     const auto& ct = *maybe_ct;
 
-    auto conn = reach_ep->connect(
-            {ct.pubkey_ed25519.view(), ct.ip, ct.omq_quic_port},
-            tls_creds,
-            quic::opt::handshake_timeout{5s});
-    auto s = conn->open_stream<quic::BTRequestStream>();
-    s->command("snode_ping", ""s, [test = std::move(test), this](const quic::message& m) mutable {
-        bool passed;
-        if (m.timed_out || m.body() != "pong"sv) {
-            log::debug(
-                    logcat,
-                    "QUIC reachability test failed for {}: {}",
-                    test->pubkey,
-                    m.timed_out ? "timeout" : "unexpected response");
-            passed = false;
-        } else {
-            log::debug(
-                    logcat,
-                    "Successful response to QUIC reachability ping test of {}",
-                    test->pubkey);
-            passed = true;
-        }
-        // Go via reach_ep rather than m.stream(): on a timeout the stream may already be gone,
-        // and m.stream() throws rather than returning nullptr, which would skip the result
-        // reporting below and leave the test unresolved.
-        if (auto conn = reach_ep->get_conn(m.conn_rid()))
-            conn->close_connection();
-
-        // Defer this to an omq task; the same deadlock-avoidance logic described in
-        // handle_request applies here.
+    // Defer this to an omq task; the same deadlock-avoidance logic described in handle_request
+    // applies here.
+    auto report = [this](std::shared_ptr<snode::sn_test> test, bool passed) {
         service_node_->omq_server()->inject_task(
                 "quic", "quic:(reach_report)", "", [test = std::move(test), passed]() {
                     test->add_result(passed);
                 });
-    });
+    };
+
+    auto ping = [this, report](
+                        std::shared_ptr<snode::sn_test> test,
+                        quic::BTRequestStream& s,
+                        bool close_after) {
+        s.command(
+                "snode_ping",
+                ""s,
+                [test = std::move(test), report, close_after, this](
+                        const quic::message& m) mutable {
+                    bool passed;
+                    if (m.timed_out || m.body() != "pong"sv) {
+                        log::debug(
+                                logcat,
+                                "QUIC reachability test failed for {}: {}",
+                                test->pubkey,
+                                m.timed_out ? "timeout" : "unexpected response");
+                        passed = false;
+                    } else {
+                        log::debug(
+                                logcat,
+                                "Successful response to QUIC reachability ping test of {}",
+                                test->pubkey);
+                        passed = true;
+                    }
+                    // Go via reach_ep rather than m.stream(): on a timeout the stream may already
+                    // be gone, and m.stream() throws rather than returning nullptr, which would
+                    // skip the result reporting below and leave the test unresolved.
+                    if (close_after)
+                        if (auto conn = reach_ep->get_conn(m.conn_rid()))
+                            conn->close_connection();
+
+                    report(std::move(test), passed);
+                });
+    };
+
+    if (sn_quic_capable(ct)) {
+        // Ping over the connection we hold with the node (establishing it if needed), and keep it.
+        sn_connect(
+                ct,
+                [this, test = std::move(test), ping, report](
+                        std::shared_ptr<quic::Connection> conn) mutable {
+                    if (!conn) {
+                        log::debug(
+                                logcat,
+                                "QUIC reachability test failed for {}: could not connect",
+                                test->pubkey);
+                        return report(std::move(test), false);
+                    }
+                    ping(std::move(test), *sn_stream(*conn), false);
+                });
+        return;
+    }
+
+    // Older nodes only accept the client ALPN and expect a one-off connection.
+    auto conn = reach_ep->connect(
+            {ct.pubkey_ed25519.view(), ct.ip, ct.omq_quic_port},
+            tls_creds,
+            quic::opt::handshake_timeout{5s});
+    ping(std::move(test), *conn->open_stream<quic::BTRequestStream>(), true);
 }
 
 }  // namespace oxenss::server

@@ -672,8 +672,10 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
     // account we would now answer with a 421 has to be terminated.  This must not be skipped when
     // we are not `ready` (e.g. we just got decommissioned): those are exactly the cases where the
     // subscription has become useless.
-    for (auto* s : mq_servers_)
+    for (auto* s : mq_servers_) {
         s->drop_foreign_monitors();
+        s->sweep_sn_connections();
+    }
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED

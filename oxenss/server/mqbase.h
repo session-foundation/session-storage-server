@@ -168,6 +168,10 @@ class MQBase {
 
     virtual void reachability_test(std::shared_ptr<snode::sn_test> test) = 0;
 
+    // Called after each service node list update so that connections held open to nodes that are
+    // no longer service nodes can be closed.  The default does nothing.
+    virtual void sweep_sn_connections() {}
+
     virtual ~MQBase() = default;
 
   private:

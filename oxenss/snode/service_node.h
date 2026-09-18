@@ -63,6 +63,11 @@ inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2
 // payload, and send none.
 inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 12, 0};
 
+// The storage server version from which node-to-node traffic goes over a held QUIC connection
+// (negotiated with server::SN_ALPN) rather than oxenmq.  Older versions only accept the client
+// ALPN and only the commands a client may send.
+inline constexpr std::array<uint16_t, 3> SN_QUIC_VERSION = {2, 12, 0};
+
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
         case SnodeStatus::UNSTAKED: return "Unstaked"sv;

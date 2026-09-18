@@ -113,14 +113,19 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
     // FIXME: currently we do this on any new swarm creation, but that seems excessive: we really
     // only need to worry about this if our boundary on either side changes.  (Most of the time it
     // won't because, with hundreds of swarms, most new swarms don't affect our swarm space).
-    auto new_swarm_ids = std::views::keys(swarms);
-    auto old_swarm_ids = std::views::keys(network.swarms_);
-    std::set_difference(
-            new_swarm_ids.begin(),
-            new_swarm_ids.end(),
-            old_swarm_ids.begin(),
-            old_swarm_ids.end(),
-            std::inserter(events.new_swarms, events.new_swarms.end()));
+    //
+    // On the first update after startup we have no previous swarm list to compare against (only
+    // our own swarm id is persisted), so every swarm would look new; none of them are.
+    if (!network.swarms_.empty()) {
+        auto new_swarm_ids = std::views::keys(swarms);
+        auto old_swarm_ids = std::views::keys(network.swarms_);
+        std::set_difference(
+                new_swarm_ids.begin(),
+                new_swarm_ids.end(),
+                old_swarm_ids.begin(),
+                old_swarm_ids.end(),
+                std::inserter(events.new_swarms, events.new_swarms.end()));
+    }
 
     return events;
 }

@@ -346,19 +346,19 @@ void ServiceNode::bootstrap_fallback() {
 
                     if (++(*req_counter) == node_count) {
                         log::info(logcat, "Bootstrapping done");
-                        if (target_height_ > 0)
-                            update_swarms();
-                        else {
-                            // If target height is still 0 after having contacted
-                            // (successfully or not) all seed nodes, just assume we have
-                            // finished syncing. (Otherwise we will never get a chance
-                            // to update syncing status.)
+                        if (target_height_ == 0) {
+                            // No seed answered, so nothing can tell us whether our oxend is
+                            // behind; assume it is not, or we would never leave the syncing
+                            // state.
                             log::warning(
                                     logcat,
                                     "Could not contact any bootstrap nodes to get target "
                                     "height. Assuming our local height is correct.");
                             syncing_ = false;
                         }
+                        // The initial oxend response was discarded as "still syncing", so ask
+                        // again now rather than knowing no service nodes until the next block.
+                        update_swarms();
                     }
                 },
                 params,
@@ -1055,46 +1055,47 @@ void ServiceNode::process_snodes_update(std::string_view data) {
 
     std::lock_guard lock{sn_mutex_};
 
+    if (maybe_bu && !got_first_response_.exchange(true)) {
+        log::info(logcat, "Got initial swarm information from local Oxend");
+        // On our very first response we *may* want to fall back to the bootstrap nodes *if* the
+        // response looks sparse: this will typically happen for a fresh service node because
+        // IP/port distribution through the network can take up to an hour.  We don't really want
+        // to hit the bootstrap nodes when we don't have to, though, so only do it if the response
+        // is missing more than 3% of proof data (IPs/ports/ed25519/x25519 pubkeys) or has fewer
+        // than 100 SNs (10 on testnet).  This has to be judged from the response itself: until we
+        // decide we are not syncing, on_snodes_update() below does not store anything from it.
+        //
+        // (In the future it would be nice to eliminate this by putting all the required data on
+        // chain, and get rid of needing to consult bootstrap nodes: but currently we still need
+        // this to deal with the lag).
+        const int total = maybe_bu->contacts.size();
+        const int contactable = std::ranges::count_if(
+                maybe_bu->contacts, [](const auto& c) { return c.second.contactable(); });
+        const int missing = total - contactable;
+
+        if (skip_bootstrap_ ||
+            (total >= (oxenss::is_mainnet ? 100 : 10) &&
+             missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
+            log::info(
+                    logcat,
+                    "Initialized from oxend with {}/{} contactable service nodes",
+                    contactable,
+                    total);
+            syncing_ = false;
+        } else {
+            log::info(
+                    logcat,
+                    "Detected some missing SN data ({}/{} contactable); "
+                    "falling back to bootstrap nodes for help",
+                    contactable,
+                    total);
+            bootstrap_fallback();
+        }
+    }
+
     if (maybe_bu) {
         log::debug(logcat, "Blockchain updated, rebuilding swarm list");
         on_snodes_update(std::move(*maybe_bu));
-    }
-
-    if (got_first_response_.exchange(true))
-        return;
-
-    log::info(logcat, "Got initial swarm information from local Oxend");
-    // This is our very first response and so we *may* want to try falling back to the bootstrap
-    // node *if* our response looks sparse: this will typically happen for a fresh service node
-    // because IP/port distribution through the network can take up to an hour.  We don't really
-    // want to hit the bootstrap nodes when we don't have to, though, so only do it if our responses
-    // is missing more than 3% of proof data (IPs/ports/ed25519/x25519 pubkeys) or we got back fewer
-    // than 100 SNs (10 on testnet).
-    //
-    // (In the future it would be nice to eliminate this by putting all the required data on chain,
-    // and get rid of needing to consult bootstrap nodes: but currently we still need this to deal
-    // with the lag).
-
-    auto [total, contactable] = network_.contacts.counts();
-    auto missing = total - contactable;
-
-    if (skip_bootstrap_ ||
-        (total >= (oxenss::is_mainnet ? 100 : 10) &&
-         missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
-        log::info(
-                logcat,
-                "Initialized from oxend with {}/{} contactable service nodes",
-                contactable,
-                total);
-        syncing_ = false;
-    } else {
-        log::info(
-                logcat,
-                "Detected some missing SN data ({}/{} contactable); "
-                "falling back to bootstrap nodes for help",
-                contactable,
-                total);
-        bootstrap_fallback();
     }
 }
 

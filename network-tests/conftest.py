@@ -1,6 +1,7 @@
 import pytest
 import random
 
+import ss
 import transport
 
 
@@ -12,6 +13,15 @@ def pytest_addoption(parser):
         default="https",
         choices=sorted(transport.TRANSPORTS),
         help="how to send storage RPC requests to the storage servers under test",
+    )
+    parser.addoption(
+        "--node",
+        action="store",
+        default="",
+        metavar="PUBKEY|IP:PORT",
+        help="steer the tests at one node (ed25519 pubkey, or ip:port of either listener): it "
+        "becomes the entry point, test accounts are generated inside its swarm, and it is "
+        "preferred whenever a swarm member is picked -- so its logs show most of the run",
     )
 
 
@@ -56,15 +66,39 @@ def sns(rpc):
 
 
 @pytest.fixture(scope="module")
-def random_sn(rpc, sns):
-    return rpc.connect(random.choice(sns))
+def pinned_node(pytestconfig, sns):
+    want = pytestconfig.getoption("node")
+    if not want:
+        return None
+    for sn in sns:
+        if want in (sn['pubkey_ed25519'], f"{sn['ip']}:{sn['port_https']}", f"{sn['ip']}:{sn['port_omq']}"):
+            return sn
+    pytest.exit(f"--node={want} does not match any active service node")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _prefer_pinned_node(pinned_node):
+    ss.preferred_node = pinned_node['pubkey_ed25519'] if pinned_node else None
+
+
+@pytest.fixture(scope="module")
+def random_sn(rpc, sns, pinned_node):
+    return rpc.connect(pinned_node or random.choice(sns))
 
 
 @pytest.fixture
-def sk():
+def sk(rpc, random_sn, pinned_node):
     from nacl.signing import SigningKey
 
-    return SigningKey.generate()
+    # With a pinned node, keep generating until the account lands in its swarm (testnet has a
+    # handful of swarms, so this takes a few tries at most).
+    while True:
+        sk = SigningKey.generate()
+        if not pinned_node:
+            return sk
+        members = ss.get_swarm(rpc, random_sn, sk)['snodes']
+        if any(m['pubkey_ed25519'] == pinned_node['pubkey_ed25519'] for m in members):
+            return sk
 
 
 @pytest.fixture(scope="module")

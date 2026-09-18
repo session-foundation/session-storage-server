@@ -87,8 +87,18 @@ def get_swarm(rpc, conn, sk, netid=5):
     return json.loads(r[0])
 
 
+# Set from the --node option: a node to put first whenever swarm members are picked, so that a run
+# can be followed in that node's logs.
+preferred_node = None
+
+
 def random_swarm_members(swarm, n, exclude={}):
-    return random.sample([s for s in swarm['snodes'] if s['pubkey_ed25519'] not in exclude], n)
+    members = [s for s in swarm['snodes'] if s['pubkey_ed25519'] not in exclude]
+    preferred = [s for s in members if s['pubkey_ed25519'] == preferred_node]
+    if not preferred:
+        return random.sample(members, n)
+    rest = [s for s in members if s['pubkey_ed25519'] != preferred_node]
+    return preferred + random.sample(rest, n - 1)
 
 
 def store_n(rpc, conn, sk, basemsg, n, *, offset=0, netid=5, now=None, ttl=30):

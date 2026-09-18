@@ -19,4 +19,8 @@ Usage:
 
 - `--exclude=<ed25519 pubkey>` keeps the tests away from a particular node.
 
+- `--node=<ed25519 pubkey>` (or `ip:port` of either listener) does the opposite: that node becomes
+  the entry point, test accounts are generated inside its swarm, and it is used first whenever a
+  swarm member is picked, so that a run can be followed in that node's logs.
+
 `transport.py` is where a new transport (e.g. QUIC) would be added.

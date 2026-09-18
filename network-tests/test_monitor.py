@@ -93,7 +93,9 @@ def test_monitor_reg_ed(rpc, random_sn, sk, exclude):
 
 
 def test_monitor_reg_session(rpc, random_sn, sk, exclude):
-    swarm = ss.get_swarm(rpc, random_sn, sk)
+    # A Session ID is 05 + the x25519 key derived from sk, so that is the account whose swarm we
+    # need; the nodes check that the account is theirs before accepting the subscription.
+    swarm = ss.get_swarm(rpc, random_sn, sk.to_curve25519_private_key())
 
     o = oxenmq.OxenMQ()
     o.start()
@@ -300,13 +302,18 @@ def test_monitor_push(rpc, random_sn, sk, exclude):
 
 
 def test_monitor_multi(rpc, random_sn, sk, exclude):
-    swarm = ss.get_swarm(rpc, random_sn, sk)
+    swarm = ss.get_swarm(rpc, random_sn, sk, netid=3)
 
     conns = {}
 
     n_notifies = 0
 
-    sk2 = SigningKey.generate()
+    # Both subscriptions in the combined request go to sk's swarm, and a node only accepts a
+    # subscription for an account it stores, so sk2 has to land in the same swarm.
+    while True:
+        sk2 = SigningKey.generate()
+        if ss.get_swarm(rpc, random_sn, sk2, netid=3)['swarm'] == swarm['swarm']:
+            break
 
     def handle_notify_message(m):
         nonlocal conns, n_notifies

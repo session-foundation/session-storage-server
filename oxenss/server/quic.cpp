@@ -137,6 +137,7 @@ void QUIC::startup_endpoint() {
                 quic::connection_closed_callback{[this, ep_idx](quic::Connection& c, uint64_t ec) {
                     on_conn_closed(c, ec, ep_idx);
                 }});
+        log::info(logcat, "QUIC server listening at {}", ep->local());
         ep_idx++;
     }
 

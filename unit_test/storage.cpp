@@ -554,9 +554,11 @@ TEST_CASE("storage - ready retry requests", "[storage]") {
     storage.foreach_ready_retry_request(collect(true));
     CHECK(seen.empty());
 
-    // cmd1 was reported sent, so it waits RETRY_INTERVAL (60s); the other two were not, so they
-    // wait only RETRY_NO_CONTACT_INTERVAL (15s).  Backdating 30s brings back just those two.
-    TestSuiteHacks::db_backdate_retries(storage, 30s);
+    // cmd1 was reported sent, so it waits RETRY_INTERVAL (30s); the other two were not, so they
+    // wait only RETRY_NO_CONTACT_INTERVAL (15s).  Backdating 20s brings back just those two.
+    // (Backdating a full 30s would put cmd1 exactly on the boundary, where whether it counts as
+    // due comes down to sub-millisecond timing.)
+    TestSuiteHacks::db_backdate_retries(storage, 20s);
     seen.clear();
     storage.foreach_ready_retry_request(collect(true));
     REQUIRE(seen.size() == 2);

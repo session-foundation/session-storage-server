@@ -55,6 +55,18 @@ inline constexpr auto SN_CONN_REDUNDANT_LINGER = 20s;
 inline constexpr auto SN_CONN_KEEP_ALIVE = 15s;
 inline constexpr auto SN_CONN_IDLE_TIMEOUT = 60s;
 
+// On each connection with another storage server we open a fixed set of streams and send each
+// kind of traffic on its own, so that none waits behind another (a QUIC stream delivers in order
+// and has its own flow-control window; separate streams do not):
+// - command: forwarded client commands, handshakes and pings -- small and latency-sensitive;
+// - data: message batches (dumps and deliveries) -- bulk;
+// - onion: onion request hops, spread over several so that a large payload in transit holds up
+//   only the hops sharing its stream.
+// The peer opens its own set for what it sends us; our handler treats every incoming stream alike.
+inline constexpr size_t SN_ONION_STREAMS = 4;
+
+enum class sn_stream_kind { command, data, onion };
+
 class QUIC : public MQBase {
   public:
     QUIC(snode::ServiceNode& snode,
@@ -99,8 +111,11 @@ class QUIC : public MQBase {
     // before this returns (when already connected) or later from the QUIC event loop.
     void sn_connect(const snode::contact& ct, sn_conn_callback cb);
 
-    // The request stream to use for commands to the peer on the given connection.
-    std::shared_ptr<quic::BTRequestStream> sn_stream(quic::Connection& c);
+    // The stream to send the given kind of traffic on, on the given SN connection.  For onion
+    // requests this is whichever onion stream currently has the least data outstanding.  Returns
+    // nullptr if the connection has no stream set (it is not an established SN connection).
+    std::shared_ptr<quic::BTRequestStream> sn_stream(
+            const quic::Connection& c, sn_stream_kind kind);
 
     quic::Loop loop{};
 
@@ -138,11 +153,18 @@ class QUIC : public MQBase {
         bool empty() const { return !inbound && !outbound; }
     };
 
-    // Guards the three maps below.  Never hold it across a call into libquic that may run a
-    // connection callback or wait on the QUIC loop (close_connection, connect, open_stream, ...):
+    struct sn_streams {
+        std::shared_ptr<quic::BTRequestStream> command, data;
+        std::array<std::shared_ptr<quic::BTRequestStream>, SN_ONION_STREAMS> onion;
+    };
+
+    // Guards the maps below.  Never hold it across a call into libquic that may run a connection
+    // callback or wait on the QUIC loop (close_connection, connect, open_stream, get_stats, ...):
     // the callbacks take it too.
     std::mutex sn_conns_mutex_;
     std::unordered_map<crypto::ed25519_pubkey, sn_conn> sn_conns_;
+    // The streams we opened on each SN connection, by connection.
+    std::unordered_map<quic::ConnectionID, sn_streams> sn_streams_;
     // Peers we have connections in both directions with, and when the second one arrived.
     std::unordered_map<crypto::ed25519_pubkey, std::chrono::steady_clock::time_point> sn_bidir_;
     // Outbound connections being established, with the callbacks waiting for them.

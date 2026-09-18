@@ -183,10 +183,19 @@ void QUIC::on_conn_established(quic::Connection& c) {
         return;
     }
 
+    // A stream costs nothing until its first byte, so the whole set is opened up front.
+    auto handler = [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); };
+    sn_streams streams;
+    streams.command = conn->open_stream<quic::BTRequestStream>(handler);
+    streams.data = conn->open_stream<quic::BTRequestStream>(handler);
+    for (auto& s : streams.onion)
+        s = conn->open_stream<quic::BTRequestStream>(handler);
+
     std::vector<sn_conn_callback> waiting;
     std::shared_ptr<quic::Connection> use, replaced;
     {
         std::lock_guard lock{sn_conns_mutex_};
+        sn_streams_[conn->reference_id()] = std::move(streams);
         auto [it, ins] = sn_conns_.try_emplace(
                 *pk, sn_conn{.inbound_wins = *pk < service_node_->own_address().pubkey_ed25519});
         auto& sc = it->second;
@@ -244,6 +253,7 @@ void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
     std::vector<sn_conn_callback> waiting;
     {
         std::lock_guard lock{sn_conns_mutex_};
+        sn_streams_.erase(c.reference_id());
         if (auto it = sn_conns_.find(*pk); it != sn_conns_.end()) {
             auto& sc = it->second;
             auto& slot = c.is_inbound() ? sc.inbound : sc.outbound;
@@ -365,12 +375,18 @@ bool QUIC::sn_request(
 
                 std::shared_ptr<quic::BTRequestStream> stream;
                 try {
-                    stream = sn_stream(*conn);
+                    stream = sn_stream(
+                            *conn,
+                            cmd == "data"            ? sn_stream_kind::data
+                            : cmd == "onion_request" ? sn_stream_kind::onion
+                                                     : sn_stream_kind::command);
                 } catch (const std::exception& e) {
                     // The connection is on its way out; the caller retries later.
-                    log::debug(logcat, "Could not open a stream for {} request: {}", cmd, e.what());
+                    log::debug(logcat, "Could not get a stream for {} request: {}", cmd, e.what());
                     return reply(false, {"TIMEOUT"s});
                 }
+                if (!stream)
+                    return reply(false, {"TIMEOUT"s});
                 stream->command(cmd, body, timeout, [reply, storage_cc](quic::message m) {
                     if (m.timed_out)
                         return reply(false, {"TIMEOUT"s});
@@ -440,9 +456,6 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
                 quic::connection_closed_callback{[this](quic::Connection& c, uint64_t ec) {
                     on_conn_closed(c, ec, reach_ep_idx);
                 }});
-        // Our request stream; opening it now makes it stream 0 on this connection.
-        conn->open_stream<quic::BTRequestStream>(
-                [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); });
     } catch (const std::exception& e) {
         log::warning(logcat, "Failed to initiate connection to {}: {}", pk, e.what());
         std::vector<sn_conn_callback> waiting;
@@ -458,11 +471,39 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
     }
 }
 
-std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(quic::Connection& c) {
-    if (auto s = c.get_stream<quic::BTRequestStream>(0))
-        return s;
-    return c.open_stream<quic::BTRequestStream>(
-            [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); });
+std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
+        const quic::Connection& c, sn_stream_kind kind) {
+    std::optional<sn_streams> streams;
+    {
+        std::lock_guard lock{sn_conns_mutex_};
+        if (auto it = sn_streams_.find(c.reference_id()); it != sn_streams_.end())
+            streams = it->second;
+    }
+    if (!streams) {
+        log::error(logcat, "Internal error: no stream set for SN connection {}", c.reference_id());
+        return nullptr;
+    }
+
+    switch (kind) {
+        case sn_stream_kind::command: return streams->command;
+        case sn_stream_kind::data: return streams->data;
+        case sn_stream_kind::onion: break;
+    }
+
+    // The stream counters live on the QUIC loop (one loop for all our endpoints), so read them
+    // all in one trip rather than one round trip per stream.
+    return reach_ep->job_queue.call_get([&onion = streams->onion] {
+        std::shared_ptr<quic::BTRequestStream> best;
+        size_t best_outstanding = 0;
+        for (auto& s : onion) {
+            auto [acked, unacked, unsent, retained] = s->get_stats();
+            if (!best || unacked + unsent < best_outstanding) {
+                best = s;
+                best_outstanding = unacked + unsent;
+            }
+        }
+        return best;
+    });
 }
 
 void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
@@ -747,7 +788,7 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
                     }
                     std::shared_ptr<quic::BTRequestStream> stream;
                     try {
-                        stream = sn_stream(*conn);
+                        stream = sn_stream(*conn, sn_stream_kind::command);
                     } catch (const std::exception& e) {
                         log::debug(
                                 logcat,
@@ -756,6 +797,8 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
                                 e.what());
                         return report(std::move(test), false);
                     }
+                    if (!stream)
+                        return report(std::move(test), false);
                     ping(std::move(test), *stream, false);
                 });
         return;

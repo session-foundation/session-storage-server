@@ -77,14 +77,12 @@ def delete_before(sk, *, ago=120, timestamp=None):
     )
 
 
-def get_swarm(omq, conn, sk, netid=5):
+def get_swarm(rpc, conn, sk, netid=5):
     pubkey = (
         "{:02x}".format(netid)
         + (sk.verify_key if isinstance(sk, SigningKey) else sk.public_key).encode().hex()
     )
-    r = omq.request_future(
-        conn, "storage.get_swarm", [json.dumps({"pubkey": pubkey}).encode()]
-    ).get()
+    r = rpc.request(conn, "get_swarm", json.dumps({"pubkey": pubkey}).encode()).get()
     assert len(r) == 1
     return json.loads(r[0])
 
@@ -93,7 +91,13 @@ def random_swarm_members(swarm, n, exclude={}):
     return random.sample([s for s in swarm['snodes'] if s['pubkey_ed25519'] not in exclude], n)
 
 
-def store_n(omq, conn, sk, basemsg, n, *, offset=0, netid=5, now=time.time(), ttl=30):
+def store_n(rpc, conn, sk, basemsg, n, *, offset=0, netid=5, now=None, ttl=30):
+    """Stores n messages one at a time, so that the server assigns their ids in list order; tests
+    rely on that when they page with last_hash or index into a retrieve result."""
+    # Not a default argument: that is evaluated once at import, and a run longer than the server's
+    # timestamp tolerance would then have every later store rejected as stale.
+    if now is None:
+        now = time.time()
     msgs = []
     pubkey = (
         chr(netid).encode()
@@ -114,9 +118,9 @@ def store_n(omq, conn, sk, basemsg, n, *, offset=0, netid=5, now=time.time(), tt
                 },
             }
         )
-        msgs[-1]['future'] = omq.request_future(
-            conn, "storage.store", [json.dumps(msgs[-1]['req']).encode()]
-        )
+        resp = rpc.request(conn, "store", json.dumps(msgs[-1]['req']).encode()).get()
+        assert len(resp) == 1, resp
+        msgs[-1]['store'] = json.loads(resp[0].decode())
         msgs[-1]['hash'] = (
             blake2b(pubkey + msgs[-1]['data'], encoder=Base64Encoder).decode().rstrip('=')
         )
@@ -124,9 +128,6 @@ def store_n(omq, conn, sk, basemsg, n, *, offset=0, netid=5, now=time.time(), tt
     assert len({m['hash'] for m in msgs}) == len(msgs)
 
     for m in msgs:
-        resp = m['future'].get()
-        assert len(resp) == 1
-        m['store'] = json.loads(resp[0].decode())
 
         assert len(m['store']['swarm']) >= 5
         assert not any('failed' in v for v in m['store']['swarm'].values())

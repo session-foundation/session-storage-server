@@ -1,4 +1,3 @@
-from util import sn_address
 import ss
 import subaccount
 import time
@@ -14,20 +13,20 @@ def b64(data: bytes):
     return base64.b64encode(data).decode()
 
 
-def test_retrieve_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_retrieve_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # Store a message for myself, using master key
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -60,9 +59,9 @@ def test_retrieve_subaccount(omq, random_sn, sk, exclude):
 
     assert dude_token.hex() == '03030000' + dude_sk.verify_key.encode().hex()
 
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -84,11 +83,11 @@ def test_retrieve_subaccount(omq, random_sn, sk, exclude):
     assert r["messages"][0]["hash"] == hash
 
 
-def test_store_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_store_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
@@ -99,9 +98,9 @@ def test_store_subaccount(omq, random_sn, sk, exclude):
     sig = dude_sk.sign(f"store42{ts}".encode()).signature
 
     # Store a message using the subaccount
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -131,9 +130,9 @@ def test_store_subaccount(omq, random_sn, sk, exclude):
         assert hash == v['hash']
 
     # Retrieve using master key:
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -154,14 +153,14 @@ def test_store_subaccount(omq, random_sn, sk, exclude):
     assert s["messages"][0]["hash"] == hash
 
 
-def test_expire_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     # Store using the master key
-    msgs = ss.store_n(omq, conn, sk, b"omg123", 3, netid=3)
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 3, netid=3)
 
     now = int(time.time() * 1000)
     for m in msgs:
@@ -173,9 +172,9 @@ def test_expire_subaccount(omq, random_sn, sk, exclude):
 
     # Update one of the expiries from ~1min from now -> 1day from now
     sig = dude_sk.sign(f"expire{new_exp}{msgs[0]['hash']}".encode()).signature
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.expire',
+        'expire',
         [
             json.dumps(
                 {
@@ -202,9 +201,9 @@ def test_expire_subaccount(omq, random_sn, sk, exclude):
 
     new_exp = now + 12 * 60 * 60 * 1000
     sig = dude_sk.sign(f"expire{new_exp}{''.join(m['hash'] for m in msgs)}".encode()).signature
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.expire',
+        'expire',
         [
             json.dumps(
                 {
@@ -227,20 +226,20 @@ def test_expire_subaccount(omq, random_sn, sk, exclude):
         assert set(exp["updated"]) == set([m['hash'] for m in msgs[1:]])
 
 
-def test_revoke_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_revoke_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # Store a message for myself, using master key
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -267,9 +266,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
         assert hash == v['hash']
 
     # Also store another message in the revoked-keys-allowed namespace
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -300,9 +299,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     to_sign = f"retrieve42{ts}".encode()
     sig = dude_sk.sign(to_sign).signature
 
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -324,9 +323,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert r["messages"][0]["hash"] == hash
 
     # revoked_subaccounts should not list any token
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoked_subaccounts',
+        'revoked_subaccounts',
         [
             json.dumps(
                 {
@@ -344,9 +343,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert len(r["revoked_subaccounts"]) == 0
 
     # Revoke the subaccount
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoke_subaccount',
+        'revoke_subaccount',
         [
             json.dumps(
                 {
@@ -377,9 +376,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
             raise e
 
     # Try to retrieve it again using the subaccount, should fail
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -396,9 +395,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert r == [b'401', b'retrieve signature verification failed']
 
     # revoked_subaccounts should list the corresponding token
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoked_subaccounts',
+        'revoked_subaccounts',
         [
             json.dumps(
                 {
@@ -417,9 +416,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert r["revoked_subaccounts"][0] == b64(dude_token)
 
     # But the one in the revoked-keys-allowed namespace should work:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -439,9 +438,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert r["messages"][0]["hash"] == revoke_allowed_hash
 
     # Unrevoke it:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.unrevoke_subaccount',
+        'unrevoke_subaccount',
         [
             json.dumps(
                 {
@@ -474,9 +473,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
             raise e
 
     # Retrieve should work now:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -498,9 +497,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert r["messages"][0]["hash"] == hash
 
     # revoked_subaccounts should not list any token
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoked_subaccounts',
+        'revoked_subaccounts',
         [
             json.dumps(
                 {
@@ -518,9 +517,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     assert len(r["revoked_subaccounts"]) == 0
 
     # Revoke the subaccount again:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoke_subaccount',
+        'revoke_subaccount',
         [
             json.dumps(
                 {
@@ -556,9 +555,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     for i in range(49):
         another_sk, another_token, another_sig = subaccount.make_subaccount(0x03, sk)
         revoke_list.append(another_token)
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoke_subaccount',
+        'revoke_subaccount',
         [
             json.dumps(
                 {
@@ -587,9 +586,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
             raise e
 
     # Try retrieving it again using the subaccount, should fail again
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -608,9 +607,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     # Revoke one more subaccount, the original subaccount should now succeed in retrieving the messages
     another_sk, another_token, another_sig = subaccount.make_subaccount(0x03, sk)
     revoke_list.append(another_token)
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.revoke_subaccount',
+        'revoke_subaccount',
         [
             json.dumps(
                 {
@@ -628,9 +627,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
 
     # Try retrieving it again using the subaccount, should succeed now (because only the most recent
     # 50 revocations are kept by the swarm):
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -657,9 +656,9 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
     for i in range(10):
         another_sk, another_token, another_sig = subaccount.make_subaccount(0x03, sk)
         revoke_list.append(another_token)
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.unrevoke_subaccount',
+        'unrevoke_subaccount',
         [
             json.dumps(
                 {
@@ -689,11 +688,11 @@ def test_revoke_subaccount(omq, random_sn, sk, exclude):
             raise e
 
 
-def test_subaccount_permissions(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_subaccount_permissions(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
@@ -717,9 +716,9 @@ def test_subaccount_permissions(omq, random_sn, sk, exclude):
     to_sign = f"retrieve42{ts}".encode()
 
     for i in range(4):
-        r = omq.request_future(
+        r = rpc.request(
             conn,
-            'storage.retrieve',
+            'retrieve',
             [
                 json.dumps(
                     {
@@ -750,9 +749,9 @@ def test_subaccount_permissions(omq, random_sn, sk, exclude):
     )
 
     for i in range(4):
-        r = omq.request_future(
+        r = rpc.request(
             conn,
-            'storage.store',
+            'store',
             [
                 json.dumps(
                     {
@@ -778,9 +777,9 @@ def test_subaccount_permissions(omq, random_sn, sk, exclude):
                 assert v['hash'] == hash
 
     for i in range(4):
-        r = omq.request_future(
+        r = rpc.request(
             conn,
-            'storage.delete',
+            'delete',
             [
                 json.dumps(
                     {
@@ -803,9 +802,9 @@ def test_subaccount_permissions(omq, random_sn, sk, exclude):
             assert r == [b'401', b'delete_msgs signature verification failed']
 
     for i in range(4):
-        r = omq.request_future(
+        r = rpc.request(
             conn,
-            'storage.retrieve',
+            'retrieve',
             [
                 json.dumps(
                     {

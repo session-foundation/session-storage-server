@@ -1,39 +1,63 @@
 import pytest
-from oxenmq import OxenMQ, Address
-import json
 import random
+
+import transport
 
 
 def pytest_addoption(parser):
     parser.addoption("--exclude", action="store", default="")
-
-
-@pytest.fixture(scope="module")
-def omq():
-    omq = OxenMQ()
-    omq.max_message_size = 10 * 1024 * 1024
-    omq.start()
-    return omq
-
-
-@pytest.fixture(scope="module")
-def sns(omq):
-    remote = omq.connect_remote(
-        Address(
-            "curve://public.session.foundation:38161/9c5201e30957cd44e3dcc8ad7f94f48e6914deef77390f77a439a2d7e7f4cb5c"
-        )
+    parser.addoption(
+        "--transport",
+        action="store",
+        default="https",
+        choices=sorted(transport.TRANSPORTS),
+        help="how to send storage RPC requests to the storage servers under test",
     )
-    x = omq.request_future(remote, "rpc.get_service_nodes", b'{"active_only": true}').get()
-    assert len(x) == 2 and x[0] == b'200'
-    return json.loads(x[1])
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "omq: the test itself uses oxenmq features (skipped under other transports)"
+    )
+    config.addinivalue_line(
+        "markers", "bt: the test sends bt-encoded requests (skipped on json-only transports)"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    t = transport.TRANSPORTS[config.getoption("transport")]
+    for item in items:
+        if "omq" in item.keywords and t is not transport.OMQ:
+            item.add_marker(pytest.mark.skip(reason="requires --transport=omq"))
+        if "bt" in item.keywords and not t.bt:
+            item.add_marker(pytest.mark.skip(reason=f"{t.name} transport carries json only"))
 
 
 @pytest.fixture(scope="module")
-def random_sn(omq, sns):
-    sn = random.choice(sns['service_node_states'])
-    addr = Address(sn['public_ip'], sn['storage_lmq_port'], bytes.fromhex(sn['pubkey_x25519']))
-    conn = omq.connect_remote(addr)
-    return conn
+def rpc(pytestconfig):
+    return transport.TRANSPORTS[pytestconfig.getoption("transport")]()
+
+
+@pytest.fixture(scope="module")
+def sns(rpc):
+    fields = {
+        f: True
+        for f in (
+            'public_ip',
+            'storage_port',
+            'storage_lmq_port',
+            'pubkey_ed25519',
+            'pubkey_x25519',
+            'service_node_pubkey',
+        )
+    }
+    r = rpc.oxend("get_service_nodes", {"active_only": True, "fields": fields})
+    return [transport.normalize_oxend_snode(sn) for sn in r['service_node_states']]
+
+
+@pytest.fixture(scope="module")
+def random_sn(rpc, sns):
+    return rpc.connect(random.choice(sns))
 
 
 @pytest.fixture

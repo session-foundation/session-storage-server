@@ -1,4 +1,4 @@
-from util import sn_address
+import pytest
 import ss
 import subaccount
 import time
@@ -13,6 +13,10 @@ import base64
 
 import oxenmq
 from oxenc import bt_serialize, bt_deserialize
+
+# Message monitoring is an oxenmq (and, in future, QUIC) feature: the node pushes notifications to
+# us over the connection, which HTTPS cannot do.
+pytestmark = pytest.mark.omq
 
 
 def notify_request(
@@ -57,8 +61,8 @@ def notify_request(
     return req
 
 
-def test_monitor_reg_ed(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_reg_ed(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     o = oxenmq.OxenMQ()
     o.start()
@@ -88,8 +92,8 @@ def test_monitor_reg_ed(omq, random_sn, sk, exclude):
     assert registered == [[b'd7:successi1ee']] * len(registered)
 
 
-def test_monitor_reg_session(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_reg_session(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     o = oxenmq.OxenMQ()
     o.start()
@@ -119,8 +123,8 @@ def test_monitor_reg_session(omq, random_sn, sk, exclude):
     assert registered == [[b'd7:successi1ee']] * len(registered)
 
 
-def test_monitor_reg_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_reg_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     o = oxenmq.OxenMQ()
     o.start()
@@ -161,8 +165,8 @@ def test_monitor_reg_subaccount(omq, random_sn, sk, exclude):
     assert registered == [[b'd7:successi1ee']] * len(registered)
 
 
-def test_monitor_push(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_push(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     conns = {}
 
@@ -224,16 +228,16 @@ def test_monitor_push(omq, random_sn, sk, exclude):
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     # print(f"starting store at {time.time()}")
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -247,9 +251,9 @@ def test_monitor_push(omq, random_sn, sk, exclude):
     )
 
     # And another, but this one in a non-monitored namespace:
-    s2 = omq.request_future(
+    s2 = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -295,8 +299,8 @@ def test_monitor_push(omq, random_sn, sk, exclude):
     assert [s['response'] for s in swarm['snodes']] == [[expected_notify]] * len(swarm['snodes'])
 
 
-def test_monitor_multi(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_multi(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     conns = {}
 
@@ -349,16 +353,16 @@ def test_monitor_multi(omq, random_sn, sk, exclude):
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     # print(f"starting store at {time.time()}")
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {

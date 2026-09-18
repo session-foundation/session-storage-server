@@ -1,4 +1,3 @@
-from util import sn_address
 import ss
 import time
 import base64
@@ -8,19 +7,19 @@ from nacl.hash import blake2b
 from nacl.signing import VerifyKey
 
 
-def test_store(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_store(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -54,18 +53,18 @@ def test_store(omq, random_sn, sk, exclude):
     assert ts - 30000 <= s['t'] <= ts + 30000
 
 
-def test_store_retrieve_unauthenticated(omq, random_sn, sk, exclude):
+def test_store_retrieve_unauthenticated(rpc, random_sn, sk, exclude):
     """Attempts to retrieve messages without authentication.  This should fail (as of HF19)."""
-    sns = ss.random_swarm_members(ss.get_swarm(omq, random_sn, sk), 2, exclude)
-    conn1 = omq.connect_remote(sn_address(sns[0]))
+    sns = ss.random_swarm_members(ss.get_swarm(rpc, random_sn, sk), 2, exclude)
+    conn1 = rpc.connect(sns[0])
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn1,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -88,32 +87,32 @@ def test_store_retrieve_unauthenticated(omq, random_sn, sk, exclude):
 
     assert all(v['hash'] == hash for v in s['swarm'].values())
 
-    conn2 = omq.connect_remote(sn_address(sns[1]))
-    r = omq.request_future(
+    conn2 = rpc.connect(sns[1])
+    r = rpc.request(
         conn2,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex()}).encode()],
     ).get()
 
     assert r == [b'401', b'retrieve: request signature required']
 
 
-def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
+def test_store_retrieve_authenticated(rpc, random_sn, sk, exclude):
     xsk = sk.to_curve25519_private_key()
     xpk = xsk.public_key
-    sn_x = ss.random_swarm_members(ss.get_swarm(omq, random_sn, xsk), 1, exclude)[0]
-    sn_ed = ss.random_swarm_members(ss.get_swarm(omq, random_sn, sk), 1, exclude)[0]
-    conn_x = omq.connect_remote(sn_address(sn_x))
-    conn_ed = omq.connect_remote(sn_address(sn_ed))
+    sn_x = ss.random_swarm_members(ss.get_swarm(rpc, random_sn, xsk), 1, exclude)[0]
+    sn_ed = ss.random_swarm_members(ss.get_swarm(rpc, random_sn, sk), 1, exclude)[0]
+    conn_x = rpc.connect(sn_x)
+    conn_ed = rpc.connect(sn_ed)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store message for myself, using both my ed25519 key and x25519 key to test different auth
     # modes
-    s1 = omq.request_future(
+    s1 = rpc.request(
         conn_x,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -125,9 +124,9 @@ def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    s2 = omq.request_future(
+    s2 = rpc.request(
         conn_ed,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -162,9 +161,9 @@ def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     badsig = sig[0:4] + ('z' if sig[4] != 'z' else 'a') + sig[5:]
 
-    r_good1 = omq.request_future(
+    r_good1 = rpc.request(
         conn_x,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -176,18 +175,18 @@ def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    r_good2 = omq.request_future(
+    r_good2 = rpc.request(
         conn_ed,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {"pubkey": '03' + sk.verify_key.encode().hex(), "timestamp": ts, "signature": sig}
             ).encode()
         ],
     )
-    r_bad1 = omq.request_future(
+    r_bad1 = rpc.request(
         conn_x,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -199,9 +198,9 @@ def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    r_bad2 = omq.request_future(
+    r_bad2 = rpc.request(
         conn_ed,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -212,9 +211,9 @@ def test_store_retrieve_authenticated(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    r_bad3 = omq.request_future(
+    r_bad3 = rpc.request(
         conn_ed,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -253,21 +252,21 @@ def exactly_one(iterable):
     return found_one and not found_more
 
 
-def test_store_retrieve_multiple(omq, random_sn, sk, exclude):
-    sns = ss.random_swarm_members(ss.get_swarm(omq, random_sn, sk), 2, exclude)
-    conn1 = omq.connect_remote(sn_address(sns[0]))
+def test_store_retrieve_multiple(rpc, random_sn, sk, exclude):
+    sns = ss.random_swarm_members(ss.get_swarm(rpc, random_sn, sk), 2, exclude)
+    conn1 = rpc.connect(sns[0])
 
     basemsg = b"This is my message \x00<--that's a null, this is invalid utf8: \x80\xff"
 
     # Store 5 messages
-    msgs = ss.store_n(omq, conn1, sk, basemsg, 5)
+    msgs = ss.store_n(rpc, conn1, sk, basemsg, 5)
 
     # Retrieve all messages from the swarm (should give back the 5 we just stored):
-    conn2 = omq.connect_remote(sn_address(sns[1]))
+    conn2 = rpc.connect(sns[1])
     ts = int(time.time() * 1000)
-    resp = omq.request_future(
+    resp = rpc.request(
         conn2,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -294,12 +293,12 @@ def test_store_retrieve_multiple(omq, random_sn, sk, exclude):
 
     # Store 6 more messages
     basemsg = b'another msg'
-    new_msgs = ss.store_n(omq, conn2, sk, basemsg, 6, offset=1)
+    new_msgs = ss.store_n(rpc, conn2, sk, basemsg, 6, offset=1)
 
     # Retrieve using a last_hash so that we should get back only the 6:
-    resp = omq.request_future(
+    resp = rpc.request(
         conn1,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -326,9 +325,9 @@ def test_store_retrieve_multiple(omq, random_sn, sk, exclude):
         assert source['req']['expiry'] == m['expiration']
 
     # Give an unknown hash which should retrieve all:
-    r = omq.request_future(
+    r = rpc.request(
         conn2,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -347,13 +346,13 @@ def test_store_retrieve_multiple(omq, random_sn, sk, exclude):
     assert len(r['messages']) == 11
 
 
-def test_store_sig_timestamp(omq, random_sn, sk, exclude):
+def test_store_sig_timestamp(rpc, random_sn, sk, exclude):
     """Tests that sig_timestamp is used properly for the signature both sig_timestamp and timestamp
     are given."""
-    swarm = ss.get_swarm(omq, random_sn, sk)
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ns = 123
@@ -363,9 +362,9 @@ def test_store_sig_timestamp(omq, random_sn, sk, exclude):
     # Should be fine: timestamp is current, and we sign with it (so timestamp is double double-duty
     # as both the message timestamp, and the signature timestamp):
     to_sign = f"store{ns}{ts}".encode()
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -389,9 +388,9 @@ def test_store_sig_timestamp(omq, random_sn, sk, exclude):
 
     # Fails because timestamp is too old for a store signature:
     to_sign = f"store{ns}{ts}".encode()
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -410,9 +409,9 @@ def test_store_sig_timestamp(omq, random_sn, sk, exclude):
     # This should work: sig_timestamp is current, timestamp is old:
     sig_ts = int(time.time() * 1000)
     to_sign = f"store{ns}{sig_ts}".encode()
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {

@@ -1,4 +1,3 @@
-from util import sn_address
 import ss
 import time
 import base64
@@ -16,49 +15,45 @@ msg_size = 70000
 
 
 @pytest.fixture(scope='module')
-def big_store(omq, random_sn, exclude):
+def big_store(rpc, random_sn, exclude):
     sk = SigningKey.generate()
-    swarm = ss.get_swarm(omq, random_sn, sk)
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     pk = '03' + sk.verify_key.encode().hex()
 
+    # One store at a time: the tests below assume `hashes` is in id order, which only holds if
+    # the server saw the stores in this order.
     hashes = []
-    for x in range(12):
-        s = []
-        for y in range(10):
-            ts = int(time.time() * 1000)
-            exp = ts + ttl
-            msg = nacl.utils.random(msg_size)
-            s.append(
-                omq.request_future(
-                    conn,
-                    'storage.store',
-                    [
-                        json.dumps(
-                            {
-                                "pubkey": pk,
-                                "timestamp": ts,
-                                "ttl": ttl,
-                                "data": base64.b64encode(msg).decode(),
-                            }
-                        ).encode()
-                    ],
-                )
-            )
-        for si in s:
-            si = si.get()
-            assert len(si) == 1
-            si = json.loads(si[0])
-            assert 'hash' in si
-            hashes.append(si['hash'])
+    for x in range(120):
+        ts = int(time.time() * 1000)
+        exp = ts + ttl
+        msg = nacl.utils.random(msg_size)
+        s = rpc.request(
+            conn,
+            'store',
+            [
+                json.dumps(
+                    {
+                        "pubkey": pk,
+                        "timestamp": ts,
+                        "ttl": ttl,
+                        "data": base64.b64encode(msg).decode(),
+                    }
+                ).encode()
+            ],
+        ).get()
+        assert len(s) == 1
+        s = json.loads(s[0])
+        assert 'hash' in s
+        hashes.append(s['hash'])
 
     return {'conn': conn, 'sk': sk, 'pk': pk, 'hashes': hashes}
 
 
-def test_retrieve_count(omq, big_store):
+def test_retrieve_count(rpc, big_store):
     conn = big_store['conn']
     sk = big_store['sk']
     pk = big_store['pk']
@@ -68,15 +63,15 @@ def test_retrieve_count(omq, big_store):
     to_sign = "retrieve{}".format(ts).encode()
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
 
-    s5 = omq.request_future(
+    s5 = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": pk, "timestamp": ts, "signature": sig, "max_count": 5})],
     )
 
-    s8 = omq.request_future(
+    s8 = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -90,9 +85,9 @@ def test_retrieve_count(omq, big_store):
         ],
     )
 
-    s20 = omq.request_future(
+    s20 = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -107,9 +102,9 @@ def test_retrieve_count(omq, big_store):
     )
 
     # This one is a little tricky: our last one is the limit, but we should still get more: false
-    s10 = omq.request_future(
+    s10 = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -142,9 +137,9 @@ def test_retrieve_count(omq, big_store):
     assert not s20['more']
 
     # We request 100, but should hit the implicit max size at 83
-    s100 = omq.request_future(
+    s100 = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -171,7 +166,7 @@ def test_retrieve_count(omq, big_store):
     assert not s10['more']
 
 
-def test_retrieve_size(omq, big_store):
+def test_retrieve_size(rpc, big_store):
     conn = big_store['conn']
     sk = big_store['sk']
     pk = big_store['pk']
@@ -181,9 +176,9 @@ def test_retrieve_size(omq, big_store):
     to_sign = "retrieve{}".format(ts).encode()
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
 
-    s500k = omq.request_future(
+    s500k = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -197,9 +192,9 @@ def test_retrieve_size(omq, big_store):
         ],
     )
 
-    s600k = omq.request_future(
+    s600k = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -213,9 +208,9 @@ def test_retrieve_size(omq, big_store):
         ],
     )
 
-    smax = omq.request_future(
+    smax = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -229,9 +224,9 @@ def test_retrieve_size(omq, big_store):
         ],
     )
 
-    smax_nomore = omq.request_future(
+    smax_nomore = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -245,9 +240,9 @@ def test_retrieve_size(omq, big_store):
         ],
     )
 
-    sthird = omq.request_future(
+    sthird = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -261,15 +256,15 @@ def test_retrieve_size(omq, big_store):
         ],
     )
 
-    sdefault = omq.request_future(
+    sdefault = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": pk, "timestamp": ts, "signature": sig, "last_hash": hashes[89]})],
     )
 
-    sdefault_nomore = omq.request_future(
+    sdefault_nomore = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": pk, "timestamp": ts, "signature": sig, "last_hash": hashes[103]})],
     )
 
@@ -320,7 +315,7 @@ def test_retrieve_size(omq, big_store):
     assert not sdefault_nomore['more']
 
 
-def test_retrieve_size_and_count(omq, big_store):
+def test_retrieve_size_and_count(rpc, big_store):
     conn = big_store['conn']
     sk = big_store['sk']
     pk = big_store['pk']
@@ -330,9 +325,9 @@ def test_retrieve_size_and_count(omq, big_store):
     to_sign = "retrieve{}".format(ts).encode()
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
 
-    s5_or_1M = omq.request_future(
+    s5_or_1M = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -347,9 +342,9 @@ def test_retrieve_size_and_count(omq, big_store):
         ],
     )
 
-    s10_or_700k = omq.request_future(
+    s10_or_700k = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {

@@ -279,7 +279,7 @@ void ServiceNode::bootstrap_fallback() {
     } else {
         seed_nodes.emplace_back(
                 "curve://storage.seed2.loki.network:38161/"
-                "80adaead94db3b0402a6057869bdbe63204a28e93589fd95a035480ed6c03b45");
+                "9c5201e30957cd44e3dcc8ad7f94f48e6914deef77390f77a439a2d7e7f4cb5c");
     }
 
     auto req_counter = std::make_shared<std::atomic<int>>(0);

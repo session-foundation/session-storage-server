@@ -141,8 +141,12 @@ parse_result parse_cli_args(int argc, char* argv[]) {
     cli.add_option(
                "--log-level",
                options.log_level,
-               "Log verbosity level, see Log Levels below for accepted values")
-            ->type_name("LEVEL")
+               "Log verbosity: a level (trace, debug, info, warning, error, critical, off) for "
+               "everything, and/or comma-separated CAT=LEVEL entries for individual categories, "
+               "applied in order (e.g. '*=warning,snode=debug').  Storage server categories: "
+               "daemon, server, ssquic, snode, swarm, db, rpc, http, crypto, logging; the quic "
+               "and oxenmq libraries log under those names.")
+            ->type_name("LEVELS")
             ->capture_default_str();
     cli.add_option(
                "--oxend-rpc",

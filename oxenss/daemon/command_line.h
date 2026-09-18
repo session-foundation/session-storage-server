@@ -5,6 +5,8 @@
 #include <variant>
 #include <vector>
 
+#include <oxenss/logging/oxen_logger.h>
+
 namespace oxenss::cli {
 
 struct command_line_options {
@@ -18,7 +20,7 @@ struct command_line_options {
     bool skip_bootstrap = false;
     bool force_start = false;
     bool testnet = false;
-    std::string log_level = "info";
+    std::string log_level{logging::DEFAULT_LOG_LEVELS};
     std::filesystem::path data_dir;
     std::string oxend_key;          // test only (but needed for backwards compatibility)
     std::string oxend_x25519_key;   // test only

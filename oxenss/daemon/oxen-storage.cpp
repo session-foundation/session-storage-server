@@ -58,19 +58,14 @@ int main(int argc, char* argv[]) {
     if (!fs::exists(options.data_dir))
         fs::create_directories(options.data_dir);
 
-    log::Level log_level;
-    try {
-        log_level = log::level_from_string(options.log_level);
-    } catch (const std::invalid_argument& e) {
+    if (!logging::init(options.data_dir, options.log_level)) {
         log::critical(
                 logcat,
-                "{}; supported levels: trace, debug, info, warn, error, critical, off",
-                e.what(),
+                "Invalid --log-level '{}': expected a level (trace, debug, info, warning, error, "
+                "critical, off) and/or CAT=LEVEL entries",
                 options.log_level);
         return EXIT_FAILURE;
     }
-
-    logging::init(options.data_dir, log_level);
 
     if (options.testnet) {
         is_mainnet = false;
@@ -80,7 +75,7 @@ int main(int argc, char* argv[]) {
     // Always print version for the logs
     log::info(logcat, "{}", STORAGE_SERVER_VERSION_INFO);
 
-    log::info(logcat, "Setting log level to {}", options.log_level);
+    log::info(logcat, "Log levels: {}", options.log_level);
     log::info(logcat, "Setting database location to {}", util::to_sv(options.data_dir.u8string()));
     log::info(logcat, "Connecting to oxend @ {}", options.oxend_omq_rpc);
 

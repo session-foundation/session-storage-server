@@ -126,14 +126,6 @@ class ServiceNode {
 
     mutable std::recursive_mutex sn_mutex_;
 
-    // The hash of the last swarms blob that was serialised, used for dirty checks before storing to
-    // the DB.
-    uint64_t last_swarms_serialize_hash = 0;
-
-    // The hash of the last retryable requsts blob that was serialised, used for dirty checks before
-    // storing to the DB.
-    uint64_t last_retryable_serialize_hash = 0;
-
     void send_notifies(message m);
 
     // Save multiple messages to the database at once (i.e. in a single transaction).  Returns
@@ -199,25 +191,12 @@ class ServiceNode {
     void on_delivery_reply(
             const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok);
 
-    /// Distribute all our data to where it belongs
-    /// (called when our old node got dissolved)
-    void salvage_data() const;  // mutex not needed
-
-    /// Reliably push message/batch to a service node.  The node must be contactable!
-    void relay_data_reliable(
-            const std::string& blob,
-            const crypto::legacy_pubkey& snpk,
-            const contact& ct) const;  // mutex not needed
-
     // Conducts any ping peer tests that are due; (this is designed to be called frequently and
     // does nothing if there are no tests currently due).
     void ping_peers();
 
     /// Pings oxend (as required for uptime proofs)
     void oxend_ping();
-
-    /// Check if it is our turn to test and initiate peer test if so
-    void initiate_peer_test();
 
     // Initiate node ping tests
     void test_reachability(const crypto::legacy_pubkey& sn, int previous_failures);
@@ -322,11 +301,6 @@ class ServiceNode {
     // initial data and timers that rely on an oxend connection.  This blocks until we get an
     // initial service node block update back from oxend.
     void on_oxend_connected();
-
-    // Parses the result of a `get_service_nodes` oxend rpc request, loading the service node state
-    // into our contact details and returning a "block_update" struct containing various details of
-    // the update.  Returns a nullopt if the RPC response indicates that nothing has changed.
-    std::optional<block_update> update_snodes(std::string_view response_body);
 
     // Called when oxend notifies us of a new block to update swarm info
     void update_swarms(std::promise<bool>* on_completion = nullptr);

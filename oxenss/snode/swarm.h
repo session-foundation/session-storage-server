@@ -59,15 +59,14 @@ enum struct SwarmRequestedDBDump {
     Nil,
     NeedsToRequest,
     RequestUnderway,
-    Done,
 };
 
 struct SwarmMemberState {
     SwarmMemberStatus status;
 
-    // Flags for if our storage server needs to initiate a request to receive a DB dump from this
-    // member. 'Nil' if no action is to be taken, otherwise this flag transition from
-    // 'NeedsToRequest' to 'RequestUnderway' to 'Done' via the outgoing data ready handshake.
+    // Whether we need to ask this member for a dump of the swarm's messages: the request goes out
+    // with the data_ready handshake, moving this from NeedsToRequest to RequestUnderway, and back
+    // to Nil once acknowledged (or to NeedsToRequest to try again if it fails).
     SwarmRequestedDBDump our_ss_requested_db_dump;
 
     // The earliest timestamp at which the swarm will check if they have received contact

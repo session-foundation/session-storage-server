@@ -33,13 +33,6 @@ enum class StoreResult {
     Full,      // Can't insert right now because the database is full.
 };
 
-inline std::atomic<int> tmp_init_db_version = 0;
-
-enum class BlobType {
-    Swarms,
-    RetryableRequests,
-};
-
 // Storage database class.
 class Database {
     // Held by pointer so that this header does not have to pull in SQLiteCpp.
@@ -129,11 +122,6 @@ class Database {
 
     // Retrieves all messages.
     std::vector<message> retrieve_all();
-
-    enum class GetMessageCount {
-        All,
-        Owned,  // Only messages that belong to this node's swarm
-    };
 
     // Return the total number of messages stored
     int64_t get_message_count();

@@ -424,11 +424,6 @@ void ServiceNode::record_retrieve_request() {
     all_stats_.bump_retrieve_requests();
 }
 
-struct LookupRetryIndexes {
-    std::optional<size_t> retryable_index;
-    std::optional<size_t> node_index;
-};
-
 void ServiceNode::check_new_members() {
     for (const auto& pk : swarm_.extract_contact_pending_members()) {
         auto c = network_.contacts.find(pk);
@@ -485,10 +480,9 @@ void ServiceNode::check_new_members() {
             if (SwarmMemberState* member = swarm_.is_member_locked(pk); member) {
                 // Update the requested DB dump state machine if necessary.
                 SwarmRequestedDBDump& status = member->our_ss_requested_db_dump;
-                if (status == SwarmRequestedDBDump::RequestUnderway) {
-                    status = success ? SwarmRequestedDBDump::Done
+                if (status == SwarmRequestedDBDump::RequestUnderway)
+                    status = success ? SwarmRequestedDBDump::Nil
                                      : SwarmRequestedDBDump::NeedsToRequest;
-                }
 
                 if (success)
                     member->status = SwarmMemberStatus::Ready;

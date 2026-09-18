@@ -21,22 +21,7 @@ namespace oxenss::server {
 
 namespace quic = oxen::quic;
 
-using quic_callback = std::function<void(quic::message)>;
 using Address = quic::Address;
-
-struct PendingRequest {
-    std::optional<std::string> name = std::nullopt;
-    std::string body;
-    quic_callback func = nullptr;
-
-    // Constructor
-    PendingRequest(std::string name, std::string body, quic_callback func) :
-            name{std::move(name)}, body{std::move(body)}, func{std::move(func)} {}
-    PendingRequest(std::string_view name, std::string_view body, quic_callback func) :
-            name{name}, body{body}, func{std::move(func)} {}
-};
-
-using RequestQueue = std::deque<PendingRequest>;
 
 // ALPN for connections between storage servers (SN_QUIC_VERSION and later).  Node-to-node commands
 // are accepted only on connections negotiated with it, and the listener requires and verifies the
@@ -174,8 +159,6 @@ class QUIC : public MQBase {
     void on_conn_established(quic::Connection& c);
     void on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx);
     void close_redundant_sn_conns();
-
-    std::shared_ptr<quic::Endpoint> create_endpoint();
 
     void handle_request(quic::message msg, size_t ep_idx);
 

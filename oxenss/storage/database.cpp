@@ -1421,10 +1421,8 @@ void Database::remove_node_retry_request(int64_t req_id) {
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
     auto conn = db_->conn();
 
-    // FIXME: retry requests don't have an expiry, so we need to pick a good expiration time
-    //        for these retries.  For now, using 4 hours ago.  Tests will pass 4 hours from
-    //        now.
-    conn.prepared_exec("DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - 4h));
+    conn.prepared_exec(
+            "DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - RETRY_EXPIRY));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {

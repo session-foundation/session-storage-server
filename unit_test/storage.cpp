@@ -483,16 +483,14 @@ TEST_CASE("storage - retry requests", "[storage]") {
     CHECK(req_count == 3);
 
     std::this_thread::sleep_for(500ms);
-    // FIXME: "expiry" is currently 4h, this is incredibly arbitrary and should be considered
-    // further.
-    auto the_future = std::chrono::system_clock::now() + 4h;
+    auto the_future = std::chrono::system_clock::now() + Database::RETRY_EXPIRY;
 
     std::this_thread::sleep_for(
             500ms);  // the following insert should *not* be considered "expired"
     CHECK_NOTHROW(storage.add_retry_request(pubkey, "fools", "barred") == 4);
     req_count = storage.retry_request_count();
     CHECK(req_count == 4);
-    // remove expired, pretending it's 4h (minus the sleep) from now
+    // remove expired, pretending it's RETRY_EXPIRY (minus the sleep) from now
     CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
     req_count = storage.retry_request_count();
     CHECK(req_count == 1);

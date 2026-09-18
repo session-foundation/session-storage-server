@@ -1045,7 +1045,8 @@ void RequestHandler::process_client_req(
         return cb(handle_wrong_swarm(req.pubkey));
 
     auto now = system_clock::now();
-    if (req.timestamp < now - SIGNATURE_TOLERANCE || req.timestamp > now + SIGNATURE_TOLERANCE) {
+    const auto tolerance = req.recurse ? SIGNATURE_TOLERANCE : SIGNATURE_TOLERANCE_FORWARDED;
+    if (req.timestamp < now - tolerance || req.timestamp > now + tolerance) {
         log::debug(
                 logcat,
                 "revoke_subaccount: invalid timestamp ({}s from now)",
@@ -1098,7 +1099,8 @@ void RequestHandler::process_client_req(
         return cb(handle_wrong_swarm(req.pubkey));
 
     auto now = system_clock::now();
-    if (req.timestamp < now - SIGNATURE_TOLERANCE || req.timestamp > now + SIGNATURE_TOLERANCE) {
+    const auto tolerance = req.recurse ? SIGNATURE_TOLERANCE : SIGNATURE_TOLERANCE_FORWARDED;
+    if (req.timestamp < now - tolerance || req.timestamp > now + tolerance) {
         log::debug(
                 logcat,
                 "unrevoke_subaccount: invalid timestamp ({}s from now)",

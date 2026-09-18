@@ -1480,8 +1480,11 @@ void ServiceNode::check_retry_requests() {
                                            const std::string& cmd,
                                            const std::string& payload,
                                            int64_t req_id) {
-        // FIXME: non-swarm-member retries should be purged automatically
-        // std::optional<SwarmMemberState> is_member = swarm_.is_member(key);
+        // A node that has left our swarm no longer owns the messages the request is about
+        if (!swarm_.is_member(key)) {
+            db->remove_node_retry_request(req_id);
+            return false;
+        }
 
         auto ct = contacts().find(key);
         if (!ct || !*ct)

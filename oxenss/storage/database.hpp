@@ -71,11 +71,19 @@ class Database {
 
     // How long after a swarm request to a peer times out before we first retry it.
     static constexpr auto RETRY_INITIAL_DELAY = 15s;
-    // How long to wait between retry attempts once a retry has been sent.
-    static constexpr auto RETRY_INTERVAL = 60s;
+    // How long to wait between retry attempts once a retry has been sent.  With the initial delay
+    // this puts the first two attempts at 15s and 45s (plus up to one retry check interval), both
+    // inside the ±60s the peer allows on a timestamped request's signature; the third attempt at
+    // 75s is refused for those, which ends their retries.
+    static constexpr auto RETRY_INTERVAL = 30s;
     // How long to wait before re-checking a retry that could not be sent because we had no contact
     // details for the peer.
     static constexpr auto RETRY_NO_CONTACT_INTERVAL = 15s;
+    // How long to keep retrying a request.  This bounds how stale a replayed delete or expiry can
+    // be: a peer that has been unreachable for longer than a brief outage is more likely to have
+    // state the client has since changed (a re-stored message, a new expiry) than to still want
+    // the original request.
+    static constexpr auto RETRY_EXPIRY = 15min;
 
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().

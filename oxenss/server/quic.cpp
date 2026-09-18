@@ -9,6 +9,7 @@
 
 #include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxenc/bt_serialize.h>
 
 namespace oxenss::server {
 
@@ -392,13 +393,23 @@ void QUIC::handle_ping(quic::message msg) {
 
 void QUIC::handle_request(quic::message msg, size_t ep_idx) {
     auto& omq = *service_node_->omq_server();
-    auto remote_host = msg.stream()->get_conn()->remote();
+    auto conn = msg.stream()->get_conn();
+    auto remote_host = conn->remote();
     auto remote_ip =
             (remote_host.is_ipv4() ? remote_host.mapped_ipv4_as_ipv6() : remote_host).to_ipv6();
 
+    // The command set depends on the ALPN: an SN_ALPN connection is with an authenticated service
+    // node and carries node-to-node commands; the client ALPN carries client ones.  Only the ping
+    // is on both.
     auto name = msg.endpoint();
-    if (!(name == "snode_ping" || name == "monitor" || name == "onion_req" ||
-          rpc::RequestHandler::client_rpc_endpoints.count(name)))
+    std::optional<crypto::ed25519_pubkey> peer;
+    if (conn->selected_alpn() == SN_ALPN) {
+        peer = sn_key(*conn);
+        if (!peer || !(name == "snode_ping" || name == "data" || name == "data_ready" ||
+                       name == "storage_cc"))
+            throw quic::no_such_endpoint{};
+    } else if (!(name == "snode_ping" || name == "monitor" || name == "onion_req" ||
+                 rpc::RequestHandler::client_rpc_endpoints.count(name)))
         throw quic::no_such_endpoint{};
 
     // We handle everything inside an inject task because if we do *anything* that requires
@@ -408,11 +419,18 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
             "quic",
             "quic:{}"_format(msg.endpoint()),
             remote_host.host(),
-            [this, msg, remote_ip, ep_idx]() mutable {
+            [this, msg, remote_ip, ep_idx, peer]() mutable {
                 auto name = msg.endpoint();
 
                 if (name == "snode_ping")
                     return handle_ping(std::move(msg));
+                if (peer) {
+                    if (name == "data")
+                        return handle_sn_data(std::move(msg));
+                    if (name == "data_ready")
+                        return handle_sn_data_ready(std::move(msg), *peer);
+                    return handle_sn_storage_cc(std::move(msg));
+                }
                 if (name == "monitor")
                     return handle_monitor_message(std::move(msg), ep_idx);
                 if (name == "onion_req")
@@ -431,6 +449,50 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
                                         true);
                         });
             });
+}
+
+void QUIC::handle_sn_data(quic::message msg) {
+    auto body = msg.body();
+    if (body.empty())
+        return msg.respond("Empty data push", true);
+    if (!service_node_->process_push_batch(body, msg.stream()->get_conn()->remote().host()))
+        return msg.respond("Failed to store messages", true);
+    msg.respond("OK");
+}
+
+void QUIC::handle_sn_data_ready(quic::message msg, const crypto::ed25519_pubkey& peer) {
+    auto pk = service_node_->contacts().lookup(peer);
+    if (!pk)
+        return msg.respond("Swarm mismatch", true);
+    auto reply = service_node_->data_ready_handshake(*pk, msg.body());
+    msg.respond(reply, reply != "OK");
+}
+
+void QUIC::handle_sn_storage_cc(quic::message msg) {
+    // The body is the two message parts of the oxenmq version -- the client command name and the
+    // request payload -- as a bt list.
+    std::string_view name, payload;
+    try {
+        oxenc::bt_list_consumer l{msg.body()};
+        name = l.consume_string_view();
+        payload = l.consume_string_view();
+    } catch (const std::exception& e) {
+        return msg.respond("Invalid forwarded request: {}"_format(e.what()), true);
+    }
+
+    bool found = handle_client_rpc(
+            name,
+            payload,
+            std::nullopt,
+            [msg](http::response_code code, std::string_view res_body) {
+                if (code.first == http::OK.first)
+                    msg.respond(res_body);
+                else
+                    msg.respond("{} {}\n\n{}"_format(code.first, code.second, res_body), true);
+            },
+            /*forwarded=*/true);
+    if (!found)
+        msg.respond("Unknown forwarded command {}"_format(name), true);
 }
 
 void QUIC::handle_onion_request(quic::message msg) {

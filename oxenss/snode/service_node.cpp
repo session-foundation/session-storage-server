@@ -756,6 +756,33 @@ void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
             params.dump());
 }
 
+std::string ServiceNode::data_ready_handshake(
+        const crypto::legacy_pubkey& pk, std::string_view payload) {
+    if (!swarm_.is_member(pk))
+        return "Swarm mismatch";
+
+    // Storage servers before SN_DATA_READY_WITH_REQUEST_VERSION send a bare request: they are just
+    // checking that we are reachable before pushing their messages to us, and never ask for ours.
+    bool needs_db_dump = false;
+    if (!payload.empty()) {
+        try {
+            oxenc::bt_dict_consumer d{payload};
+            if (auto version = d.require<uint32_t>("@"); version != 0)
+                return fmt::format("Unsupported data_ready request version {}", version);
+            needs_db_dump = d.require<bool>("t");
+        } catch (const std::exception& e) {
+            log::info(logcat, "Malformed data_ready request from {}: {}", pk, e.what());
+            return "Request payload malformed";
+        }
+    }
+
+    if (needs_db_dump)
+        queue_swarm_dump(pk);
+
+    log::debug(logcat, "data_ready from {} processed (needs db dump: {})", pk, needs_db_dump);
+    return "OK";
+}
+
 void ServiceNode::queue_swarm_dump(const crypto::legacy_pubkey& pk) {
     auto swarm = swarm_.our_swarm_id();
     if (swarm == INVALID_SWARM_ID)

@@ -143,6 +143,11 @@ class QUIC : public MQBase {
 
     void handle_request(quic::message msg, size_t ep_idx);
 
+    // Node-to-node commands, accepted only on SN_ALPN connections (see handle_request).
+    void handle_sn_data(quic::message msg);
+    void handle_sn_data_ready(quic::message msg, const crypto::ed25519_pubkey& peer);
+    void handle_sn_storage_cc(quic::message msg);
+
     void handle_onion_request(quic::message msg);
 
     void handle_monitor_message(quic::message msg, size_t ep_idx);

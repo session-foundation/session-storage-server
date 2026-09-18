@@ -333,6 +333,11 @@ class ServiceNode {
     // swarm.
     void queue_swarm_dump(const crypto::legacy_pubkey& pk);
 
+    // Handles a data_ready handshake from swarm member `pk` (see check_new_members).  `payload`
+    // is the request payload, empty from pre-2.12 nodes.  Returns the reply to send: "OK", or a
+    // reason the handshake was refused.
+    std::string data_ready_handshake(const crypto::legacy_pubkey& pk, std::string_view payload);
+
     // Delivers our stored message with the given hash to swarm peer `pk` over sn.data, retrying
     // until it arrives or the message is gone.  Used when forwarding a client's store to `pk`
     // failed: replaying the store request instead would be refused by the peer once the client's

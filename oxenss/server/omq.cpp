@@ -59,30 +59,11 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     crypto::x25519_pubkey xpk;
     std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
     auto pk = service_node_->contacts().lookup(xpk);
-    if (!pk || !service_node_->swarm().is_member(*pk))
+    if (!pk)
         return message.send_reply("Swarm mismatch");
 
-    // Storage servers before SN_DATA_READY_WITH_REQUEST_VERSION send a bare request: they are just
-    // checking that we are reachable before pushing their messages to us, and never ask for ours.
-    bool needs_db_dump = false;
-    if (!message.data.empty()) {
-        try {
-            oxenc::bt_dict_consumer d{message.data[0]};
-            if (auto version = d.require<uint32_t>("@"); version != 0)
-                return message.send_reply(
-                        fmt::format("Unsupported sn.data_ready request version {}", version));
-            needs_db_dump = d.require<bool>("t");
-        } catch (const std::exception& e) {
-            log::info(logcat, "Malformed sn.data_ready request from {}: {}", *pk, e.what());
-            return message.send_reply("Request payload malformed");
-        }
-    }
-
-    if (needs_db_dump)
-        service_node_->queue_swarm_dump(*pk);
-
-    log::debug(logcat, "sn.data_ready from {} processed (needs db dump: {})", *pk, needs_db_dump);
-    message.send_reply("OK");
+    message.send_reply(service_node_->data_ready_handshake(
+            *pk, message.data.empty() ? std::string_view{} : message.data[0]));
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {

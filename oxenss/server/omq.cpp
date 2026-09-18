@@ -439,19 +439,19 @@ void OMQ::notify_monitor_ended(std::vector<connection_id>& conns, std::string_vi
     send_notification(conns, "notify.monitor_ended", notification);
 }
 
-bool OMQ::sn_request(
+void OMQ::sn_request(
         const snode::contact& ct,
         std::string_view cmd,
         std::vector<std::string> parts,
         sn_reply_callback cb,
-        std::chrono::milliseconds timeout) {
+        std::chrono::milliseconds timeout,
+        sn_fallback) {
     omq_.request(
             ct.pubkey_x25519.view(),
             "sn.{}"_format(cmd),
             std::move(cb),
             oxenmq::send_option::data_parts(parts),
             oxenmq::send_option::request_timeout{timeout});
-    return true;
 }
 
 void OMQ::reachability_test(std::shared_ptr<snode::sn_test> test) {

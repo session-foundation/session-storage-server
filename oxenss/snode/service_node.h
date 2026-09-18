@@ -108,6 +108,9 @@ class ServiceNode {
 
     server::OMQ& omq_server_;
     std::vector<server::MQBase*> mq_servers_;
+    // The QUIC server, once registered: node-to-node requests go to it first, and it hands back
+    // those for nodes that do not speak QUIC to be sent over oxenmq (see sn_request).
+    server::MQBase* quic_server_ = nullptr;
 
     std::atomic<int> oxend_pings_ =
             0;  // Consecutive successful pings, used for batching logs about it
@@ -338,9 +341,8 @@ class ServiceNode {
     // reason the handshake was refused.
     std::string data_ready_handshake(const crypto::legacy_pubkey& pk, std::string_view payload);
 
-    // Sends a node-to-node request to `ct` over whichever registered transport carries such
-    // traffic with that node (see server::MQBase::sn_request), asking the most recently registered
-    // first: QUIC for nodes that speak it, oxenmq for the rest.
+    // Sends a node-to-node request to `ct` (see server::MQBase::sn_request): over QUIC for a node
+    // that speaks it, over oxenmq for the rest.
     void sn_request(
             const contact& ct,
             std::string_view cmd,

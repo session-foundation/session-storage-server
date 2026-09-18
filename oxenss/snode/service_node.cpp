@@ -238,6 +238,7 @@ static std::optional<block_update> parse_swarm_update(
 
 void ServiceNode::register_mq_server(server::MQBase* server) {
     mq_servers_.push_back(server);
+    quic_server_ = server;
 }
 
 void ServiceNode::bootstrap_fallback() {
@@ -757,12 +758,14 @@ void ServiceNode::sn_request(
         std::vector<std::string> parts,
         std::function<void(bool success, std::vector<std::string> parts)> cb,
         std::chrono::milliseconds timeout) {
-    for (auto it = mq_servers_.rbegin(); it != mq_servers_.rend(); ++it)
-        if ((*it)->sn_request(ct, cmd, parts, cb, timeout))
-            return;
-    log::error(
-            logcat, "Internal error: no transport took a {} request to {}", cmd, ct.pubkey_ed25519);
-    cb(false, {"TIMEOUT"s});
+    auto via_omq = [this, ct, cmd = std::string{cmd}, cb, timeout](std::vector<std::string> parts) {
+        omq_server_.sn_request(ct, cmd, std::move(parts), cb, timeout, nullptr);
+    };
+    if (quic_server_)
+        quic_server_->sn_request(
+                ct, cmd, std::move(parts), std::move(cb), timeout, std::move(via_omq));
+    else
+        via_omq(std::move(parts));
 }
 
 bool ServiceNode::peer_is_current(const contact& ct) {

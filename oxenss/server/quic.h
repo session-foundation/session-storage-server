@@ -11,7 +11,6 @@
 #include <oxen/quic/btstream.hpp>
 #include <oxen/quic/endpoint.hpp>
 
-#include <mutex>
 #include <unordered_map>
 
 namespace oxenss::rpc {
@@ -87,35 +86,17 @@ class QUIC : public MQBase {
 
     bool sn_connected(const snode::contact& ct) override;
 
-    // Sends over the held connection when the node speaks QUIC (sn_quic_capable), establishing
-    // the connection first if needed; a node that does not is left to the next transport.  A
-    // single part is the request body as-is, several are sent as a bt list (see
+    // Sends over the held connection when the node speaks QUIC (see sn_quic_capable),
+    // establishing the connection first if needed; the request is passed to `fallback` for a node
+    // that does not.  A single part is the request body as-is, several are sent as a bt list (see
     // handle_sn_storage_cc).  Replies are delivered off the QUIC loop, via an oxenmq task.
-    bool sn_request(
+    void sn_request(
             const snode::contact& ct,
             std::string_view cmd,
             std::vector<std::string> parts,
             sn_reply_callback cb,
-            std::chrono::milliseconds timeout) override;
-
-    using sn_conn_callback = std::function<void(std::shared_ptr<quic::Connection>)>;
-
-    // True if node-to-node traffic with this node goes over QUIC.  An SN_ALPN connection we
-    // currently hold with it settles that on its own (only a QUIC-capable node makes one, and
-    // the version oxend reports lags a node's upgrade by up to an hour); only without one does
-    // the reported version decide what to establish.
-    bool sn_quic_capable(const snode::contact& ct);
-
-    // Invokes `cb` with our connection to the given storage server, establishing one first if we
-    // have none.  `cb` gets nullptr if a connection could not be established.  It may be invoked
-    // before this returns (when already connected) or later from the QUIC event loop.
-    void sn_connect(const snode::contact& ct, sn_conn_callback cb);
-
-    // The stream to send the given kind of traffic on, on the given SN connection.  For onion
-    // requests this is whichever onion stream currently has the least data outstanding.  Returns
-    // nullptr if the connection has no stream set (it is not an established SN connection).
-    std::shared_ptr<quic::BTRequestStream> sn_stream(
-            const quic::Connection& c, sn_stream_kind kind);
+            std::chrono::milliseconds timeout,
+            sn_fallback fallback) override;
 
     quic::Loop loop{};
 
@@ -145,8 +126,8 @@ class QUIC : public MQBase {
 
         // The connection to use: the winner when we have both, else whichever we have.
         std::shared_ptr<quic::Connection> preferred() const;
-        // Stores a new connection in the given direction, returning any it replaces (which the
-        // caller closes once it no longer holds the registry mutex).
+        // Stores a new connection in the given direction, returning any it replaces for the
+        // caller to close.
         std::shared_ptr<quic::Connection> set(std::shared_ptr<quic::Connection> c, bool is_inbound);
         // Drops and returns the connection in the given direction (nullptr if none).
         std::shared_ptr<quic::Connection> take(bool is_inbound);
@@ -158,10 +139,11 @@ class QUIC : public MQBase {
         std::array<std::shared_ptr<quic::BTRequestStream>, SN_ONION_STREAMS> onion;
     };
 
-    // Guards the maps below.  Never hold it across a call into libquic that may run a connection
-    // callback or wait on the QUIC loop (close_connection, connect, open_stream, get_stats, ...):
-    // the callbacks take it too.
-    std::mutex sn_conns_mutex_;
+    using sn_conn_callback = std::function<void(std::shared_ptr<quic::Connection>)>;
+
+    // The SN connection registry.  Everything from here to the end of the private section is
+    // owned by the QUIC loop: it is only touched from loop callbacks, timers and jobs, so no lock
+    // is involved; other threads reach it through loop.call() / loop.call_get().
     std::unordered_map<crypto::ed25519_pubkey, sn_conn> sn_conns_;
     // The streams we opened on each SN connection, by connection.
     std::unordered_map<quic::ConnectionID, sn_streams> sn_streams_;
@@ -169,6 +151,25 @@ class QUIC : public MQBase {
     std::unordered_map<crypto::ed25519_pubkey, std::chrono::steady_clock::time_point> sn_bidir_;
     // Outbound connections being established, with the callbacks waiting for them.
     std::unordered_map<crypto::ed25519_pubkey, std::vector<sn_conn_callback>> pending_sn_conns_;
+
+    bool has_sn_conn(const crypto::ed25519_pubkey& pk) const;
+
+    // True if node-to-node traffic with this node goes over QUIC.  An SN_ALPN connection we
+    // currently hold with it settles that on its own (only a QUIC-capable node makes one, and
+    // the version oxend reports lags a node's upgrade by up to an hour); only without one does
+    // the reported version decide what to establish.
+    bool sn_quic_capable(const snode::contact& ct) const;
+
+    // Invokes `cb` with our connection to the given storage server, establishing one first if we
+    // have none; `cb` gets nullptr if a connection could not be established.  It is invoked
+    // immediately when already connected, otherwise once the connection attempt resolves.
+    void sn_connect(const snode::contact& ct, sn_conn_callback cb);
+
+    // The stream to send the given kind of traffic on, on the given SN connection.  For onion
+    // requests this is whichever onion stream currently has the least data outstanding.  Returns
+    // nullptr if the connection has no stream set (it is not an established SN connection).
+    std::shared_ptr<quic::BTRequestStream> sn_stream(
+            const quic::Connection& c, sn_stream_kind kind) const;
 
     void on_conn_established(quic::Connection& c);
     void on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx);

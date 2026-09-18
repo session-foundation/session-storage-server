@@ -190,40 +190,38 @@ void QUIC::on_conn_established(quic::Connection& c) {
     streams.data = conn->open_stream<quic::BTRequestStream>(handler);
     for (auto& s : streams.onion)
         s = conn->open_stream<quic::BTRequestStream>(handler);
+    sn_streams_[conn->reference_id()] = std::move(streams);
+
+    auto [it, ins] = sn_conns_.try_emplace(
+            *pk, sn_conn{.inbound_wins = *pk < service_node_->own_address().pubkey_ed25519});
+    auto& sc = it->second;
+    auto replaced = sc.set(conn, c.is_inbound());
+    if (sc.inbound && sc.outbound)
+        sn_bidir_[*pk] = std::chrono::steady_clock::now();
+    auto use = sc.preferred();
+
+    log::debug(
+            logcat,
+            "{} {} connection with {}{}",
+            ins ? "Established" : "Added",
+            c.is_inbound() ? "inbound" : "outbound",
+            *pk,
+            sc.inbound && sc.outbound
+                    ? (sc.inbound_wins == c.is_inbound() ? " (replaces the other direction)"
+                                                         : " (redundant; will be closed)")
+                    : "");
 
     std::vector<sn_conn_callback> waiting;
-    std::shared_ptr<quic::Connection> use, replaced;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        sn_streams_[conn->reference_id()] = std::move(streams);
-        auto [it, ins] = sn_conns_.try_emplace(
-                *pk, sn_conn{.inbound_wins = *pk < service_node_->own_address().pubkey_ed25519});
-        auto& sc = it->second;
-        replaced = sc.set(conn, c.is_inbound());
-        if (sc.inbound && sc.outbound)
-            sn_bidir_[*pk] = std::chrono::steady_clock::now();
-        use = sc.preferred();
+    if (c.is_outbound())
+        if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
+            waiting = std::move(pit->second);
+            pending_sn_conns_.erase(pit);
+        }
 
-        log::debug(
-                logcat,
-                "{} {} connection with {}{}",
-                ins ? "Established" : "Added",
-                c.is_inbound() ? "inbound" : "outbound",
-                *pk,
-                sc.inbound && sc.outbound
-                        ? (sc.inbound_wins == c.is_inbound() ? " (replaces the other direction)"
-                                                             : " (redundant; will be closed)")
-                        : "");
-
-        if (c.is_outbound())
-            if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
-                waiting = std::move(pit->second);
-                pending_sn_conns_.erase(pit);
-            }
-    }
-
+    // Closing may re-enter on_conn_closed, which finds the slot already pointing elsewhere.
     if (replaced)
         replaced->close_connection();
+
     // This runs on the QUIC loop, which does not survive an exception escaping a callback.
     for (auto& cb : waiting)
         try {
@@ -250,34 +248,32 @@ void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
     if (!pk)
         return;
 
-    std::vector<sn_conn_callback> waiting;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        sn_streams_.erase(c.reference_id());
-        if (auto it = sn_conns_.find(*pk); it != sn_conns_.end()) {
-            auto& sc = it->second;
-            auto& slot = c.is_inbound() ? sc.inbound : sc.outbound;
-            if (slot && slot->reference_id() == c.reference_id()) {
-                slot.reset();
-                sn_bidir_.erase(*pk);
-                log::debug(
-                        logcat,
-                        "Closed {} connection with {} (ec={}){}",
-                        c.is_inbound() ? "inbound" : "outbound",
-                        *pk,
-                        ec,
-                        ec == CONN_CLOSE_REDUNDANT ? " as redundant" : "");
-                if (sc.empty())
-                    sn_conns_.erase(it);
-            }
+    sn_streams_.erase(c.reference_id());
+    if (auto it = sn_conns_.find(*pk); it != sn_conns_.end()) {
+        auto& sc = it->second;
+        auto& slot = c.is_inbound() ? sc.inbound : sc.outbound;
+        if (slot && slot->reference_id() == c.reference_id()) {
+            slot.reset();
+            sn_bidir_.erase(*pk);
+            log::debug(
+                    logcat,
+                    "Closed {} connection with {} (ec={}){}",
+                    c.is_inbound() ? "inbound" : "outbound",
+                    *pk,
+                    ec,
+                    ec == CONN_CLOSE_REDUNDANT ? " as redundant" : "");
+            if (sc.empty())
+                sn_conns_.erase(it);
         }
-        if (c.is_outbound())
-            if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
-                log::debug(logcat, "Connection to {} failed to establish (ec={})", *pk, ec);
-                waiting = std::move(pit->second);
-                pending_sn_conns_.erase(pit);
-            }
     }
+
+    std::vector<sn_conn_callback> waiting;
+    if (c.is_outbound())
+        if (auto pit = pending_sn_conns_.find(*pk); pit != pending_sn_conns_.end()) {
+            log::debug(logcat, "Connection to {} failed to establish (ec={})", *pk, ec);
+            waiting = std::move(pit->second);
+            pending_sn_conns_.erase(pit);
+        }
 
     for (auto& cb : waiting)
         try {
@@ -288,21 +284,19 @@ void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
 }
 
 void QUIC::close_redundant_sn_conns() {
+    // Collect first: closing re-enters on_conn_closed, which touches the maps being walked.
     std::vector<std::shared_ptr<quic::Connection>> losers;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        auto now = std::chrono::steady_clock::now();
-        for (auto it = sn_bidir_.begin(); it != sn_bidir_.end();) {
-            auto& [pk, since] = *it;
-            if (now < since + SN_CONN_REDUNDANT_LINGER) {
-                ++it;
-                continue;
-            }
-            if (auto cit = sn_conns_.find(pk); cit != sn_conns_.end())
-                if (auto loser = cit->second.take(!cit->second.inbound_wins))
-                    losers.push_back(std::move(loser));
-            it = sn_bidir_.erase(it);
+    auto now = std::chrono::steady_clock::now();
+    for (auto it = sn_bidir_.begin(); it != sn_bidir_.end();) {
+        auto& [pk, since] = *it;
+        if (now < since + SN_CONN_REDUNDANT_LINGER) {
+            ++it;
+            continue;
         }
+        if (auto cit = sn_conns_.find(pk); cit != sn_conns_.end())
+            if (auto loser = cit->second.take(!cit->second.inbound_wins))
+                losers.push_back(std::move(loser));
+        it = sn_bidir_.erase(it);
     }
     // The slots are already empty, so on_conn_closed ignores these.
     for (auto& c : losers)
@@ -310,9 +304,8 @@ void QUIC::close_redundant_sn_conns() {
 }
 
 void QUIC::sweep_sn_connections() {
-    std::vector<std::shared_ptr<quic::Connection>> gone;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
+    loop.call([this] {
+        std::vector<std::shared_ptr<quic::Connection>> gone;
         for (auto it = sn_conns_.begin(); it != sn_conns_.end();) {
             if (service_node_->contacts().find(it->first)) {
                 ++it;
@@ -325,36 +318,31 @@ void QUIC::sweep_sn_connections() {
             sn_bidir_.erase(it->first);
             it = sn_conns_.erase(it);
         }
-    }
-    for (auto& c : gone)
-        c->close_connection(CONN_CLOSE_NOT_SN);
+        for (auto& c : gone)
+            c->close_connection(CONN_CLOSE_NOT_SN);
+    });
 }
 
-bool QUIC::sn_connected(const snode::contact& ct) {
-    std::lock_guard lock{sn_conns_mutex_};
-    auto it = sn_conns_.find(ct.pubkey_ed25519);
+bool QUIC::has_sn_conn(const crypto::ed25519_pubkey& pk) const {
+    auto it = sn_conns_.find(pk);
     return it != sn_conns_.end() && !it->second.empty();
 }
 
-bool QUIC::sn_quic_capable(const snode::contact& ct) {
-    return sn_connected(ct) || ct.version >= snode::SN_QUIC_VERSION;
+bool QUIC::sn_connected(const snode::contact& ct) {
+    return loop.call_get([this, &ct] { return has_sn_conn(ct.pubkey_ed25519); });
 }
 
-bool QUIC::sn_request(
+bool QUIC::sn_quic_capable(const snode::contact& ct) const {
+    return has_sn_conn(ct.pubkey_ed25519) || ct.version >= snode::SN_QUIC_VERSION;
+}
+
+void QUIC::sn_request(
         const snode::contact& ct,
         std::string_view cmd,
         std::vector<std::string> parts,
         sn_reply_callback cb,
-        std::chrono::milliseconds timeout) {
-    if (!sn_quic_capable(ct))
-        return false;
-
-    std::string body;
-    if (parts.size() == 1)
-        body = std::move(parts[0]);
-    else if (!parts.empty())
-        body = oxenc::bt_serialize(parts);
-
+        std::chrono::milliseconds timeout,
+        sn_fallback fallback) {
     // Replies come in on the QUIC loop; hand them to an oxenmq task like every other QUIC event,
     // so that the loop never runs storage server logic (see handle_request).
     auto reply = [this, cb = std::make_shared<sn_reply_callback>(std::move(cb))](
@@ -365,104 +353,123 @@ bool QUIC::sn_request(
                 });
     };
 
-    const bool storage_cc = cmd == "storage_cc", onion = cmd == "onion_request";
-    sn_connect(
-            ct,
-            [this,
-             cmd = std::string{cmd},
-             body = std::move(body),
-             reply,
-             storage_cc,
-             onion,
-             timeout](std::shared_ptr<quic::Connection> conn) {
-                if (!conn)
-                    return reply(false, {"TIMEOUT"s});
+    loop.call([this,
+               ct,
+               cmd = std::string{cmd},
+               parts = std::move(parts),
+               reply,
+               timeout,
+               fallback = std::move(fallback)]() mutable {
+        if (!sn_quic_capable(ct))
+            return fallback(std::move(parts));
 
-                std::shared_ptr<quic::BTRequestStream> stream;
-                try {
-                    stream = sn_stream(
-                            *conn,
-                            cmd == "data"            ? sn_stream_kind::data
-                            : cmd == "onion_request" ? sn_stream_kind::onion
-                                                     : sn_stream_kind::command);
-                } catch (const std::exception& e) {
-                    // The connection is on its way out; the caller retries later.
-                    log::debug(logcat, "Could not get a stream for {} request: {}", cmd, e.what());
-                    return reply(false, {"TIMEOUT"s});
-                }
-                if (!stream)
-                    return reply(false, {"TIMEOUT"s});
-                stream->command(cmd, body, timeout, [reply, storage_cc, onion](quic::message m) {
-                    if (m.timed_out)
+        std::string body;
+        if (parts.size() == 1)
+            body = std::move(parts[0]);
+        else if (!parts.empty())
+            body = oxenc::bt_serialize(parts);
+
+        const bool storage_cc = cmd == "storage_cc", onion = cmd == "onion_request";
+        const auto kind = cmd == "data" ? sn_stream_kind::data
+                        : onion         ? sn_stream_kind::onion
+                                        : sn_stream_kind::command;
+
+        sn_connect(
+                ct,
+                [this,
+                 cmd = std::move(cmd),
+                 body = std::move(body),
+                 reply,
+                 storage_cc,
+                 onion,
+                 kind,
+                 timeout](std::shared_ptr<quic::Connection> conn) {
+                    if (!conn)
                         return reply(false, {"TIMEOUT"s});
-                    std::string b{m.body()};
 
-                    if (onion) {
-                        // A hop reply is a bt list of [code, body] (see handle_sn_onion_request);
-                        // oxenmq sends the same two as separate parts.
-                        if (m.is_error())
-                            return reply(
-                                    true, {std::to_string(http::BAD_GATEWAY.first), std::move(b)});
-                        try {
-                            oxenc::bt_list_consumer l{b};
-                            auto code = l.consume_integer<int>();
-                            return reply(true, {std::to_string(code), l.consume_string()});
-                        } catch (const std::exception&) {
-                            return reply(
-                                    true,
-                                    {std::to_string(http::INTERNAL_SERVER_ERROR.first),
-                                     "Invalid response from snode"s});
-                        }
-                    }
-
-                    if (!storage_cc)
-                        return reply(true, {std::move(b)});
-
-                    // A forwarded client request's reply has the QUIC client-RPC framing;
-                    // reshape it into oxenmq's: [code, reason] for a failure (from
-                    // "CODE REASON\n\nbody"), the bare result for a success (from the
-                    // [code, result] list).
-                    if (m.is_error()) {
-                        auto code = b.substr(0, b.find(' '));
-                        auto nl = b.find("\n\n");
-                        return reply(
-                                true,
-                                {std::move(code), nl == std::string::npos ? "" : b.substr(nl + 2)});
-                    }
+                    std::shared_ptr<quic::BTRequestStream> stream;
                     try {
-                        oxenc::bt_list_consumer l{b};
-                        l.consume_integer<int>();
-                        return reply(true, {std::string{l.consume_dict_data()}});
-                    } catch (const std::exception&) {
-                        // Unparseable; passing it through as-is makes the caller treat it
-                        // as a bad peer response.
-                        return reply(true, {std::move(b)});
+                        stream = sn_stream(*conn, kind);
+                    } catch (const std::exception& e) {
+                        // The connection is on its way out; the caller retries later.
+                        log::debug(
+                                logcat, "Could not get a stream for {} request: {}", cmd, e.what());
+                        return reply(false, {"TIMEOUT"s});
                     }
+                    if (!stream)
+                        return reply(false, {"TIMEOUT"s});
+
+                    stream->command(
+                            cmd, body, timeout, [reply, storage_cc, onion](quic::message m) {
+                                if (m.timed_out)
+                                    return reply(false, {"TIMEOUT"s});
+                                std::string b{m.body()};
+
+                                if (onion) {
+                                    // A hop reply is a bt list of [code, body] (see
+                                    // handle_sn_onion_request); oxenmq sends the same two as
+                                    // separate parts.
+                                    if (m.is_error())
+                                        return reply(
+                                                true,
+                                                {std::to_string(http::BAD_GATEWAY.first),
+                                                 std::move(b)});
+                                    try {
+                                        oxenc::bt_list_consumer l{b};
+                                        auto code = l.consume_integer<int>();
+                                        return reply(
+                                                true, {std::to_string(code), l.consume_string()});
+                                    } catch (const std::exception&) {
+                                        return reply(
+                                                true,
+                                                {std::to_string(http::INTERNAL_SERVER_ERROR.first),
+                                                 "Invalid response from snode"s});
+                                    }
+                                }
+
+                                if (!storage_cc)
+                                    return reply(true, {std::move(b)});
+
+                                // A forwarded client request's reply has the QUIC client-RPC
+                                // framing; reshape it into oxenmq's: [code, reason] for a failure
+                                // (from "CODE REASON\n\nbody"), the bare result for a success
+                                // (from the [code, result] list).
+                                if (m.is_error()) {
+                                    auto code = b.substr(0, b.find(' '));
+                                    auto nl = b.find("\n\n");
+                                    return reply(
+                                            true,
+                                            {std::move(code),
+                                             nl == std::string::npos ? "" : b.substr(nl + 2)});
+                                }
+                                try {
+                                    oxenc::bt_list_consumer l{b};
+                                    l.consume_integer<int>();
+                                    return reply(true, {std::string{l.consume_dict_data()}});
+                                } catch (const std::exception&) {
+                                    // Unparseable; passing it through as-is makes the caller
+                                    // treat it as a bad peer response.
+                                    return reply(true, {std::move(b)});
+                                }
+                            });
                 });
-            });
-    return true;
+    });
 }
 
 void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
     const auto& pk = ct.pubkey_ed25519;
-    std::shared_ptr<quic::Connection> existing;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        if (auto it = sn_conns_.find(pk); it != sn_conns_.end())
-            existing = it->second.preferred();
-        if (!existing) {
-            auto [pit, ins] = pending_sn_conns_.try_emplace(pk);
-            pit->second.push_back(std::move(cb));
-            if (!ins)
-                return;  // a connection attempt is already underway
-        }
-    }
-    if (existing)
-        return cb(std::move(existing));
+    if (auto it = sn_conns_.find(pk); it != sn_conns_.end())
+        if (auto conn = it->second.preferred())
+            return cb(std::move(conn));
+
+    auto [pit, ins] = pending_sn_conns_.try_emplace(pk);
+    pit->second.push_back(std::move(cb));
+    if (!ins)
+        return;  // a connection attempt is already underway
 
     log::debug(logcat, "Connecting to {} @ {}:{}", pk, ct.ip, ct.omq_quic_port);
     try {
-        auto conn = reach_ep->connect(
+        reach_ep->connect(
                 {pk.view(), ct.ip, ct.omq_quic_port},
                 tls_creds,
                 quic::opt::outbound_alpns{SN_ALPN},
@@ -483,12 +490,9 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
     } catch (const std::exception& e) {
         log::warning(logcat, "Failed to initiate connection to {}: {}", pk, e.what());
         std::vector<sn_conn_callback> waiting;
-        {
-            std::lock_guard lock{sn_conns_mutex_};
-            if (auto pit = pending_sn_conns_.find(pk); pit != pending_sn_conns_.end()) {
-                waiting = std::move(pit->second);
-                pending_sn_conns_.erase(pit);
-            }
+        if (auto wit = pending_sn_conns_.find(pk); wit != pending_sn_conns_.end()) {
+            waiting = std::move(wit->second);
+            pending_sn_conns_.erase(wit);
         }
         for (auto& w : waiting)
             w(nullptr);
@@ -496,38 +500,30 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
 }
 
 std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
-        const quic::Connection& c, sn_stream_kind kind) {
-    std::optional<sn_streams> streams;
-    {
-        std::lock_guard lock{sn_conns_mutex_};
-        if (auto it = sn_streams_.find(c.reference_id()); it != sn_streams_.end())
-            streams = it->second;
-    }
-    if (!streams) {
+        const quic::Connection& c, sn_stream_kind kind) const {
+    auto it = sn_streams_.find(c.reference_id());
+    if (it == sn_streams_.end()) {
         log::error(logcat, "Internal error: no stream set for SN connection {}", c.reference_id());
         return nullptr;
     }
+    auto& streams = it->second;
 
     switch (kind) {
-        case sn_stream_kind::command: return streams->command;
-        case sn_stream_kind::data: return streams->data;
+        case sn_stream_kind::command: return streams.command;
+        case sn_stream_kind::data: return streams.data;
         case sn_stream_kind::onion: break;
     }
 
-    // The stream counters live on the QUIC loop, so read them all in one trip rather than one
-    // round trip per stream.
-    return loop.call_get([&onion = streams->onion] {
-        std::shared_ptr<quic::BTRequestStream> best;
-        size_t best_outstanding = 0;
-        for (auto& s : onion) {
-            auto [acked, unacked, unsent, retained] = s->get_stats();
-            if (!best || unacked + unsent < best_outstanding) {
-                best = s;
-                best_outstanding = unacked + unsent;
-            }
+    std::shared_ptr<quic::BTRequestStream> best;
+    size_t best_outstanding = 0;
+    for (auto& s : streams.onion) {
+        auto [acked, unacked, unsent, retained] = s->get_stats();
+        if (!best || unacked + unsent < best_outstanding) {
+            best = s;
+            best_outstanding = unacked + unsent;
         }
-        return best;
-    });
+    }
+    return best;
 }
 
 void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
@@ -788,7 +784,6 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
         // a node that hasn't broadcast usable contact info, so we don't need to worry about testing
         // it here.
         return;
-    const auto& ct = *maybe_ct;
 
     // Defer this to an omq task; the same deadlock-avoidance logic described in handle_request
     // applies here.
@@ -834,43 +829,43 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
                 });
     };
 
-    if (sn_quic_capable(ct)) {
-        // Ping over the connection we hold with the node (establishing it if needed), and keep it.
-        sn_connect(
-                ct,
-                [this, test = std::move(test), ping, report](
-                        std::shared_ptr<quic::Connection> conn) mutable {
-                    if (!conn) {
-                        log::debug(
-                                logcat,
-                                "QUIC reachability test failed for {}: could not connect",
-                                test->pubkey);
-                        return report(std::move(test), false);
-                    }
-                    std::shared_ptr<quic::BTRequestStream> stream;
-                    try {
-                        stream = sn_stream(*conn, sn_stream_kind::command);
-                    } catch (const std::exception& e) {
-                        log::debug(
-                                logcat,
-                                "QUIC reachability test failed for {}: {}",
-                                test->pubkey,
-                                e.what());
-                        return report(std::move(test), false);
-                    }
-                    if (!stream)
-                        return report(std::move(test), false);
-                    ping(std::move(test), *stream, false);
-                });
-        return;
-    }
+    // The registry is loop-owned, so the rest happens there.  (This is also called with the
+    // service node's mutex held, and call() does not block.)
+    loop.call([this, test = std::move(test), ct = *maybe_ct, report, ping]() mutable {
+        if (sn_quic_capable(ct)) {
+            // Ping over the connection we hold with the node (establishing it if needed), and
+            // keep it.
+            sn_connect(
+                    ct,
+                    [this, test = std::move(test), ping, report](
+                            std::shared_ptr<quic::Connection> conn) mutable {
+                        if (!conn) {
+                            log::debug(
+                                    logcat,
+                                    "QUIC reachability test failed for {}: could not connect",
+                                    test->pubkey);
+                            return report(std::move(test), false);
+                        }
+                        auto stream = sn_stream(*conn, sn_stream_kind::command);
+                        if (!stream)
+                            return report(std::move(test), false);
+                        ping(std::move(test), *stream, false);
+                    });
+            return;
+        }
 
-    // Older nodes only accept the client ALPN and expect a one-off connection.
-    auto conn = reach_ep->connect(
-            {ct.pubkey_ed25519.view(), ct.ip, ct.omq_quic_port},
-            tls_creds,
-            quic::opt::handshake_timeout{5s});
-    ping(std::move(test), *conn->open_stream<quic::BTRequestStream>(), true);
+        // Older nodes only accept the client ALPN and expect a one-off connection.
+        try {
+            auto conn = reach_ep->connect(
+                    {ct.pubkey_ed25519.view(), ct.ip, ct.omq_quic_port},
+                    tls_creds,
+                    quic::opt::handshake_timeout{5s});
+            ping(std::move(test), *conn->open_stream<quic::BTRequestStream>(), true);
+        } catch (const std::exception& e) {
+            log::debug(logcat, "QUIC reachability test failed for {}: {}", test->pubkey, e.what());
+            report(std::move(test), false);
+        }
+    });
 }
 
 }  // namespace oxenss::server

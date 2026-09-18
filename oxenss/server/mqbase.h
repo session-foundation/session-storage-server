@@ -178,20 +178,23 @@ class MQBase {
     virtual bool sn_connected(const snode::contact&) { return false; }
 
     using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
+    using sn_fallback = std::function<void(std::vector<std::string> parts)>;
 
-    // Sends node-to-node request `cmd` ("data", "data_ready" or "storage_cc") with the given
-    // message parts to `ct` over this transport, if this transport carries node-to-node traffic
-    // with that node; returns false, without sending, if it does not (the default: no such
-    // traffic).  Whatever the transport, the reply reaches `cb` in oxenmq's shape: `success` is
-    // false on timeout (with parts {"TIMEOUT"}), otherwise the parts are the reply body, or
-    // [code, reason] for a refused storage_cc.
-    virtual bool sn_request(
+    // Sends node-to-node request `cmd` ("data", "data_ready", "storage_cc" or "onion_request")
+    // with the given message parts to `ct` over this transport, if this transport carries
+    // node-to-node traffic with that node; otherwise hands the parts to `fallback`, which tries
+    // the next transport (the default does only that: no such traffic).  The decision, and so
+    // `fallback`, may happen later on another thread.  Whatever the transport, the reply reaches
+    // `cb` in oxenmq's shape: `success` is false on timeout (with parts {"TIMEOUT"}), otherwise
+    // the parts are the reply body, or [code, reason] for a refused storage_cc or a hop reply.
+    virtual void sn_request(
             const snode::contact&,
             std::string_view,
-            std::vector<std::string>,
+            std::vector<std::string> parts,
             sn_reply_callback,
-            std::chrono::milliseconds) {
-        return false;
+            std::chrono::milliseconds,
+            sn_fallback fallback) {
+        fallback(std::move(parts));
     }
 
     virtual ~MQBase() = default;

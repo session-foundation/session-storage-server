@@ -25,7 +25,7 @@ built statically as part of the build:
 * libcurl >= 7.68
 * libevent >= 2.1
 * libzmq >= 4.3
-* sqlite >= 3.35.5
+* sqlite >= 3.37.0
 * gnutls and ngtcp2 (required by oxen-libquic)
 
 The uWebSockets HTTPS backend (see below) additionally needs OpenSSL >= 3, which must come from the

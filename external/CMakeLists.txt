@@ -144,10 +144,10 @@ if(USE_JEMALLOC AND NOT BUILD_STATIC_DEPS)
 endif()
 
 
-# 3.35.x is required for queries we use (RETURNING), and 3.35.5 for its bug fixes; anything older
-# falls back to a static sqlite3mc, which is a regular sqlite3 with encryption bolted on that we
-# simply don't use.
-session_dep(sqlite3 3.35.5)
+# 3.37 is required for STRICT tables (state_kv); RETURNING, which we also use, arrived in 3.35.
+# Anything older falls back to a static sqlite3mc, which is a regular sqlite3 with encryption bolted
+# on that we simply don't use.
+session_dep(sqlite3 3.37.0)
 
 # session-sqlite would build its own sqlite3mc given the chance; hand it ours instead so that a
 # system sqlite3 gets used where there is a new enough one.  SESSION_EXTERNAL_SQLITE_MC stays off

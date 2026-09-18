@@ -29,7 +29,7 @@ Available schemas:
                 retry_node_requests(id, rr_id→retry_requests, pk_id→retry_pubkeys,
                                     next_retry, UNIQUE(rr_id,pk_id))
     new view+triggers: retry_node_reqs (insert view), retry_node_add, rr_cleanup
-    new table: state_kv(key TEXT UNIQUE, value TEXT)  — generic persistent key/value store
+    new table: state_kv(key TEXT PRIMARY KEY, value ANY) STRICT  — persistent non-message state
 """
 
 import sqlite3, os, sys, time

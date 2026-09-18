@@ -18,8 +18,6 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
-#include "oxenc/bt_serialize.h"
-#include "oxenc/bt_value.h"
 #include "oxenss/crypto/keys.h"
 
 #include <SQLiteCpp/SQLiteCpp.h>
@@ -245,14 +243,12 @@ BEGIN
         );
 END;
 
--- Generic key->value store for the database
--- in future, we may explicitly require TEXT for keys, but arbitrary type for values.
--- store arbitrary persistent state, e.g. which swarm were we in before restart
+-- Persistent state that is not messages, e.g. which swarm we were in before a restart.  STRICT so
+-- that ANY stores values exactly as given: whoever writes a key knows what type it holds.
 CREATE TABLE state_kv (
-    key TEXT NOT NULL,
-    value TEXT,
-    UNIQUE(key)
-);
+    key TEXT PRIMARY KEY,
+    value ANY
+) STRICT, WITHOUT ROWID;
 
 -- public namespaces are at most used for testing before this migration, so clear them before
 -- adding the unique owner/namespace index
@@ -262,6 +258,23 @@ CREATE UNIQUE INDEX message_outbox_singleton
 ON messages(owner, namespace)
 WHERE namespace < 0 AND namespace % 20 = -1;
 
+            )");
+        }
+
+        // Unreleased development builds created state_kv with a TEXT value column holding a
+        // bt-encoded swarm id.  Nothing in it is worth converting: losing the swarm id only means
+        // one restart cannot tell whether our swarm dissolved while we were down.
+        if (db.execAndGet(
+                      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'state_kv'")
+                    .getString()
+                    .find("STRICT") == std::string::npos) {
+            log::info(logcat, "Upgrading database schema: recreating state_kv");
+            db.exec(R"(
+DROP TABLE state_kv;
+CREATE TABLE state_kv (
+    key TEXT PRIMARY KEY,
+    value ANY
+) STRICT, WITHOUT ROWID;
             )");
         }
 
@@ -1328,21 +1341,16 @@ void Database::remove_expired_retry_requests(std::chrono::system_clock::time_poi
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {
-    auto as_hex = oxenc::bt_serialize<uint64_t>(swarm_id);
-    auto conn = db_->conn();
-    conn.prepared_exec(
-            "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)", as_hex);
+    db_->conn().prepared_exec(
+            "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)",
+            static_cast<int64_t>(swarm_id));
 }
 
 std::optional<uint64_t> Database::get_current_swarm() {
     auto conn = db_->conn();
-    try {
-        auto as_hex =
-                conn.prepared_get<std::string>("SELECT value FROM state_kv WHERE key = 'swarm_id'");
-        return oxenc::bt_deserialize<uint64_t>(as_hex);
-    } catch (const std::exception& e) {
-        return std::nullopt;
-    }
+    if (auto id = exec_and_maybe_get<int64_t>(
+                conn.prepared_st("SELECT value FROM state_kv WHERE key = 'swarm_id'")))
+        return static_cast<uint64_t>(*id);
     return std::nullopt;
 }
 

@@ -140,13 +140,14 @@ void ServiceNode::on_oxend_connected(const std::function<bool()>& keep_going) {
                     util::friendly_duration(block_age));
     }
 
-    bool success;
-    do {
+    while (true) {
         auto prom = std::make_shared<std::promise<bool>>();
         auto fut = prom->get_future();
         update_swarms(prom);
-        success = await_startup(fut, keep_going, "the initial block update from oxend");
-    } while (!success);
+        if (await_startup(fut, keep_going, "the initial block update from oxend"))
+            break;
+        std::this_thread::sleep_for(1s);
+    }
 
     log::info(
             logcat,

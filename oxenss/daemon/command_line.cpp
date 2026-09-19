@@ -147,6 +147,8 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "daemon, server, ssquic, snode, swarm, db, rpc, http, crypto, logging; the quic "
                "and oxenmq libraries log under those names.")
             ->type_name("LEVELS")
+            // A config file value is split on commas into several values; put them back together.
+            ->join(',')
             ->capture_default_str();
     cli.add_option(
                "--oxend-rpc",

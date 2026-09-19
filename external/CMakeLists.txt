@@ -6,13 +6,39 @@ check_submodule(nlohmann_json)
 check_submodule(oxen-libquic)
 check_submodule(oxen-mq)
 check_submodule(session-sqlite)
-check_submodule(uWebSockets)
+if(HTTPS_BACKEND_UWEBSOCKETS)
+    check_submodule(uWebSockets)
+endif()
 
 
 session_dep(libsodium 1.0.18)
 session_dep(libzmq 4.3)
-session_dep(libssl 3 WITH libcrypto)
+if(HTTPS_BACKEND_UWEBSOCKETS)
+    # Only uSockets wants OpenSSL; everything else TLS-related here is gnutls, and session-deps no
+    # longer builds OpenSSL at all: a static libcrypto and a static gnutls define conflicting
+    # symbols and cannot be linked into one binary.  So this backend takes OpenSSL from the system
+    # only, and has no place in an all-static build.
+    if(BUILD_STATIC_DEPS)
+        message(FATAL_ERROR
+            "HTTPS_BACKEND_UWEBSOCKETS needs the system's OpenSSL and cannot be combined with "
+            "BUILD_STATIC_DEPS")
+    endif()
+    find_package(OpenSSL 3 REQUIRED)
+endif()
 session_dep(libcurl 7.68)
+
+# Already pulled in by liboxenquic and the gnutls flavour of libcurl; declared here because we use
+# it directly for certificate generation.
+session_dep(gnutls 3.6)
+
+# 1.0.8 is a security floor, not an API one: the code needs nothing newer than 0.9.75, but
+# 1.0.7/1.0.8 fixed crashes and out-of-bounds writes in the request parser that anyone able to
+# reach the HTTPS port can trigger.  No current Debian/Ubuntu stable ships that, so this is a
+# static build nearly everywhere for now; lower the floor for a distro only once its package has
+# those fixes backported.
+if(HTTPS_BACKEND_MICROHTTPD)
+    session_dep(libmicrohttpd 1.0.8)
+endif()
 
 # oxenss/http drives curl from libquic's event loop, so it needs libevent itself rather than just
 # inheriting it from libquic (which isn't built at all when a system liboxenquic is used).
@@ -56,6 +82,7 @@ sessiondep_or_submodule(nlohmann_json 3.11.0 nlohmann_json nlohmann_json::nlohma
 sessiondep_or_submodule(CLI11 2.2.0 CLI11 CLI11::CLI11)
 
 
+if(HTTPS_BACKEND_UWEBSOCKETS)
 # uSockets doesn't really have a proper build system (just a very simple Makefile) so build it
 # ourselves.
 file(GLOB usockets_src CONFIGURE_DEPENDS
@@ -68,7 +95,7 @@ add_library(uSockets STATIC EXCLUDE_FROM_ALL ${usockets_src})
 target_include_directories(uSockets PRIVATE uWebSockets/uSockets/src)
 target_compile_definitions(uSockets PRIVATE LIBUS_USE_OPENSSL)
 target_compile_features(uSockets PRIVATE c_std_11 cxx_std_17)
-target_link_libraries(uSockets sessiondep::libssl sessiondep::libcrypto)
+target_link_libraries(uSockets OpenSSL::SSL OpenSSL::Crypto)
 
 # The uWebSockets C++ layer is header-only but isn't actually prefixed in the repository itself, but
 # rather only on install (which, as above, is just a very simple Makefile).  This is unfortunate
@@ -80,6 +107,7 @@ add_library(uWebSockets INTERFACE)
 target_include_directories(uWebSockets SYSTEM INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/uWebSockets)
 target_link_libraries(uWebSockets INTERFACE uSockets)
 target_compile_definitions(uWebSockets INTERFACE UWS_HTTPRESPONSE_NO_WRITEMARK UWS_NO_ZLIB)
+endif()
 
 
 # cpr configuration.  Ideally we'd just do this via add_subdirectory, but cpr's cmake drags in a
@@ -116,10 +144,10 @@ if(USE_JEMALLOC AND NOT BUILD_STATIC_DEPS)
 endif()
 
 
-# 3.35.x is required for queries we use (RETURNING), and 3.35.5 for its bug fixes; anything older
-# falls back to a static sqlite3mc, which is a regular sqlite3 with encryption bolted on that we
-# simply don't use.
-session_dep(sqlite3 3.35.5)
+# 3.37 is required for STRICT tables (state_kv); RETURNING, which we also use, arrived in 3.35.
+# Anything older falls back to a static sqlite3mc, which is a regular sqlite3 with encryption bolted
+# on that we simply don't use.
+session_dep(sqlite3 3.37.0)
 
 # session-sqlite would build its own sqlite3mc given the chance; hand it ours instead so that a
 # system sqlite3 gets used where there is a new enough one.  SESSION_EXTERNAL_SQLITE_MC stays off

@@ -29,6 +29,7 @@ namespace rpc {
 namespace snode {
     class ServiceNode;
     struct sn_test;
+    struct contact;
 }  // namespace snode
 
 struct message;
@@ -167,6 +168,34 @@ class MQBase {
             std::vector<connection_id>&, std::string_view notification) = 0;
 
     virtual void reachability_test(std::shared_ptr<snode::sn_test> test) = 0;
+
+    // Called after each service node list update so that connections held open to nodes that are
+    // no longer service nodes can be closed.  The default does nothing.
+    virtual void sweep_sn_connections() {}
+
+    // True if this transport currently holds a node-to-node connection with the given node.  The
+    // default (for transports that connect on demand) is false.
+    virtual bool sn_connected(const snode::contact&) { return false; }
+
+    using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
+    using sn_fallback = std::function<void(std::vector<std::string> parts)>;
+
+    // Sends node-to-node request `cmd` ("data", "data_ready", "storage_cc" or "onion_request")
+    // with the given message parts to `ct` over this transport, if this transport carries
+    // node-to-node traffic with that node; otherwise hands the parts to `fallback`, which tries
+    // the next transport (the default does only that: no such traffic).  The decision, and so
+    // `fallback`, may happen later on another thread.  Whatever the transport, the reply reaches
+    // `cb` in oxenmq's shape: `success` is false on timeout (with parts {"TIMEOUT"}), otherwise
+    // the parts are the reply body, or [code, reason] for a refused storage_cc or a hop reply.
+    virtual void sn_request(
+            const snode::contact&,
+            std::string_view,
+            std::vector<std::string> parts,
+            sn_reply_callback,
+            std::chrono::milliseconds,
+            sn_fallback fallback) {
+        fallback(std::move(parts));
+    }
 
     virtual ~MQBase() = default;
 

@@ -33,13 +33,6 @@ enum class StoreResult {
     Full,      // Can't insert right now because the database is full.
 };
 
-inline std::atomic<int> tmp_init_db_version = 0;
-
-enum class BlobType {
-    Swarms,
-    RetryableRequests,
-};
-
 // Storage database class.
 class Database {
     // Held by pointer so that this header does not have to pull in SQLiteCpp.
@@ -63,12 +56,6 @@ class Database {
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
-    // True if swarm state was already persisted in the database when it was opened.
-    // On the first swarm update after startup, this prevents spurious DB dump requests
-    // to peers who only appear as new members because swarm state was not persisted
-    // in pre-migration databases.
-    bool _had_swarm_state_on_open = false;
-
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
@@ -77,19 +64,25 @@ class Database {
 
     // How long after a swarm request to a peer times out before we first retry it.
     static constexpr auto RETRY_INITIAL_DELAY = 15s;
-    // How long to wait between retry attempts once a retry has been sent.
-    static constexpr auto RETRY_INTERVAL = 60s;
+    // How long to wait between retry attempts once a retry has been sent.  With the initial delay
+    // this puts the first two attempts at 15s and 45s (plus up to one retry check interval), both
+    // inside the ±60s the peer allows on a timestamped request's signature; the third attempt at
+    // 75s is refused for those, which ends their retries.
+    static constexpr auto RETRY_INTERVAL = 30s;
     // How long to wait before re-checking a retry that could not be sent because we had no contact
     // details for the peer.
     static constexpr auto RETRY_NO_CONTACT_INTERVAL = 15s;
+    // How long to keep retrying a request.  This bounds how stale a replayed delete or expiry can
+    // be: a peer that has been unreachable for longer than a brief outage is more likely to have
+    // state the client has since changed (a re-stored message, a new expiry) than to still want
+    // the original request.
+    static constexpr auto RETRY_EXPIRY = 15min;
 
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().
     explicit Database(std::filesystem::path db_path);
 
     ~Database();
-
-    bool had_swarm_state_on_open() const { return _had_swarm_state_on_open; }
 
     // if the database is full then print an error only once ever N errors
     static constexpr int DB_FULL_FREQUENCY = 100;
@@ -129,11 +122,6 @@ class Database {
 
     // Retrieves all messages.
     std::vector<message> retrieve_all();
-
-    enum class GetMessageCount {
-        All,
-        Owned,  // Only messages that belong to this node's swarm
-    };
 
     // Return the total number of messages stored
     int64_t get_message_count();
@@ -267,16 +255,71 @@ class Database {
     // to take several seconds longer to execute, per call.
     int64_t retry_request_count();
 
-    // executes the provided callback for every swarm message (in batches) for the swarm with the
-    // given swarm space boundaries.  The lower bound is exclusive; the upper inclusive.
-    // if the lower bound is higher than the upper bound (i.e. overflow wrapping), will be called
-    // recursively on both sides of the overflow.  In this case, zero as the lower bound *will*
-    // be inclusive
-    void foreach_swarm_message(
-            std::function<void(const std::vector<message>&)> callback,
-            uint64_t lower_bound,
-            uint64_t upper_bound,
-            bool zero_inclusive = false);
+    // Swarm space ranges below are (lower, upper] on the circular uint64 swarm space, as returned
+    // by Network::get_swarm_boundaries(): lower < upper is an ordinary interval, lower > upper
+    // wraps around past UINT64_MAX, and lower == upper (only when there is a single swarm) is the
+    // whole space.
+
+    // True if any message owner falls in the given swarm space range.
+    bool has_owners_in_range(uint64_t lower, uint64_t upper);
+
+    // The highest message id in the database, or 0 if there are no messages.
+    int64_t max_message_id();
+
+    // A queued or in-progress dump of our messages to another service node: every message with id
+    // in [next_id, end_id] whose owner is in `swarm`'s swarm space range still has to be sent.
+    struct pending_dump {
+        crypto::legacy_pubkey pubkey;
+        uint64_t swarm;
+        int64_t next_id;
+        int64_t end_id;
+        std::chrono::system_clock::time_point next_attempt;
+    };
+
+    // Queues a dump to `pubkey` of all current messages (up to and including `end_id`) for the
+    // given swarm.  If a dump to that node for that swarm is already queued it is restarted from
+    // the beginning with the later end id, so that nothing the new request covers is skipped.
+    void queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, int64_t end_id);
+
+    std::vector<pending_dump> pending_dumps();
+
+    // Records progress on a dump: `next_id` is the first id not yet confirmed received, and
+    // `next_attempt` the earliest time to send more.
+    void update_dump(
+            const crypto::legacy_pubkey& pubkey,
+            uint64_t swarm,
+            int64_t next_id,
+            std::chrono::system_clock::time_point next_attempt);
+
+    void remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm);
+
+    // Returns the next batch of a dump: messages with id in [from_id, end_id] whose owner is in the
+    // swarm space range, in id order, stopping after the message that takes the batch past
+    // `byte_budget`.  The second element is the id of the last message returned (0 if none).
+    std::pair<std::vector<message>, int64_t> next_dump_batch(
+            int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget);
+
+    // Pending deliveries: messages whose forwarded store did not reach a swarm peer, to be sent
+    // to it later over sn.data.  A pending delivery references the message and is removed with
+    // it, so a message that is deleted or expires first is never delivered.
+
+    // Queues delivery of the stored message with the given hash to `pubkey`.  Does nothing if no
+    // such message is stored.
+    void queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash);
+
+    // The nodes with at least one pending delivery.
+    std::vector<crypto::legacy_pubkey> delivery_peers();
+
+    // The next batch of pending deliveries to `pubkey`, in message id order, stopping after the
+    // message that takes the batch past `byte_budget`.  Returns the messages and their ids.
+    std::pair<std::vector<message>, std::vector<int64_t>> next_delivery_batch(
+            const crypto::legacy_pubkey& pubkey, size_t byte_budget);
+
+    // Removes the given (delivered) messages from `pubkey`'s pending deliveries.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey, const std::vector<int64_t>& ids);
+
+    // Removes all pending deliveries to `pubkey`.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey);
 
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.

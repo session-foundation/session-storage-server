@@ -11,5 +11,5 @@ target_link_libraries(crypto
     PRIVATE
     common
     logging
-    sessiondep::libcrypto
+    sessiondep::gnutls
     sessiondep::libsodium)

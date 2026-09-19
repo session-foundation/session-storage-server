@@ -13,6 +13,12 @@ inline double to_epoch_double(std::chrono::system_clock::time_point t) {
     return std::chrono::duration<double>{t.time_since_epoch()}.count();
 }
 
+inline std::chrono::system_clock::time_point from_epoch_double(double t) {
+    return std::chrono::system_clock::time_point{
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                    std::chrono::duration<double>{t})};
+}
+
 inline std::chrono::system_clock::time_point from_epoch_ms(int64_t t) {
     return std::chrono::system_clock::time_point{std::chrono::milliseconds{t}};
 }

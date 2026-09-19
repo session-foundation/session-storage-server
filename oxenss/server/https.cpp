@@ -1,11 +1,10 @@
 #include "https.h"
 
-#include "utils.h"
 #include "omq.h"
+#include "utils.h"
 #include <oxenss/logging/oxen_logger.h>
 #include <oxenss/rpc/request_handler.h>
 #include <oxenss/snode/service_node.h>
-#include <iterator>
 #include <oxenss/utils/string_utils.hpp>
 
 #include <chrono>
@@ -13,12 +12,17 @@
 #include <nlohmann/json.hpp>
 #include <oxenc/base64.h>
 #include <oxenc/endian.h>
-#include <oxen/quic/format.hpp>
 #include <oxenc/hex.h>
+#include <oxen/quic/format.hpp>
 #include <oxenmq/oxenmq.h>
 #include <variant>
 
-#include <uWebSockets/App.h>
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
+#include "https_uws.h"
+#endif
+#ifdef OXENSS_HTTPS_MICROHTTPD
+#include "https_mhd.h"
+#endif
 
 namespace oxenss::server {
 
@@ -26,42 +30,69 @@ static auto logcat = log::Cat("server");
 
 using nlohmann::json;
 
-// Sends an error response and finalizes the response.
-void HTTPS::error_response(
-        HttpResponse& res, http::response_code code, std::optional<std::string_view> body) const {
-    res.writeStatus(std::to_string(code.first) + " " + std::string{code.second});
-    add_generic_headers(res);
-    res.writeHeader("Content-Type", "text/plain");
-    if (closing_)
-        res.writeHeader("Connection", "close");
-    if (body)
-        res.end(*body);
-    else
-        res.end(std::string{code.second} + "\n");
-    if (closing_)
-        res.close();
+namespace {
+    const std::vector<HttpsBackend> backends{
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
+            HttpsBackend::uwebsockets,
+#endif
+#ifdef OXENSS_HTTPS_MICROHTTPD
+            HttpsBackend::microhttpd,
+#endif
+    };
+}  // namespace
+
+std::string_view to_string(HttpsBackend b) {
+    switch (b) {
+        case HttpsBackend::uwebsockets: return "uwebsockets"sv;
+        case HttpsBackend::microhttpd: return "microhttpd"sv;
+    }
+    return "unknown"sv;
 }
 
-void HTTPS::handle_cors(HttpRequest& req, http::headers& extra_headers) {
-    if (cors_any_)
-        extra_headers.emplace("Access-Control-Allow-Origin", "*");
-    else if (!cors_.empty()) {
-        if (std::string origin{req.getHeader("origin")}; !origin.empty() && cors_.count(origin)) {
-            extra_headers.emplace("Access-Control-Allow-Origin", "*");
-            extra_headers.emplace("Vary", "Origin");
-        }
+std::optional<HttpsBackend> parse_https_backend(std::string_view name) {
+    if (name == "uwebsockets"sv || name == "uws"sv)
+        return HttpsBackend::uwebsockets;
+    if (name == "microhttpd"sv || name == "mhd"sv)
+        return HttpsBackend::microhttpd;
+    return std::nullopt;
+}
+
+std::span<const HttpsBackend> available_https_backends() {
+    return backends;
+}
+
+void HttpsRequest::set_remote(std::span<const uint8_t> raw) {
+    remote_ip.reset();
+    if (raw.size() == 4) {
+        remote_addr = oxen::quic::ipv4{raw.first<4>()}.to_string();
+        // IPv4: convert to ipv4-mapped-ipv6:
+        remote_ip = oxen::quic::ipv6{
+                0,
+                0,
+                0,
+                0,
+                0,
+                0xffff,
+                oxenc::load_big_to_host<uint16_t>(raw.data()),
+                oxenc::load_big_to_host<uint16_t>(raw.data() + 2)};
+    } else if (raw.size() == 16) {
+        remote_ip = oxen::quic::ipv6{raw.first<16>()};
+        remote_addr = "[{}]"_format(remote_ip->to_string());
+    } else {
+        remote_addr = "{{unknown:{}}}"_format(oxenc::to_hex(raw));
     }
 }
 
-//------------------------------------------------------------------------------------------------------------------------------
+void HttpsCall::reply(rpc::Response response, bool force_close) {
+    if (replied.exchange(true))
+        return;
+    send(std::move(response), force_close);
+}
+
 HTTPS::HTTPS(
         snode::ServiceNode& sn,
         rpc::RequestHandler& rh,
         rpc::RateLimiter& rl,
-        std::vector<std::tuple<std::string, uint16_t, bool>> bind,
-        const std::filesystem::path& ssl_cert,
-        const std::filesystem::path& ssl_key,
-        const std::filesystem::path& ssl_dh,
         crypto::legacy_keypair legacy_keys) :
         service_node_{sn},
         omq_{*service_node_.omq_server()},
@@ -75,533 +106,275 @@ HTTPS::HTTPS(
             2,    // minimum # of threads reserved threads for this category
             1000  // max queued requests
     );
-
-    // uWS is designed to work from a single thread, which is good (we pull off the requests and
-    // then stick them into the LMQ job queue to be scheduled along with other jobs).  But as a
-    // consequence, we need to create everything inside that thread.  We *also* need to get the
-    // (thread local) event loop pointer back from the thread so that we can shut it down later
-    // (injecting a callback into it is one of the few thread-safe things we can do across
-    // threads).
-    //
-    // Things we need in the owning thread, fulfilled from the http thread:
-
-    // - the uWS::Loop* for the event loop thread (which is thread_local).  We can get this
-    // during
-    //   thread startup, after the thread does basic initialization.
-    std::promise<uWS::Loop*> loop_promise;
-    auto loop_future = loop_promise.get_future();
-
-    // - the us_listen_socket_t* on which the server is listening.  We can't get this until we
-    //   actually start listening, so wait until `start()` for it.  (We also double-purpose it
-    //   to send back an exception if one fires during startup).
-    std::promise<std::vector<us_listen_socket_t*>> startup_success_promise;
-    startup_success_ = startup_success_promise.get_future();
-
-    // Things we need to send from the owning thread to the event loop thread:
-    // - a signal when the thread should bind to the port and start the event loop (when we call
-    //   start()).
-    // startup_promise_
-
-    uWS::SocketContextOptions https_opts{
-            .key_file_name = ssl_key.c_str(),
-            .cert_file_name = ssl_cert.c_str(),
-            .dh_params_file_name = ssl_dh.c_str()};
-
-    server_thread_ = std::thread{
-            [this, bind = std::move(bind), &https_opts](
-                    std::promise<uWS::Loop*> loop_promise,
-                    std::future<bool> startup_future,
-                    std::promise<std::vector<us_listen_socket_t*>> startup_success) {
-                uWS::SSLApp https{https_opts};
-                try {
-                    create_endpoints(https);
-                } catch (...) {
-                    loop_promise.set_exception(std::current_exception());
-                    return;
-                }
-                // We've initialized, signal the calling thread
-                loop_promise.set_value(uWS::Loop::get());
-                // Now wait until we get the signal to go (sent when the caller calls start() call).
-                if (!startup_future.get())
-                    // False means cancel, i.e. we got destroyed/shutdown without start() being
-                    // called
-                    return;
-
-                // we don't currently do cors
-                // cors_ = {...};
-
-                std::vector<us_listen_socket_t*> listening;
-                try {
-                    bool required_bind_failed = false;
-                    for (const auto& [addr, port, required] : bind)
-                        https.listen(
-                                addr,
-                                port,
-                                LIBUS_LISTEN_EXCLUSIVE_PORT,
-                                [&listening,
-                                 req = required,
-                                 &required_bind_failed,
-                                 addr = fmt::format("{}:{}", addr, port)](
-                                        us_listen_socket_t* sock) {
-                                    if (sock) {
-                                        log::info(logcat, "HTTPS server listening at {}", addr);
-                                        listening.push_back(sock);
-                                    } else if (req) {
-                                        required_bind_failed = true;
-                                        log::critical(
-                                                logcat,
-                                                "HTTPS server failed to bind to required address "
-                                                "{}",
-                                                addr);
-                                    } else {
-                                        log::warning(
-                                                logcat,
-                                                "HTTPS server failed to bind to (non-required) "
-                                                "address {}",
-                                                addr);
-                                    }
-                                });
-
-                    if (listening.empty() || required_bind_failed) {
-                        std::string error =
-                                "RPC HTTP server failed to bind{}; tried to bind to: "_format(
-                                        listening.empty() ? "; no valid bind address(es) given"
-                                                          : "");
-                        for (const auto& [addr, port, required] : bind)
-                            fmt::format_to(std::back_inserter(error), " {}:{}", addr, port);
-                        throw std::runtime_error{error};
-                    }
-                } catch (...) {
-                    startup_success.set_exception(std::current_exception());
-                    return;
-                }
-                startup_success.set_value(std::move(listening));
-
-                https.run();
-            },
-            std::move(loop_promise),
-            startup_promise_.get_future(),
-            std::move(startup_success_promise)};
-
-    loop_ = loop_future.get();
 }
 
-bool HTTPS::check_ready(HttpResponse& res) {
+rpc::Response HTTPS::error_response(
+        http::response_code code, std::optional<std::string_view> body) {
+    rpc::Response res{code};
+    res.headers.emplace_back("Content-Type", "text/plain");
+    if (body)
+        res.body = std::string{*body};
+    else
+        res.body = std::string{code.second} + "\n";
+    return res;
+}
+
+rpc::Response HTTPS::busy_response() {
+    return error_response(http::SERVICE_UNAVAILABLE, "Server busy, try again later"sv);
+}
+
+RenderedResponse HTTPS::render(const rpc::Response& res) const {
+    RenderedResponse out;
+    out.status = res.status;
+    out.headers.reserve(res.headers.size() + 2);
+    out.headers.emplace_back("Server", server_header());
+
+    const auto* json = std::get_if<nlohmann::json>(&res.body);
+    const auto* binary = std::get_if<std::span<const std::byte>>(&res.body);
+    if (std::none_of(begin(res.headers), end(res.headers), [](const auto& h) {
+            return util::string_iequal(h.first, "content-type");
+        }))
+        out.headers.emplace_back(
+                "Content-Type",
+                json     ? "application/json"
+                : binary ? "application/octet-stream"
+                         : "text/plain");
+    for (const auto& h : res.headers)
+        out.headers.push_back(h);
+
+    // NB: if the dump() here throws then it means we messed up and put some invalid data
+    // (probably binary) into a json value.
+    if (json) {
+        out.body_storage = json->dump();
+        out.body = out.body_storage;
+    } else if (binary) {
+        out.body = {reinterpret_cast<const char*>(binary->data()), binary->size()};
+    } else {
+        out.body = rpc::view_body(res);
+    }
+    return out;
+}
+
+std::optional<rpc::Response> HTTPS::check_ready() {
     if (std::string reason; !service_node_.snode_ready(&reason)) {
         log::debug(logcat, "Storage server not ready ({}), replying with 503", reason);
-        error_response(
-                res, http::SERVICE_UNAVAILABLE, "Service node is not ready: " + reason + "\n");
-        return false;
+        return error_response(
+                http::SERVICE_UNAVAILABLE, "Service node is not ready: " + reason + "\n");
     }
-    return true;
+    return std::nullopt;
 }
 
-void HTTPS::add_generic_headers(HttpResponse& res) const {
-    res.writeHeader("Server", server_header());
+void HTTPS::handle_cors(HttpsRequest& req) {
+    if (cors_any_)
+        req.headers.emplace("Access-Control-Allow-Origin", "*");
+    else if (!cors_.empty()) {
+        if (auto it = req.headers.find("origin");
+            it != req.headers.end() && cors_.count(it->second)) {
+            req.headers.emplace("Access-Control-Allow-Origin", "*");
+            req.headers.emplace("Vary", "Origin");
+        }
+    }
 }
 
-// Queues a response with the uWebSockets response object; this must only be called from the
-// http thread (typically you want to use `queue_response` instead).
-void queue_response_internal(
-        HTTPS& https, HttpResponse& r, rpc::Response res, bool force_close = false) {
-    r.cork([&https, &r, res = std::move(res), force_close] {
-        r.writeStatus(fmt::format("{} {}", res.status.first, res.status.second));
-        https.add_generic_headers(r);
+std::optional<HTTPS::Immediate> HTTPS::on_headers(HttpsRequest& req) {
+    const bool post = req.method == "POST"sv;
 
-        const auto* json = std::get_if<nlohmann::json>(&res.body);
-        const auto* binary = std::get_if<std::span<const std::byte>>(&res.body);
-        if (std::none_of(begin(res.headers), end(res.headers), [](const auto& h) {
-                return util::string_iequal(h.first, "content-type");
-            }))
-            r.writeHeader(
-                    "Content-Type",
-                    json     ? "application/json"
-                    : binary ? "application/octet-stream"
-                             : "text/plain");
-        for (const auto& [h, v] : res.headers)
-            r.writeHeader(h, v);
-
-        // NB: if the dump() here throws then it means we messed up and put some invalid data
-        // (probably binary) into a json value.
-        r.end(json ? json->dump()
-              : binary
-                      ? std::string_view{reinterpret_cast<const char*>(binary->data()), binary->size()}
-                      : view_body(res),
-              force_close || https.closing());
-    });
-}
-
-namespace {
-
-    struct Request {
-        std::string body;
-        http::headers headers;
-        std::string remote_addr;
-        std::string uri;
-    };
-
-    struct call_data {
-        HTTPS& https;
-        oxenmq::OxenMQ& omq;
-        HttpResponse& res;
-        Request request;
-        std::vector<std::pair<std::string, std::string>> extra_headers;
-        bool aborted{false};
-        bool replied{false};
-
-        call_data(HTTPS& https, oxenmq::OxenMQ& omq, HttpResponse& res) :
-                https{https}, omq{omq}, res{res} {}
-
-        // If we have to drop the request because we are overloaded we want to reply with an
-        // error (so that we close the connection instead of leaking it and leaving it hanging).
-        // We don't do this, of course, if the request got aborted and replied to.
-        ~call_data() {
-            if (replied || aborted)
-                return;
-            https.loop_defer([&https = https, &res = res] {
-                https.error_response(
-                        res, http::SERVICE_UNAVAILABLE, "Server busy, try again later");
-            });
-        }
-
-        call_data(const call_data&) = delete;
-        call_data(call_data&&) = delete;
-        call_data& operator=(const call_data&) = delete;
-        call_data& operator=(call_data&&) = delete;
-
-        template <typename... T>
-        auto error_response(T&&... args) {
-            if (replied || aborted)
-                return;
-            replied = true;
-            return https.error_response(std::forward<T>(args)...);
-        }
-    };
-
-    // Queues a response for the HTTP thread to handle; the response can be in multiple string
-    // pieces to be concatenated together.
-    void queue_response(
-            std::shared_ptr<call_data> data, rpc::Response res, bool force_close = false) {
-        if (!data || data->replied)
-            return;
-        data->replied = true;
-        data->https.loop_defer(
-                [data = std::move(data), res = std::move(res), force_close]() mutable {
-                    if (data->aborted)
-                        return;
-                    queue_response_internal(data->https, data->res, std::move(res), force_close);
-                });
-    }
-
-    std::string get_remote_address(HttpResponse& res) {
-        // Either 4 (ipv4) or 16 (ipv6) bytes in network order:
-        auto addr_sv = res.getRemoteAddress();
-        // uWS offers a getRemoteAddressAsText(), but it doesn't format IPv6 addresses nicely so
-        // prefer libquic's inet_ntop-based formatting:
-        std::span addr{reinterpret_cast<const uint8_t*>(addr_sv.data()), addr_sv.size()};
-        std::string result;
-        if (addr.size() == 4) {
-            result = oxen::quic::ipv4{addr.first<4>()}.to_string();
-        } else if (addr.size() == 16) {
-            result = "[{}]"_format(oxen::quic::ipv6{addr.first<16>()}.to_string());
-        } else
-            result = "{{unknown:{}}}"_format(oxenc::to_hex(addr));
-        return result;
-    }
-
-    // Sets up a request handler that processes the initial incoming requests, sets up the
-    // appropriate handlers for incoming data, and invokes the `ready` callback once all data
-    // has been received (i.e. when the request is complete).  Can optionally call `prevalidate`
-    // on the partial call_data: it will have everything except for the body set (and can be
-    // used, for instance, to abort a request based only on headers); it will also be called
-    // from the same thread calling handle_request (typically the http thread), *not* a worker
-    // thread.
-    template <typename ReadyCallback>
-    static void handle_request(
-            HTTPS& https,
-            oxenmq::OxenMQ& omq,
-            HttpRequest& req,
-            HttpResponse& res,
-            ReadyCallback ready,
-            std::function<void(call_data& c)> prevalidate = nullptr) {
-        if (auto len = req.getHeader("content-length"); !len.empty()) {
-            if (uint64_t length; !util::parse_int(len, length)) {
-                log::warning(
-                        logcat,
-                        "Received HTTPS request from {} with invalid Content-Length, dropping",
-                        get_remote_address(res));
-                queue_response_internal(
-                        https,
-                        res,
-                        rpc::Response{http::BAD_REQUEST, "invalid Content-Length"sv},
-                        true);
-            } else if (length > MAX_REQUEST_BODY_SIZE) {
-                log::warning(
-                        logcat,
-                        "Received HTTPS request from {} with too-large body ({} > {}), dropping",
-                        get_remote_address(res),
-                        length,
-                        MAX_REQUEST_BODY_SIZE);
-                queue_response_internal(
-                        https,
-                        res,
-                        rpc::Response{http::PAYLOAD_TOO_LARGE, "Request body too large"sv},
-                        true);
-            }
-        }
-
-        std::shared_ptr<call_data> data{new call_data{https, omq, res}};
-        auto& request = data->request;
-        request.remote_addr = get_remote_address(res);
-        request.uri = req.getUrl();
-        for (const auto& [header, value] : req)
-            request.headers[std::string{header}] = value;
-
-        https.handle_cors(req, request.headers);
-        log::debug(
-                logcat,
-                "Received {} {} request from {}",
-                req.getMethod(),
-                request.uri,
-                request.remote_addr);
-
-        if (prevalidate)
-            prevalidate(*data);
-
-        res.onAborted([data] { data->aborted = true; });
-        res.onData([data = std::move(data), ready = std::move(ready)](
-                           std::string_view d, bool done) mutable {
-            data->request.body += d;
-            if (done)
-                ready(std::move(data));
-        });
-    }
-
-}  // anonymous namespace
-
-void HTTPS::create_endpoints(uWS::SSLApp& https) {
-    https.post("/ping_test/v1", [this](HttpResponse* res, HttpRequest* /*req*/) {
+    if (post && req.uri == "/ping_test/v1"sv) {
         log::trace(logcat, "Received https ping_test");
         service_node_.update_last_ping(snode::ReachType::HTTPS);
         rpc::Response resp{http::OK};
         resp.headers.emplace_back(
                 http::SNODE_PUBKEY_HEADER, oxenc::to_base64(legacy_keys_.pub.view()));
-        queue_response_internal(*this, *res, std::move(resp));
-    });
+        return Immediate{std::move(resp)};
+    }
 
-    https.post("/storage_rpc/v1", [this](HttpResponse* res, HttpRequest* req) {
-        if (!check_ready(*res))
-            return;
+    if (post && req.uri == "/storage_rpc/v1"sv) {
+        if (auto not_ready = check_ready())
+            return Immediate{std::move(*not_ready)};
         log::trace(logcat, "POST /storage_rpc/v1");
-        process_storage_rpc_req(*req, *res);
-    });
-    https.post("/onion_req/v2", [this](HttpResponse* res, HttpRequest* req) {
-        if (!check_ready(*res))
-            return;
-        log::trace(logcat, "POST /onion_req/v2");
-        process_onion_req_v2(*req, *res);
-    });
-    // Deprecated; use /storage_rpc/v1 with method=info instead
-    https.get("/get_stats/v1", [this](HttpResponse* res, HttpRequest* /*req*/) {
-        queue_response_internal(
-                *this,
-                *res,
-                rpc::Response{http::OK, json{{"version", STORAGE_SERVER_VERSION_STRING}}});
-    });
 
-    // Fallback to send a 404 for anything else:
-    https.any("/*", [this](HttpResponse* res, HttpRequest* req) {
+        if (!req.remote_ip) {
+            log::warning(
+                    logcat,
+                    "Invalid incoming request IP: '{}'; rejecting request",
+                    req.remote_addr);
+            return Immediate{error_response(http::BAD_REQUEST)};
+        }
+        if (rate_limiter_.should_rate_limit_client(*req.remote_ip)) {
+            log::debug(logcat, "Rate limiting client request from {}", *req.remote_ip);
+            return Immediate{error_response(http::TOO_MANY_REQUESTS)};
+        }
+        if (auto it = req.headers.find("x-loki-long-poll");
+            it != req.headers.end() && !it->second.empty()) {
+            // Obsolete header, return an error code
+            return Immediate{error_response(
+                    http::GONE, "long polling is no longer supported, client upgrade required")};
+        }
+    } else if (post && req.uri == "/onion_req/v2"sv) {
+        if (auto not_ready = check_ready())
+            return Immediate{std::move(*not_ready)};
+        log::trace(logcat, "POST /onion_req/v2");
+    } else if (req.method == "GET"sv && req.uri == "/get_stats/v1"sv) {
+        // Deprecated; use /storage_rpc/v1 with method=info instead
+        return Immediate{rpc::Response{http::OK, json{{"version", STORAGE_SERVER_VERSION_STRING}}}};
+    } else {
         log::info(
                 logcat,
                 "Invalid HTTP request for {} {} from {}",
-                req->getMethod(),
-                req->getUrl(),
-                get_remote_address(*res));
-        error_response(
-                *res,
-                http::NOT_FOUND,
-                fmt::format("{} {} Not Found", req->getMethod(), req->getUrl()));
-    });
-}
-
-void HTTPS::process_storage_rpc_req(HttpRequest& req, HttpResponse& res) {
-    auto addr = res.getRemoteAddress();
-    oxen::quic::ipv6 ip;
-    if (addr.size() == 4) {
-        // IPv4: convert to ipv4-mapped-ipv6:
-        ip = oxen::quic::ipv6{
-                0,
-                0,
-                0,
-                0,
-                0,
-                0xffff,
-                oxenc::load_big_to_host<uint16_t>(addr.data()),
-                oxenc::load_big_to_host<uint16_t>(addr.data() + 2)};
-    } else if (addr.size() == 16) {
-        ip = oxen::quic::ipv6{
-                std::span<const uint8_t, 16>{reinterpret_cast<const uint8_t*>(addr.data()), 16}};
-    } else {
-        log::warning(
-                logcat,
-                "Invalid incoming request IP: '{}'; rejecting request",
-                oxenc::to_hex(addr));
-        return error_response(res, http::BAD_REQUEST);
+                req.method,
+                req.uri,
+                req.remote_addr);
+        return Immediate{error_response(
+                http::NOT_FOUND, fmt::format("{} {} Not Found", req.method, req.uri))};
     }
 
-    if (rate_limiter_.should_rate_limit_client(ip)) {
-        log::debug(logcat, "Rate limiting client request from {}", ip);
-        return error_response(res, http::TOO_MANY_REQUESTS);
-    }
-    if (!req.getHeader("x-loki-long-poll").empty()) {
-        // Obsolete header, return an error code
-        return error_response(
-                res, http::GONE, "long polling is no longer supported, client upgrade required");
-    }
+    // Everything from here on is a request whose body we need.
 
-    handle_request(
-            *this,
-            omq_,
-            req,
-            res,
-            [this,
-             started = std::chrono::steady_clock::now()](std::shared_ptr<call_data> data) mutable {
-                auto& omq = data->omq;
-                auto& request = data->request;
-                omq.inject_task(
-                        "https",
-                        "https:" + request.uri,
-                        request.remote_addr,
-                        [this, data = std::move(data), started]() mutable {
-                            if (data->replied || data->aborted)
-                                return;
-
-                            try {
-                                request_handler_.process_client_req(
-                                        data->request.body,
-                                        [data, started](rpc::Response response) mutable {
-                                            log::debug(
-                                                    logcat,
-                                                    "Responding to a client request after {}",
-                                                    util::friendly_duration(
-                                                            std::chrono::steady_clock::now() -
-                                                            started));
-                                            queue_response(std::move(data), std::move(response));
-                                        });
-                            } catch (const std::exception& e) {
-                                auto error = "Exception caught with processing client request: "s +
-                                             e.what();
-                                log::critical(logcat, "{}", error);
-                                queue_response(
-                                        std::move(data), {http::INTERNAL_SERVER_ERROR, error});
-                            }
-                        });
-            });
-}
-
-void HTTPS::process_onion_req_v2(HttpRequest& req, HttpResponse& res) {
-    handle_request(
-            *this,
-            omq_,
-            req,
-            res,
-            [this,
-             started = std::chrono::steady_clock::now()](std::shared_ptr<call_data> data) mutable {
-                auto& omq = data->omq;
-                auto& request = data->request;
-                omq.inject_task(
-                        "https",
-                        "https:" + request.uri,
-                        request.remote_addr,
-                        [this, data = std::move(data), started]() mutable {
-                            if (data->replied || data->aborted)
-                                return;
-
-                            rpc::OnionRequestMetadata onion{
-                                    crypto::x25519_pubkey{},
-                                    [data, started](rpc::Response res) {
-                                        log::debug(
-                                                logcat,
-                                                "Got an onion response ({} {}) as edge node "
-                                                "(after {})",
-                                                res.status.first,
-                                                res.status.second,
-                                                util::friendly_duration(
-                                                        std::chrono::steady_clock::now() -
-                                                        started));
-                                        queue_response(std::move(data), std::move(res));
-                                    },
-                                    0,  // hopno
-                                    crypto::EncryptType::aes_gcm,
-                            };
-
-                            try {
-                                auto [ciphertext, json_req] =
-                                        rpc::parse_combined_payload(data->request.body);
-
-                                onion.ephem_key = rpc::extract_x25519_from_hex(
-                                        json_req.at("ephemeral_key").get_ref<const std::string&>());
-
-                                if (auto it = json_req.find("enc_type"); it != json_req.end())
-                                    onion.enc_type = crypto::parse_enc_type(
-                                            it->get_ref<const std::string&>());
-                                // Otherwise stay at default aes-gcm
-
-                                // Allows a fake starting hop number (to make it harder for
-                                // intermediate hops to know where they are).  If omitted, defaults
-                                // to 0.
-                                if (auto it = json_req.find("hop_no"); it != json_req.end())
-                                    onion.hop_no = std::max(0, it->get<int>());
-
-                                request_handler_.process_onion_req(ciphertext, std::move(onion));
-                            } catch (const std::exception& e) {
-                                auto msg = fmt::format("Error parsing onion request: {}", e.what());
-                                log::error(logcat, "{}", msg);
-                                queue_response(std::move(data), {http::BAD_REQUEST, msg});
-                            }
-                        });
-            });
-}
-
-void HTTPS::start() {
-    if (sent_startup_)
-        throw std::logic_error{"Cannot call HTTPS::start() more than once"};
-
-    startup_promise_.set_value(true);
-    sent_startup_ = true;
-    listen_socks_ = startup_success_.get();
-}
-
-void HTTPS::shutdown(bool join) {
-    if (!server_thread_.joinable())
-        return;
-
-    if (!sent_shutdown_) {
-        log::trace(logcat, "initiating shutdown");
-        if (!sent_startup_) {
-            startup_promise_.set_value(false);
-            sent_startup_ = true;
-        } else if (!listen_socks_.empty()) {
-            loop_defer([this] {
-                log::trace(logcat, "closing {} listening sockets", listen_socks_.size());
-                for (auto* s : listen_socks_)
-                    us_listen_socket_close(/*ssl=*/true, s);
-                listen_socks_.clear();
-
-                closing_ = true;
-            });
+    if (auto it = req.headers.find("content-length"); it != req.headers.end()) {
+        if (uint64_t length; !util::parse_int(it->second, length)) {
+            log::warning(
+                    logcat,
+                    "Received HTTPS request from {} with invalid Content-Length, dropping",
+                    req.remote_addr);
+            return Immediate{
+                    rpc::Response{http::BAD_REQUEST, "invalid Content-Length"sv},
+                    /*force_close=*/true};
+        } else if (length > MAX_REQUEST_BODY_SIZE) {
+            log::warning(
+                    logcat,
+                    "Received HTTPS request from {} with too-large body ({} > {}), dropping",
+                    req.remote_addr,
+                    length,
+                    MAX_REQUEST_BODY_SIZE);
+            return Immediate{
+                    rpc::Response{http::PAYLOAD_TOO_LARGE, "Request body too large"sv},
+                    /*force_close=*/true};
         }
-        sent_shutdown_ = true;
     }
 
-    log::trace(logcat, "joining https server thread");
-    if (join)
-        server_thread_.join();
-    log::trace(logcat, "done shutdown");
+    handle_cors(req);
+    log::debug(logcat, "Received {} {} request from {}", req.method, req.uri, req.remote_addr);
+
+    return std::nullopt;
 }
 
-HTTPS::~HTTPS() {
-    shutdown(true);
+void HTTPS::dispatch(std::shared_ptr<HttpsCall> call) {
+    if (call->request.uri == "/storage_rpc/v1"sv)
+        process_storage_rpc_req(std::move(call));
+    else if (call->request.uri == "/onion_req/v2"sv)
+        process_onion_req_v2(std::move(call));
+    else
+        // on_headers() only lets the two routes above through to body reading; anything else
+        // here is a backend bug.
+        call->reply(error_response(http::INTERNAL_SERVER_ERROR), true);
+}
+
+void HTTPS::process_storage_rpc_req(std::shared_ptr<HttpsCall> call) {
+    auto& request = call->request;
+    omq_.inject_task(
+            "https",
+            "https:" + request.uri,
+            request.remote_addr,
+            [this, call = std::move(call), started = std::chrono::steady_clock::now()]() mutable {
+                if (call->replied || call->aborted)
+                    return;
+
+                try {
+                    request_handler_.process_client_req(
+                            call->request.body, [call, started](rpc::Response response) mutable {
+                                log::debug(
+                                        logcat,
+                                        "Responding to a client request after {}",
+                                        util::friendly_duration(
+                                                std::chrono::steady_clock::now() - started));
+                                call->reply(std::move(response));
+                            });
+                } catch (const std::exception& e) {
+                    auto error = "Exception caught with processing client request: "s + e.what();
+                    log::critical(logcat, "{}", error);
+                    call->reply({http::INTERNAL_SERVER_ERROR, error});
+                }
+            });
+}
+
+void HTTPS::process_onion_req_v2(std::shared_ptr<HttpsCall> call) {
+    auto& request = call->request;
+    omq_.inject_task(
+            "https",
+            "https:" + request.uri,
+            request.remote_addr,
+            [this, call = std::move(call), started = std::chrono::steady_clock::now()]() mutable {
+                if (call->replied || call->aborted)
+                    return;
+
+                rpc::OnionRequestMetadata onion{
+                        crypto::x25519_pubkey{},
+                        [call, started](rpc::Response res) {
+                            log::debug(
+                                    logcat,
+                                    "Got an onion response ({} {}) as edge node (after {})",
+                                    res.status.first,
+                                    res.status.second,
+                                    util::friendly_duration(
+                                            std::chrono::steady_clock::now() - started));
+                            call->reply(std::move(res));
+                        },
+                        0,  // hopno
+                        crypto::EncryptType::aes_gcm,
+                };
+
+                try {
+                    auto [ciphertext, json_req] = rpc::parse_combined_payload(call->request.body);
+
+                    onion.ephem_key = rpc::extract_x25519_from_hex(
+                            json_req.at("ephemeral_key").get_ref<const std::string&>());
+
+                    if (auto it = json_req.find("enc_type"); it != json_req.end())
+                        onion.enc_type = crypto::parse_enc_type(it->get_ref<const std::string&>());
+                    // Otherwise stay at default aes-gcm
+
+                    // Allows a fake starting hop number (to make it harder for intermediate hops
+                    // to know where they are).  If omitted, defaults to 0.
+                    if (auto it = json_req.find("hop_no"); it != json_req.end())
+                        onion.hop_no = std::max(0, it->get<int>());
+
+                    request_handler_.process_onion_req(ciphertext, std::move(onion));
+                } catch (const std::exception& e) {
+                    auto msg = fmt::format("Error parsing onion request: {}", e.what());
+                    log::error(logcat, "{}", msg);
+                    call->reply({http::BAD_REQUEST, msg});
+                }
+            });
+}
+
+std::unique_ptr<HTTPS> make_https(
+        HttpsBackend backend,
+        snode::ServiceNode& sn,
+        rpc::RequestHandler& rh,
+        rpc::RateLimiter& rl,
+        std::vector<std::tuple<std::string, uint16_t, bool>> bind,
+        const std::filesystem::path& ssl_cert,
+        const std::filesystem::path& ssl_key,
+        crypto::legacy_keypair legacy_keys) {
+    switch (backend) {
+        case HttpsBackend::uwebsockets:
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
+            return std::make_unique<HTTPS_uWS>(
+                    sn, rh, rl, std::move(bind), ssl_cert, ssl_key, std::move(legacy_keys));
+#else
+            break;
+#endif
+        case HttpsBackend::microhttpd:
+#ifdef OXENSS_HTTPS_MICROHTTPD
+            return std::make_unique<HTTPS_MHD>(
+                    sn, rh, rl, std::move(bind), ssl_cert, ssl_key, std::move(legacy_keys));
+#else
+            break;
+#endif
+    }
+    throw std::invalid_argument{
+            "HTTPS backend '{}' is not available in this build (available: {})"_format(
+                    to_string(backend), fmt::join(available_https_backends(), ", "))};
 }
 
 }  // namespace oxenss::server

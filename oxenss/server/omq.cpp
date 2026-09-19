@@ -58,38 +58,12 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
 
     crypto::x25519_pubkey xpk;
     std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
-    if (!service_node_->is_swarm_peer(xpk))
+    auto pk = service_node_->contacts().lookup(xpk);
+    if (!pk)
         return message.send_reply("Swarm mismatch");
 
-    std::optional<oxenss::snode::contact> ct = service_node_->contacts().find(xpk);
-    if (!ct)
-        return message.send_reply("Contact info missing");
-
-    if (ct->version >= snode::SN_DATA_READY_WITH_REQUEST_VERSION) {
-        if (message.data.empty())
-            return message.send_reply("Request payload missing");
-
-        bool needs_db_dump{false};
-        try {
-            needs_db_dump = snode::deserialise_data_ready_request(message.data[0]);
-        } catch (const std::exception& e) {
-            log::info(logcat, "DataReadyRequest deserialization error: {}", e.what());
-            return message.send_reply("Request payload malformed.");
-        }
-
-        if (needs_db_dump)
-            service_node_->set_member_needs_db_dump(crypto::legacy_pubkey{ct->pubkey_ed25519});
-
-        if (log::get_level(logcat) <= log::Level::debug) {
-            log::debug(
-                    logcat,
-                    "sn.data ready processed (edpk: {}, needs db dump: {})",
-                    ct->pubkey_ed25519,
-                    needs_db_dump);
-        }
-    }
-
-    message.send_reply("OK");
+    message.send_reply(service_node_->data_ready_handshake(
+            *pk, message.data.empty() ? std::string_view{} : message.data[0]));
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {
@@ -101,13 +75,10 @@ void OMQ::handle_sn_data(oxenmq::Message& message) {
     }
 
     // TODO: process push batch should move to "Request handler"
-    service_node_->process_push_batch(message.data[0], message.conn.to_string());
+    if (!service_node_->process_push_batch(message.data[0], message.conn.to_string()))
+        return message.send_reply("Failed to store messages");
 
-    log::debug(logcat, "[OMQ] send reply");
-
-    // TODO: Investigate if the above could fail and whether we should report
-    // that to the sending SN
-    message.send_reply();
+    message.send_reply("OK");
 };
 
 void OMQ::handle_ping(oxenmq::Message& message) {
@@ -312,32 +283,33 @@ OMQ::OMQ(
     omq_.EPHEMERAL_ROUTING_ID = false;
 }
 
-void OMQ::connect_oxend(const oxenmq::address& oxend_rpc) {
+void OMQ::connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going) {
     // Establish our persistent connection to oxend.
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        std::promise<bool> prom;
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
         log::info(logcat, "Establishing connection to oxend...");
         omq_.connect_remote(
                 oxend_rpc,
-                [this, &prom](auto cid) {
+                [this, prom](auto cid) {
                     oxend_conn_ = cid;
-                    prom.set_value(true);
+                    prom->set_value(true);
                 },
-                [&prom, &oxend_rpc](auto&&, std::string_view reason) {
+                [prom, oxend_rpc](auto&&, std::string_view reason) {
                     log::warning(
                             logcat,
                             "failed to connect to local oxend @ {}: {}; retrying",
                             oxend_rpc.full_address(),
                             reason);
-                    prom.set_value(false);
+                    prom->set_value(false);
                 },
                 // Turn this off since we are using oxenmq's own key and don't want to replace some
                 // existing connection to it that might also be using that pubkey:
                 oxenmq::connect_option::ephemeral_routing_id{},
                 oxenmq::AuthLevel::admin);
 
-        if (prom.get_future().get()) {
+        if (snode::await_startup(fut, keep_going, "the connection to oxend")) {
             log::info(
                     logcat,
                     "Connected to oxend in {}",
@@ -348,11 +320,50 @@ void OMQ::connect_oxend(const oxenmq::address& oxend_rpc) {
     }
 }
 
+std::chrono::seconds OMQ::oxend_top_block_age(const std::function<bool()>& keep_going) {
+    for (int attempt = 1;; attempt++) {
+        auto prom = std::make_shared<std::promise<std::chrono::seconds>>();
+        auto fut = prom->get_future();
+        oxend_request(
+                "rpc.get_last_block_header", [prom](bool success, std::vector<std::string> data) {
+                    try {
+                        if (!success || data.size() < 2 || data[0] != "200")
+                            throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
+                        auto header = nlohmann::json::parse(data[1]).at("block_header");
+                        std::chrono::sys_seconds mined{
+                                std::chrono::seconds{header.at("timestamp").get<int64_t>()}};
+                        auto now = std::chrono::floor<std::chrono::seconds>(
+                                std::chrono::system_clock::now());
+                        auto age = std::max(0s, now - mined);
+                        log::info(
+                                logcat,
+                                "oxend is at height {}; its top block is {} old",
+                                header.at("height").get<uint64_t>(),
+                                util::friendly_duration(age));
+                        prom->set_value(age);
+                    } catch (...) {
+                        prom->set_exception(std::current_exception());
+                    }
+                });
+        try {
+            return snode::await_startup(fut, keep_going, "oxend's top block");
+        } catch (const snode::startup_aborted&) {
+            throw;
+        } catch (const std::exception& e) {
+            if (attempt >= 5)
+                throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
+            log::warning(logcat, "Failed to get the top block from oxend: {}; retrying", e.what());
+        }
+        std::this_thread::sleep_for(1s);
+    }
+}
+
 void OMQ::init(
         snode::ServiceNode* sn,
         rpc::RequestHandler* rh,
         rpc::RateLimiter* rl,
-        oxenmq::address oxend_rpc) {
+        oxenmq::address oxend_rpc,
+        const std::function<bool()>& keep_going) {
     // Initialization happens in 3 steps:
     // - connect to oxend
     // - get initial block update from oxend
@@ -363,10 +374,10 @@ void OMQ::init(
     rate_limiter_ = rl;
     omq_.start();
     // Block until we are connected to oxend:
-    connect_oxend(oxend_rpc);
+    connect_oxend(oxend_rpc, keep_going);
 
     // Block until we get a block update from oxend:
-    service_node_->on_oxend_connected();
+    service_node_->on_oxend_connected(keep_going);
 
     // start omq listener
     const auto port = service_node_->own_address().omq_quic_port;
@@ -466,6 +477,21 @@ void OMQ::notify(std::vector<connection_id>& conns, std::string_view notificatio
 
 void OMQ::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
     send_notification(conns, "notify.monitor_ended", notification);
+}
+
+void OMQ::sn_request(
+        const snode::contact& ct,
+        std::string_view cmd,
+        std::vector<std::string> parts,
+        sn_reply_callback cb,
+        std::chrono::milliseconds timeout,
+        sn_fallback) {
+    omq_.request(
+            ct.pubkey_x25519.view(),
+            "sn.{}"_format(cmd),
+            std::move(cb),
+            oxenmq::send_option::data_parts(parts),
+            oxenmq::send_option::request_timeout{timeout});
 }
 
 void OMQ::reachability_test(std::shared_ptr<snode::sn_test> test) {

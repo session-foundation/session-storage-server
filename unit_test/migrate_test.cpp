@@ -12,7 +12,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Opening: " << path << "\n";
     try {
         oxenss::Database db{path};
-        std::cout << "had_swarm_state_on_open: " << db.had_swarm_state_on_open() << "\n";
         std::cout << "Migration complete.\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

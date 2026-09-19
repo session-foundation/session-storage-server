@@ -11,8 +11,12 @@ local default_deps_base = [
   'libjemalloc-dev',
   'libsodium-dev',
   'libgnutls28-dev',
+  // The libmicrohttpd HTTPS backend needs >= 1.0.8 (see external/CMakeLists.txt), which only sid
+  // and Ubuntu rolling currently ship; elsewhere cmake rejects the distro package as too old and
+  // session-deps builds it statically, so installing it everywhere just lets the distros that can
+  // use the system library exercise that path.
+  'libmicrohttpd-dev',
   'libsqlite3-dev',
-  'libssl-dev',
   'libsystemd-dev',
   'libngtcp2-dev',
   'libngtcp2-crypto-gnutls-dev',
@@ -22,6 +26,10 @@ local default_deps_base = [
 ];
 local default_deps_nocxx = ['libsodium-dev'] + default_deps_base;  // libsodium-dev needs to be >= 1.0.18
 local default_deps = ['g++'] + default_deps_nocxx;  // g++ sometimes needs replacement
+// Only the (off by default) uWebSockets HTTPS backend wants OpenSSL.
+local uws_deps = default_deps + ['libssl-dev'];
+// The default build must not link OpenSSL; this is run after it.
+local check_no_openssl = 'if objdump -p oxen-storage | grep -E "NEEDED.*lib(ssl|crypto)"; then echo "OpenSSL is linked"; exit 1; fi';
 local docker_base = 'registry.oxen.rocks/';
 
 local submodules_commands = [
@@ -159,7 +167,7 @@ local static_check_and_upload = [
   },
 
   // Various debian builds
-  debian_pipeline('Debian (amd64)', docker_base + 'debian-sid', lto=true),
+  debian_pipeline('Debian (amd64)', docker_base + 'debian-sid', lto=true, extra_cmds=[check_no_openssl]),
   debian_pipeline('Debian Debug (amd64)', docker_base + 'debian-sid', build_type='Debug'),
   clang(19, lto=true),
   debian_pipeline('Debian stable (i386)', docker_base + 'debian-stable/i386', werror=false),
@@ -167,9 +175,21 @@ local static_check_and_upload = [
   debian_pipeline('Ubuntu latest (amd64)', docker_base + 'ubuntu-rolling'),
   debian_pipeline('Debian 12 bookworm (amd64)', docker_base + 'debian-bookworm', oxen_repo=true),
 
+  // The default build is libmicrohttpd only.  These keep the uWebSockets backend compiling, alone
+  // and alongside libmicrohttpd, so that it stays usable for comparison.
+  debian_pipeline('Debian sid, uWS-only (amd64)',
+                  docker_base + 'debian-sid',
+                  deps=uws_deps,
+                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON -DHTTPS_BACKEND_MICROHTTPD=OFF'),
+  debian_pipeline('Debian sid, uWS+MHD (amd64)',
+                  docker_base + 'debian-sid',
+                  deps=uws_deps,
+                  cmake_extra='-DHTTPS_BACKEND_UWEBSOCKETS=ON'),
+
   // ARM builds (ARM64 and armhf)
-  debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64'),
-  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false),
+  // The ARM box is shared and short on RAM: at the default -j6 it kills compilers mid-build.
+  debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64', jobs=4),
+  debian_pipeline('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', werror=false, jobs=4),
 
   // Static build (on bionic) which gets uploaded to oxen.rocks:
   debian_pipeline('Static (jammy amd64)',

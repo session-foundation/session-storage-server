@@ -13,7 +13,7 @@ endif()
 cmake_minimum_required(VERSION 3.18)
 
 project(oxenss
-    VERSION 2.11.3
+    VERSION 2.12.0
     LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -38,6 +38,15 @@ else()
 endif()
 
 option(BUILD_TESTS "build storage server unit tests" OFF)
+
+# HTTPS server implementations.  Any that are enabled get compiled in; which one is used is chosen
+# at runtime with --https-backend.  At least one must be enabled.  uWebSockets is the previous
+# implementation, kept for comparison; it is the only thing that brings OpenSSL into the build.
+option(HTTPS_BACKEND_UWEBSOCKETS "Build the uWebSockets (OpenSSL) HTTPS server backend" OFF)
+option(HTTPS_BACKEND_MICROHTTPD "Build the libmicrohttpd (GnuTLS) HTTPS server backend" ON)
+if(NOT HTTPS_BACKEND_UWEBSOCKETS AND NOT HTTPS_BACKEND_MICROHTTPD)
+    message(FATAL_ERROR "At least one HTTPS_BACKEND_* option must be enabled")
+endif()
 
 # session-deps has its own LTO switch for static dependency builds that defaults ON regardless of
 # ours; leaving the two to disagree breaks the link, because an LTO'd static archive can't be

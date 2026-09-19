@@ -6,7 +6,7 @@
 #include <memory>
 #include <span>
 
-#include <openssl/evp.h>
+#include <gnutls/crypto.h>
 #include <sodium/crypto_aead_xchacha20poly1305.h>
 #include <sodium/crypto_auth_hmacsha256.h>
 #include <sodium/crypto_generichash.h>
@@ -47,11 +47,27 @@ namespace {
         return key;
     }
 
-    struct aes256_evp_deleter {
-        void operator()(EVP_CIPHER_CTX* ptr) { EVP_CIPHER_CTX_free(ptr); }
+    // Wire format constants, not library preferences: the aes-gcm ciphertext a client sends is
+    // `IV || ciphertext || tag`, with these sizes, and changing either breaks every client.
+    inline constexpr size_t gcm_iv_size = 12;
+    inline constexpr size_t gcm_tag_size = 16;
+
+    struct aead_cipher_deleter {
+        void operator()(gnutls_aead_cipher_hd_t h) const { gnutls_aead_cipher_deinit(h); }
     };
 
-    using aes256_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, aes256_evp_deleter>;
+    using aead_cipher_ptr =
+            std::unique_ptr<std::remove_pointer_t<gnutls_aead_cipher_hd_t>, aead_cipher_deleter>;
+
+    aead_cipher_ptr aes_gcm_cipher(const std::array<uint8_t, crypto_scalarmult_BYTES>& key) {
+        gnutls_datum_t k{
+                const_cast<unsigned char*>(key.data()), static_cast<unsigned int>(key.size())};
+        gnutls_aead_cipher_hd_t h;
+        if (int rc = gnutls_aead_cipher_init(&h, GNUTLS_CIPHER_AES_256_GCM, &k); rc < 0)
+            throw std::runtime_error{
+                    "Could not initialise AES-256-GCM cipher: "s + gnutls_strerror(rc)};
+        return aead_cipher_ptr{h};
+    }
 
 }  // namespace
 
@@ -60,8 +76,6 @@ EncryptType parse_enc_type(std::string_view enc_type) {
         return EncryptType::xchacha20;
     if (enc_type == "aes-gcm" || enc_type == "gcm")
         return EncryptType::aes_gcm;
-    if (enc_type == "aes-cbc" || enc_type == "cbc")
-        return EncryptType::aes_cbc;
     throw std::runtime_error{"Invalid encryption type " + std::string{enc_type}};
 }
 
@@ -70,7 +84,6 @@ std::string ChannelEncryption::encrypt(
     switch (type) {
         case EncryptType::xchacha20: return encrypt_xchacha20(plaintext, pubkey);
         case EncryptType::aes_gcm: return encrypt_gcm(plaintext, pubkey);
-        case EncryptType::aes_cbc: return encrypt_cbc(plaintext, pubkey);
     }
     throw std::runtime_error{"Invalid encryption type"};
 }
@@ -80,145 +93,72 @@ std::string ChannelEncryption::decrypt(
     switch (type) {
         case EncryptType::xchacha20: return decrypt_xchacha20(ciphertext, pubkey);
         case EncryptType::aes_gcm: return decrypt_gcm(ciphertext, pubkey);
-        case EncryptType::aes_cbc: return decrypt_cbc(ciphertext, pubkey);
     }
     throw std::runtime_error{"Invalid decryption type"};
 }
 
-static std::string encrypt_openssl(
-        const EVP_CIPHER* cipher,
-        int taglen,
-        std::span<const unsigned char> plaintext,
-        const std::array<uint8_t, crypto_scalarmult_BYTES>& key) {
-    // Initialise cipher context
-    aes256_ctx_ptr ctx_ptr{EVP_CIPHER_CTX_new()};
-    auto* ctx = ctx_ptr.get();
-
-    std::string output;
-    // Start the output with the iv, then output space plus an extra possible 'blockSize'
-    // (according to libssl docs) for the cipher data.
-    const int ivLength = EVP_CIPHER_iv_length(cipher);
-    output.resize(ivLength + plaintext.size() + EVP_CIPHER_block_size(cipher) + taglen);
-    auto* o = reinterpret_cast<unsigned char*>(output.data());
-    randombytes_buf(o, ivLength);
-    const auto* iv = o;
-    o += ivLength;
-
-    if (EVP_EncryptInit_ex(ctx, cipher, nullptr, key.data(), iv) <= 0) {
-        throw std::runtime_error("Could not initialise encryption context");
-    }
-
-    int len;
-    // Encrypt every full blocks
-    if (EVP_EncryptUpdate(ctx, o, &len, plaintext.data(), plaintext.size()) <= 0) {
-        throw std::runtime_error("Could not encrypt plaintext");
-    }
-    o += len;
-
-    // Encrypt any remaining partial blocks
-    if (EVP_EncryptFinal_ex(ctx, o, &len) <= 0) {
-        throw std::runtime_error("Could not finalise encryption");
-    }
-    o += len;
-
-    // Add the tag, if applicable (e.g. aes-gcm)
-    if (taglen > 0 && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, taglen, o) <= 0)
-        throw std::runtime_error{"Failed to copy encryption tag"};
-    o += taglen;
-
-    // Remove excess buffer space
-    output.resize(reinterpret_cast<char*>(o) - output.data());
-
-    return output;
-}
-
-static std::string decrypt_openssl(
-        const EVP_CIPHER* cipher,
-        size_t taglen,
-        std::span<const unsigned char> ciphertext,
-        const std::array<uint8_t, crypto_scalarmult_BYTES>& key) {
-    // Initialise cipher context
-    aes256_ctx_ptr ctx_ptr{EVP_CIPHER_CTX_new()};
-    auto* ctx = ctx_ptr.get();
-
-    // We prepend the iv and append the tag (if applicable), so both have to fit.  This has to be
-    // checked up front because subspan, unlike string_view::substr, does not clamp to the
-    // available length.
-    const size_t ivlen = EVP_CIPHER_iv_length(cipher);
-    if (ciphertext.size() < ivlen + taglen)
-        throw std::runtime_error{"Encrypted value is too short"};
-
-    auto iv = ciphertext.first(ivlen);
-    ciphertext = ciphertext.subspan(ivlen);
-
-    auto tag = ciphertext.last(taglen);
-    ciphertext = ciphertext.first(ciphertext.size() - taglen);
-
-    // libssl docs say we need up to block size of extra buffer space:
-    std::string output;
-    output.resize(ciphertext.size() + EVP_CIPHER_block_size(cipher));
-
-    // Initialise cipher context
-    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, key.data(), iv.data()) <= 0) {
-        throw std::runtime_error("Could not initialise decryption context");
-    }
-
-    int len;
-    auto* o = reinterpret_cast<unsigned char*>(output.data());
-
-    // Decrypt every full blocks
-    if (EVP_DecryptUpdate(ctx, o, &len, ciphertext.data(), ciphertext.size()) <= 0) {
-        throw std::runtime_error("Could not decrypt block");
-    }
-    o += len;
-
-    if (!tag.empty() &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, taglen, (void*)tag.data()) <= 0)
-        throw std::runtime_error{"Could not set decryption tag"};
-
-    // Decrypt any remaining partial blocks
-    if (EVP_DecryptFinal_ex(ctx, o, &len) <= 0) {
-        throw std::runtime_error("Could not finalise decryption");
-    }
-    o += len;
-
-    // Remove excess buffer space
-    output.resize(reinterpret_cast<char*>(o) - output.data());
-
-    return output;
-}
-
-std::string ChannelEncryption::encrypt_cbc(
-        std::string_view plaintext_, const x25519_pubkey& pubKey) const {
-    return encrypt_openssl(
-            EVP_aes_256_cbc(), 0, to_uchar(plaintext_), calculate_shared_secret(keys_.sec, pubKey));
-}
-
-std::string ChannelEncryption::decrypt_cbc(
-        std::string_view ciphertext_, const x25519_pubkey& pubKey) const {
-    return decrypt_openssl(
-            EVP_aes_256_cbc(),
-            0,
-            to_uchar(ciphertext_),
-            calculate_shared_secret(keys_.sec, pubKey));
-}
-
 std::string ChannelEncryption::encrypt_gcm(
         std::string_view plaintext_, const x25519_pubkey& pubKey) const {
-    return encrypt_openssl(
-            EVP_aes_256_gcm(),
-            16 /* tag length */,
-            to_uchar(plaintext_),
-            derive_symmetric_key(keys_.sec, pubKey));
+    auto plaintext = to_uchar(plaintext_);
+    auto cipher = aes_gcm_cipher(derive_symmetric_key(keys_.sec, pubKey));
+
+    std::string output;
+    output.resize(gcm_iv_size + plaintext.size() + gcm_tag_size);
+    auto* iv = reinterpret_cast<unsigned char*>(output.data());
+    randombytes_buf(iv, gcm_iv_size);
+
+    size_t ctext_size = output.size() - gcm_iv_size;
+    if (int rc = gnutls_aead_cipher_encrypt(
+                cipher.get(),
+                iv,
+                gcm_iv_size,
+                nullptr,
+                0,  // additional data
+                gcm_tag_size,
+                plaintext.data(),
+                plaintext.size(),
+                iv + gcm_iv_size,
+                &ctext_size);
+        rc < 0)
+        throw std::runtime_error{"Could not encrypt plaintext: "s + gnutls_strerror(rc)};
+
+    assert(ctext_size == output.size() - gcm_iv_size);
+    return output;
 }
 
 std::string ChannelEncryption::decrypt_gcm(
         std::string_view ciphertext_, const x25519_pubkey& pubKey) const {
-    return decrypt_openssl(
-            EVP_aes_256_gcm(),
-            16 /* tag length */,
-            to_uchar(ciphertext_),
-            derive_symmetric_key(keys_.sec, pubKey));
+    auto ciphertext = to_uchar(ciphertext_);
+
+    // We prepend the iv and append the tag, so both have to fit.  This has to be checked up front
+    // because subspan, unlike string_view::substr, does not clamp to the available length.
+    if (ciphertext.size() < gcm_iv_size + gcm_tag_size)
+        throw std::runtime_error{"Encrypted value is too short"};
+
+    auto iv = ciphertext.first(gcm_iv_size);
+    ciphertext = ciphertext.subspan(gcm_iv_size);
+
+    auto cipher = aes_gcm_cipher(derive_symmetric_key(keys_.sec, pubKey));
+
+    std::string output;
+    output.resize(ciphertext.size() - gcm_tag_size);
+    size_t ptext_size = output.size();
+    if (int rc = gnutls_aead_cipher_decrypt(
+                cipher.get(),
+                iv.data(),
+                iv.size(),
+                nullptr,
+                0,  // additional data
+                gcm_tag_size,
+                ciphertext.data(),
+                ciphertext.size(),
+                output.data(),
+                &ptext_size);
+        rc < 0)
+        throw std::runtime_error{"Could not decrypt (AES-256-GCM): "s + gnutls_strerror(rc)};
+
+    assert(ptext_size == output.size());
+    return output;
 }
 
 static std::array<unsigned char, crypto_aead_xchacha20poly1305_ietf_KEYBYTES> xchacha20_shared_key(

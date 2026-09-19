@@ -11,24 +11,23 @@ namespace oxenss::snode {
 
 Network::Network(oxenmq::OxenMQ& omq) : contacts{omq} {}
 
-std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm) const {
-    if (swarms_.size() <= 1)
+std::pair<uint64_t, uint64_t> Network::swarm_boundaries(const swarms_t& swarms, swarm_id_t swarm) {
+    if (swarms.size() <= 1)
         return {0, 0};
 
-    const auto it = swarms_.find(swarm);
-    if (it == swarms_.end())
+    const auto it = swarms.find(swarm);
+    if (it == swarms.end())
         throw std::logic_error{"This function should only be called with a current swarm id."};
 
-    // FIXME: this logic is a little weird, but should work.
     uint64_t prev_swarm, next_swarm;
-    if (it == swarms_.begin()) {
+    if (it == swarms.begin()) {
         next_swarm = std::next(it)->first;
-        prev_swarm = std::prev(swarms_.end())->first;
+        prev_swarm = std::prev(swarms.end())->first;
     } else {
         prev_swarm = std::prev(it)->first;
         auto it2 = std::next(it);
-        if (it2 == swarms_.end())
-            it2 = swarms_.begin();
+        if (it2 == swarms.end())
+            it2 = swarms.begin();
         next_swarm = it2->first;
     }
 
@@ -42,6 +41,11 @@ std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(const uint64_t swarm
         left_diff += 1;  // round the average up on the left side
     auto right_diff = next_swarm - swarm;
     return {swarm - (left_diff / 2), swarm + (right_diff / 2)};
+}
+
+std::pair<uint64_t, uint64_t> Network::get_swarm_boundaries(swarm_id_t swarm) const {
+    std::shared_lock lock{mut_};
+    return swarm_boundaries(swarms_, swarm);
 }
 
 swarms_t::const_iterator Network::_find_swarm_for(const user_pubkey& pk) const {
@@ -121,6 +125,20 @@ void Network::update_swarms(
         all_nodes_blob_.reset();
 
     swarms_ = std::move(new_swarms);
+
+    std::array<uint16_t, 3> min_version{};
+    bool any = false;
+    for (const auto& [pk, c] : new_contacts)
+        if (c && (!any || c.version < min_version)) {
+            min_version = c.version;
+            any = true;
+        }
+    min_peer_version_ = min_version;
+}
+
+std::array<uint16_t, 3> Network::min_peer_version() const {
+    std::shared_lock lock{mut_};
+    return min_peer_version_;
 }
 
 static constexpr size_t PER_SNODE_BLOB_SIZE = 51;
@@ -180,6 +198,7 @@ std::shared_ptr<std::vector<std::byte>> Network::all_nodes_blob() const {
 }
 
 std::set<swarm_id_t> Network::get_all_swarm_ids() const {
+    std::shared_lock lock{mut_};
     std::set<swarm_id_t> ret;
 
     for (const auto& [id, swarm] : swarms_)

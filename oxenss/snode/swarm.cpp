@@ -50,15 +50,16 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
 
     if (old_swarm == INVALID_SWARM_ID) {
         log::info(logcat, "Joined swarm {:#18x} (blk {})", new_swarm, height);
-        // We were previously not in a swarm, which means we just got assigned to one, we need to
-        // relay any of our messages belonging to the swarm
+        // Every member of the swarm is new to us
         events.new_swarm_members = events.our_swarm_members;
         events.new_swarm_members.erase(our_pk);
         return events;
     }
 
     if (old_swarm != new_swarm) {
-        // Moved to a new swarm
+        // Moved to a new swarm; every member of it is new to us
+        events.new_swarm_members = events.our_swarm_members;
+        events.new_swarm_members.erase(our_pk);
 
         if (!network.swarms_.count(old_swarm)) {
             // The old swarm dissolved, which means we have a responsibility to push messages we are
@@ -79,14 +80,13 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
                 logcat,
                 "Changed from {:018x} {}to {:018x} (blk {})",
                 old_swarm,
+                events.dissolved ? "(dissolved) " : "",
                 new_swarm,
-                height,
-                events.dissolved ? "(dissolved) " : "");
+                height);
 
-        // If our old swarm is still alive then that means we got moved out of it, and so there's
-        // nothing for us to do because the remaining swarm members will continue to administer the
-        // old swarm, and whatever swarm we just moved into (possibly a new one) will have messages
-        // pushed to it by other network nodes.
+        // If our old swarm is still alive then the remaining members continue to administer it and
+        // we have nothing to push; if it dissolved we have to push what we hold to the swarms that
+        // now own it.  Either way we ask our new swarm's members for its messages.
         return events;
     }
 
@@ -113,14 +113,19 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
     // FIXME: currently we do this on any new swarm creation, but that seems excessive: we really
     // only need to worry about this if our boundary on either side changes.  (Most of the time it
     // won't because, with hundreds of swarms, most new swarms don't affect our swarm space).
-    auto new_swarm_ids = std::views::keys(swarms);
-    auto old_swarm_ids = std::views::keys(network.swarms_);
-    std::set_difference(
-            new_swarm_ids.begin(),
-            new_swarm_ids.end(),
-            old_swarm_ids.begin(),
-            old_swarm_ids.end(),
-            std::inserter(events.new_swarms, events.new_swarms.end()));
+    //
+    // On the first update after startup we have no previous swarm list to compare against (only
+    // our own swarm id is persisted), so every swarm would look new; none of them are.
+    if (!network.swarms_.empty()) {
+        auto new_swarm_ids = std::views::keys(swarms);
+        auto old_swarm_ids = std::views::keys(network.swarms_);
+        std::set_difference(
+                new_swarm_ids.begin(),
+                new_swarm_ids.end(),
+                old_swarm_ids.begin(),
+                old_swarm_ids.end(),
+                std::inserter(events.new_swarms, events.new_swarms.end()));
+    }
 
     return events;
 }
@@ -132,9 +137,13 @@ SwarmEvents Swarm::update_swarms(
 
     std::lock_guard lock{network.mut_};
 
+    // The first update after startup has no previous swarm list; only our own swarm id survives a
+    // restart, so "still in the same swarm" says nothing about what we hold.
+    const bool first_update = network.swarms_.empty();
+
     auto events = derive_swarm_events(height, swarms);
-    if (db_was_initially_empty_with_swarm_id == INVALID_SWARM_ID)
-        db_was_initially_empty_with_swarm_id = events.our_swarm_id;
+    const bool entered_swarm =
+            events.our_swarm_id != INVALID_SWARM_ID && events.our_swarm_id != cur_swarm_id_;
 
     if (events.our_swarm_id != INVALID_SWARM_ID) {
         for (const auto& pk : events.new_swarm_members)
@@ -143,69 +152,39 @@ SwarmEvents Swarm::update_swarms(
         for (auto swarm : events.new_swarms)
             log::info(logswarm, "New network swarm: {}", swarm);
 
-        // Remove members that are no longer in the swarm from our runtime state
         for (auto it = members_.begin(); it != members_.end();) {
             if (events.our_swarm_members.find(it->first) == events.our_swarm_members.end())
                 it = members_.erase(it);
             else
                 it++;
         }
+        for (const auto& pk : events.new_swarm_members)
+            members_[pk];
 
-        // TODO: Remove the versions checks below after everyone migrates their SQL DB to v1. The
-        // version checks gate the new behaviour where this SS will request a dump of the swarm
-        // member's DB to synchronise new messages.
-        //
-        // When a SS upgrades to this version, their DB is initially set to v0 and all the prior
-        // active service nodes that upgrade will have the chain synchronised and their SS's sitting
-        // in the correct swarm. We do _not_ want those storage servers to, on upgrade, request a DB
-        // dump of all the messages from each swarm peer as they are (presumably) relatively synced.
-        //
-        // The SS's on v0 don't persist the swarm state to the DB, so on startup they always
-        // re-bootstrap the state of their swarms. This populates the new-swarm-members array and
-        // hence triggers the extraneous swarm dump.
-        //
-        // The version gate protects against that happening to all the individual nodes on upgrade.
-        // Once all v0 SS's upgrade, the DB will be marked v1. From that point, swarms are persisted
-        // onto disk and so any SS's that appear in the new-swarm-members array is _actually_ a new
-        // SS and we _should_ request a DB a dump from them to synchronise messages they might have
-        // for us.
-        //
-        // New incoming nodes in general are going to end up having 0 messages for us if they are
-        // joining the network for the first time.
-        //
-        // If we are joining a swarm, then, all the members of the swarm are in the
-        // new-swarm-members array and we will request a DB dump from them.
-        //
-        // In a swarm dissolving case, then, these new nodes will have a chunk of messages in the
-        // adjacent message space that belong to this swarm they are merging into. That is handled
-        // here.
-
-        // Add members from the swarm that are missing from our runtime state and request a DB dump
-        // from them to ensure we have all the messages they have that we don't.
-        for (auto it : events.new_swarm_members) {
-            auto& pair = members_[it];
-            if (!did_swarm_space_check && _db.had_swarm_state_on_open()) {
-                if (pair.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil)
-                    pair.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
-            }
+        // We ask our peers for the swarm's messages when we have just entered the swarm, and on
+        // the first update after startup if we hold none of them: a fresh, wiped or copied
+        // database looks the same as a wiped one from here.  A restart that finds us in the same
+        // swarm with its messages present asks for nothing, and neither does a peer joining a
+        // swarm we are already in (it asks us).
+        bool request_dump = entered_swarm;
+        if (first_update) {
+            auto [lower, upper] = Network::swarm_boundaries(swarms, events.our_swarm_id);
+            request_dump = !_db.has_owners_in_range(lower, upper);
         }
-
-        did_swarm_space_check = true;
-
-        // If the DB was empty on startup then we mark all swarm members as peers that we need to
-        // request a DB dump from. Note we only do this if the swarm matches the initial swarm we
-        // were in when the DB was queried. We might have changed swarms since startup, in which
-        // case, the above branch will already initiate a DB dump request for us.
-        //
-        // This also covers the case where someone drops the messages table and restarts the SS, we
-        // need to resync all the messages from everyone in the swarm.
-        if (db_was_initially_empty_with_swarm_id == events.our_swarm_id &&
-            !db_was_initially_empty_handled) {
-            db_was_initially_empty_handled = true;
-            for (auto& it : members_) {
-                if (it.second.our_ss_requested_db_dump == SwarmRequestedDBDump::Nil) {
-                    it.second.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
-                }
+        if (request_dump) {
+            log::info(
+                    logswarm,
+                    "Requesting swarm {:x} messages from {} peers",
+                    events.our_swarm_id,
+                    members_.size() - members_.count(our_pk));
+            for (auto& [pk, state] : members_) {
+                if (pk == our_pk)
+                    continue;
+                state.our_ss_requested_db_dump = SwarmRequestedDBDump::NeedsToRequest;
+                // The request goes out with the handshake, so redo that even for a member we had
+                // already handshaken with.
+                state.status = SwarmMemberStatus::ContactDetailsPending;
+                state.check_contact_info_next_retry = {};
             }
         }
     }
@@ -286,23 +265,6 @@ std::set<crypto::legacy_pubkey> Swarm::extract_contact_pending_members() {
             next_retry = now + NEW_SWARM_MEMBER_RETRY;
             const crypto::legacy_pubkey& pk = it->first;
             result.insert(pk);
-        }
-    }
-
-    return result;
-}
-
-std::set<crypto::legacy_pubkey> Swarm::extract_contacts_needing_db_dump() {
-    std::lock_guard lock{network.mut_};
-
-    std::set<crypto::legacy_pubkey> result;
-    for (auto& it : members_) {
-        if (it.second.status == SwarmMemberStatus::Ready) {
-            const crypto::legacy_pubkey& pk = it.first;
-            if (it.second.their_ss_needs_db_dump) {
-                it.second.their_ss_needs_db_dump = false;
-                result.insert(pk);
-            }
         }
     }
 

@@ -50,8 +50,7 @@ struct SwarmEvents {
 };
 
 enum struct SwarmMemberStatus {
-    // Pubkeys of new members into our swarm who we haven't yet established communications with;
-    // once we do, we push all our swarm's messages to them.
+    // A member we have not yet completed an sn.data_ready handshake with.
     ContactDetailsPending,
     Ready,
 };
@@ -60,22 +59,15 @@ enum struct SwarmRequestedDBDump {
     Nil,
     NeedsToRequest,
     RequestUnderway,
-    Done,
 };
 
 struct SwarmMemberState {
     SwarmMemberStatus status;
 
-    // Flags for if our storage server needs to initiate a request to receive a DB dump from this
-    // member. 'Nil' if no action is to be taken, otherwise this flag transition from
-    // 'NeedsToRequest' to 'RequestUnderway' to 'Done' via the outgoing data ready handshake.
+    // Whether we need to ask this member for a dump of the swarm's messages: the request goes out
+    // with the data_ready handshake, moving this from NeedsToRequest to RequestUnderway, and back
+    // to Nil once acknowledged (or to NeedsToRequest to try again if it fails).
     SwarmRequestedDBDump our_ss_requested_db_dump;
-
-    // Set if this swarm member has requested a DB dump from us in the data ready handshake. If set
-    // they are assumed to not have any of the messages for the swarm yet so a full DB dump will be
-    // initiated for messages we own that belong to the swarm when the 'check new members' routine
-    // occurs.
-    bool their_ss_needs_db_dump;
 
     // The earliest timestamp at which the swarm will check if they have received contact
     // information for this member yet and can send them data. Only utilised when status is
@@ -99,23 +91,7 @@ class Swarm {
 
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
-    // Track which swarm we were set to when we determined that the DB was empty. This helps track
-    // which set of peers we should attempt to request a DB dump from since swarms may change during
-    // that asynchronous process. If the swarm does change, the act of joining a new swarm triggers
-    // a DB dump which invalidates the need to request a DB dump from our initial but now,
-    // irrelevant swarm peers, identified by this swarm ID.
-    //
-    // It is important to remember this on startup because if you were active, you may start
-    // receiving messages before the server contacts peers to request a swarm DB dump to synchronise
-    // messages which would seed the database and checking this later would fail.
-    swarm_id_t db_was_initially_empty_with_swarm_id = INVALID_SWARM_ID;
-
-    // Flag that stops the DB initially empty w/ swarm ID from executing more than once.
-    bool db_was_initially_empty_handled = false;
-
     Database& _db;
-
-    bool did_swarm_space_check = false;
 
   public:
     Swarm(Network& network, const crypto::legacy_pubkey& our_pk, Database& db) :
@@ -159,10 +135,6 @@ class Swarm {
     // contacted to establish liveness in prep for transitioning to a contact that we can push swarm
     // messages to.
     std::set<crypto::legacy_pubkey> extract_contact_pending_members();
-
-    // Returns the pubkeys of any new swarm members that have joined that we now have contact
-    // details for, mark them as ready and need a dump of the DB.
-    std::set<crypto::legacy_pubkey> extract_contacts_needing_db_dump();
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <future>
@@ -482,16 +483,14 @@ TEST_CASE("storage - retry requests", "[storage]") {
     CHECK(req_count == 3);
 
     std::this_thread::sleep_for(500ms);
-    // FIXME: "expiry" is currently 4h, this is incredibly arbitrary and should be considered
-    // further.
-    auto the_future = std::chrono::system_clock::now() + 4h;
+    auto the_future = std::chrono::system_clock::now() + Database::RETRY_EXPIRY;
 
     std::this_thread::sleep_for(
             500ms);  // the following insert should *not* be considered "expired"
     CHECK_NOTHROW(storage.add_retry_request(pubkey, "fools", "barred") == 4);
     req_count = storage.retry_request_count();
     CHECK(req_count == 4);
-    // remove expired, pretending it's 4h (minus the sleep) from now
+    // remove expired, pretending it's RETRY_EXPIRY (minus the sleep) from now
     CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
     req_count = storage.retry_request_count();
     CHECK(req_count == 1);
@@ -555,13 +554,241 @@ TEST_CASE("storage - ready retry requests", "[storage]") {
     storage.foreach_ready_retry_request(collect(true));
     CHECK(seen.empty());
 
-    // cmd1 was reported sent, so it waits RETRY_INTERVAL (60s); the other two were not, so they
-    // wait only RETRY_NO_CONTACT_INTERVAL (15s).  Backdating 30s brings back just those two.
-    TestSuiteHacks::db_backdate_retries(storage, 30s);
+    // cmd1 was reported sent, so it waits RETRY_INTERVAL (30s); the other two were not, so they
+    // wait only RETRY_NO_CONTACT_INTERVAL (15s).  Backdating 20s brings back just those two.
+    // (Backdating a full 30s would put cmd1 exactly on the boundary, where whether it counts as
+    // due comes down to sub-millisecond timing.)
+    TestSuiteHacks::db_backdate_retries(storage, 20s);
     seen.clear();
     storage.foreach_ready_retry_request(collect(true));
     REQUIRE(seen.size() == 2);
     CHECK_FALSE(saw("cmd1"));
     CHECK(saw("cmd2"));
     CHECK(saw("cmd3"));
+}
+
+TEST_CASE("storage - removing retry requests", "[storage]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    const auto pk1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto pk2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+
+    // One request, retried to two nodes
+    auto req = storage.add_retry_request(pk1, "cmd", "payload");
+    storage.add_retry_request(pk2, "cmd", "payload", req);
+    REQUIRE(storage.retry_request_count() == 2);
+
+    TestSuiteHacks::db_backdate_retries(storage, 1h);
+    std::vector<int64_t> node_reqs;
+    storage.foreach_ready_retry_request(
+            [&node_reqs](const auto&, const auto&, const auto&, int64_t id) {
+                node_reqs.push_back(id);
+                return true;
+            });
+    REQUIRE(node_reqs.size() == 2);
+
+    storage.remove_node_retry_request(node_reqs[0]);
+    CHECK(storage.retry_request_count() == 1);
+    storage.remove_node_retry_request(node_reqs[1]);
+    CHECK(storage.retry_request_count() == 0);
+
+    // The request itself goes with its last node entry, so it can no longer be added to:
+    CHECK_THROWS(storage.add_retry_request(pk1, "cmd", "payload", req));
+}
+
+TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    const auto now = std::chrono::system_clock::now();
+    const std::string data(100, 'x');
+    for (int i = 1; i <= 3; i++)
+        REQUIRE(storage.store({pk, "h{}"_format(i), namespace_id::Default, now, now + 1h, data}) ==
+                StoreResult::New);
+
+    const auto peer1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto peer2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+    using pks = std::vector<crypto::legacy_pubkey>;
+
+    CHECK(storage.delivery_peers().empty());
+
+    storage.queue_delivery(peer1, "h1");
+    storage.queue_delivery(peer1, "h3");
+    storage.queue_delivery(peer1, "h3");            // already queued: no-op
+    storage.queue_delivery(peer1, "no such hash");  // nothing to deliver: no-op
+    CHECK(storage.delivery_peers() == pks{peer1});
+
+    auto [msgs, ids] = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0].hash == "h1");
+    CHECK(msgs[1].hash == "h3");
+    CHECK(ids == std::vector<int64_t>{1, 3});
+
+    // The byte budget splits batches as for dumps
+    CHECK(storage.next_delivery_batch(peer1, 1).first.size() == 1);
+
+    storage.remove_deliveries(peer1, {1});
+    std::tie(msgs, ids) = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].hash == "h3");
+
+    // Deleting the message takes its pending delivery with it
+    CHECK(storage.delete_by_hash(pk, {"h3"}) == std::vector<std::string>{"h3"});
+    CHECK(storage.next_delivery_batch(peer1, 1 << 20).first.empty());
+    CHECK(storage.delivery_peers().empty());
+
+    // ... as does expiry
+    REQUIRE(storage.store({pk, "h4", namespace_id::Default, now, now - 1s, data}) ==
+            StoreResult::New);
+    storage.queue_delivery(peer1, "h4");
+    storage.queue_delivery(peer2, "h2");
+    CHECK(storage.delivery_peers().size() == 2);
+    storage.clean_expired();
+    CHECK(storage.delivery_peers() == pks{peer2});
+
+    storage.remove_deliveries(peer2);
+    CHECK(storage.delivery_peers().empty());
+}
+
+TEST_CASE("storage - swarm space range queries", "[storage][swarm]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    // Two owners; the trigger on owners fills in their swarm space from the pubkey.  Swarm space
+    // is the XOR of the pubkey's four 8-byte words, so the keys must not be a repeated pattern
+    // (that XORs to 0).
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    REQUIRE(pk2.load("05a1b2c3d4e5f60718293a4b5c6d7e8f900f1e2d3c4b5a69781122334455667788"));
+    const auto s1 = pubkey_to_swarm_space(pk1), s2 = pubkey_to_swarm_space(pk2);
+    REQUIRE(s1 != 0);
+    REQUIRE(s2 != 0);
+    REQUIRE(s1 < s2);
+
+    const auto now = std::chrono::system_clock::now();
+    REQUIRE(storage.store({pk1, "hash1", namespace_id::Default, now, now + 1h, "one"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk2, "hash2", namespace_id::Default, now, now + 1h, "two"}) ==
+            StoreResult::New);
+
+    using set = std::set<std::string>;
+    auto hashes = [&](uint64_t lower, uint64_t upper) {
+        set seen;
+        for (const auto& m :
+             storage.next_dump_batch(1, storage.max_message_id(), lower, upper, 1 << 20).first)
+            seen.insert(m.hash);
+        return seen;
+    };
+    constexpr auto max = std::numeric_limits<uint64_t>::max();
+
+    // lower < upper: the single range query.  (0, max] covers everything but swarm space 0.
+    CHECK(hashes(0, max) == set{"hash1", "hash2"});
+    CHECK(storage.has_owners_in_range(0, max));
+
+    // The lower bound is exclusive and the upper inclusive.
+    CHECK(hashes(s1 - 1, s1) == set{"hash1"});
+    CHECK(hashes(s1, s2 - 1).empty());
+    CHECK_FALSE(storage.has_owners_in_range(s1, s2 - 1));
+    CHECK(hashes(s1, s2) == set{"hash2"});
+    CHECK(storage.has_owners_in_range(s1, s2));
+
+    // lower > upper wraps around: (s2, max] plus [0, s1], which takes in hash1 but not hash2.
+    CHECK(hashes(s2, s1) == set{"hash1"});
+    CHECK(storage.has_owners_in_range(s2, s1));
+
+    // Equal bounds mean the whole space (the single-swarm case).
+    CHECK(hashes(s1, s1) == set{"hash1", "hash2"});
+    CHECK(storage.has_owners_in_range(7, 7));
+}
+
+TEST_CASE("storage - dump batches and cursors", "[storage][swarm]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    const auto now = std::chrono::system_clock::now();
+    const std::string data(100, 'x');
+    for (int i = 1; i <= 5; i++)
+        REQUIRE(storage.store({pk, "h{}"_format(i), namespace_id::Default, now, now + 1h, data}) ==
+                StoreResult::New);
+    CHECK(storage.max_message_id() == 5);
+
+    // Each message counts for a bit over 180 bytes, so a 300 byte budget stops after the message
+    // that takes the batch past it: two per batch.
+    auto [b1, last1] = storage.next_dump_batch(1, 5, 0, 0, 300);
+    REQUIRE(b1.size() == 2);
+    CHECK(b1[0].hash == "h1");
+    CHECK(b1[1].hash == "h2");
+    CHECK(last1 == 2);
+
+    auto [b2, last2] = storage.next_dump_batch(last1 + 1, 5, 0, 0, 300);
+    REQUIRE(b2.size() == 2);
+    CHECK(b2[0].hash == "h3");
+    CHECK(last2 == 4);
+
+    auto [b3, last3] = storage.next_dump_batch(last2 + 1, 5, 0, 0, 300);
+    REQUIRE(b3.size() == 1);
+    CHECK(b3[0].hash == "h5");
+    CHECK(last3 == 5);
+
+    auto [b4, last4] = storage.next_dump_batch(last3 + 1, 5, 0, 0, 300);
+    CHECK(b4.empty());
+    CHECK(last4 == 0);
+
+    // end_id is a snapshot: a message stored after it is not part of the dump.
+    REQUIRE(storage.store({pk, "h6", namespace_id::Default, now, now + 1h, data}) ==
+            StoreResult::New);
+    CHECK(storage.max_message_id() == 6);
+    CHECK(storage.next_dump_batch(6, 5, 0, 0, 300).first.empty());
+    CHECK(storage.next_dump_batch(6, 6, 0, 0, 300).first.size() == 1);
+
+    // Cursor rows
+    const auto peer = crypto::legacy_pubkey::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    CHECK(storage.pending_dumps().empty());
+
+    storage.queue_dump(peer, 123, 5);
+    auto dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].pubkey == peer);
+    CHECK(dumps[0].swarm == 123);
+    CHECK(dumps[0].next_id == 1);
+    CHECK(dumps[0].end_id == 5);
+    CHECK(dumps[0].next_attempt == std::chrono::system_clock::time_point{});
+
+    storage.update_dump(peer, 123, 3, now + 1h);
+    dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].next_id == 3);
+    CHECK(dumps[0].end_id == 5);
+    auto delta = dumps[0].next_attempt - (now + 1h);
+    CHECK(delta > -1s);
+    CHECK(delta < 1s);
+
+    // Queueing again for the same node and swarm restarts from the beginning, keeps the later end,
+    // and makes it due immediately.
+    storage.queue_dump(peer, 123, 4);
+    dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].next_id == 1);
+    CHECK(dumps[0].end_id == 5);
+    CHECK(dumps[0].next_attempt == std::chrono::system_clock::time_point{});
+
+    // A different swarm for the same node is a separate dump.
+    storage.queue_dump(peer, 124, 9);
+    CHECK(storage.pending_dumps().size() == 2);
+
+    storage.remove_dump(peer, 123);
+    dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].swarm == 124);
+    CHECK(dumps[0].end_id == 9);
 }

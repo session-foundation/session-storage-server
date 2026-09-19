@@ -198,20 +198,27 @@ class OMQ : public MQBase {
     std::unordered_set<std::string> stats_access_keys_;
 
     // Connects (and blocks until connected) to oxend.  When this returns an oxend connection
-    // will be available (and oxend_conn_ will be set to the connection id to reach it).
-    void connect_oxend(const oxenmq::address& oxend_rpc);
+    // will be available (and oxend_conn_ will be set to the connection id to reach it).  Throws
+    // snode::startup_aborted if `keep_going` returns false while waiting.
+    void connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going);
 
   public:
     OMQ(const crypto::x25519_keypair& keys,
         const std::vector<crypto::x25519_pubkey>& stats_access_keys_hex);
 
-    // Initialize oxenmq; return a future that completes once we have connected to and
-    // initialized from oxend.
+    // Initialize oxenmq: connects to oxend, loads the initial state from it, then starts the
+    // oxenmq listener.  Blocks until done; `keep_going` is polled while waiting on oxend and a
+    // false return aborts startup with snode::startup_aborted.
     void init(
             snode::ServiceNode* sn,
             rpc::RequestHandler* rh,
             rpc::RateLimiter* rl,
-            oxenmq::address oxend_rpc);
+            oxenmq::address oxend_rpc,
+            const std::function<bool()>& keep_going);
+
+    // Blocks until oxend tells us how old its top block is.  Throws after a few failed attempts,
+    // or snode::startup_aborted when `keep_going` says to stop; either aborts startup.
+    std::chrono::seconds oxend_top_block_age(const std::function<bool()>& keep_going);
 
     /// Dereferencing via * or -> accesses the contained OxenMQ instance.
     oxenmq::OxenMQ& operator*() { return omq_; }
@@ -249,6 +256,15 @@ class OMQ : public MQBase {
     void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;
 
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
+
+    // Always sends: oxenmq is the transport for every node not (yet) reached over QUIC.
+    void sn_request(
+            const snode::contact& ct,
+            std::string_view cmd,
+            std::vector<std::string> parts,
+            sn_reply_callback cb,
+            std::chrono::milliseconds timeout,
+            sn_fallback) override;
 
   private:
     // Fire-and-forget push of `notification` to the OMQ connections in `conns`, using `command`

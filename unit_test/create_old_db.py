@@ -14,22 +14,27 @@ Available schemas:
     messages(id INTEGER PK, hash TEXT UNIQUE, owner→owners, namespace INTEGER,
              timestamp INTEGER, expiry INTEGER, data BLOB)
     revoked_subaccounts(owner→owners, token BLOB, timestamp INTEGER)
+    indices: messages_expiry(expiry), messages_owner(owner, namespace, timestamp),
+             messages_hash(hash) — the latter a duplicate of the UNIQUE(hash) autoindex
 
   post-swarm-space  (current)
     owners: added swarm_space_hi INTEGER, swarm_space_lo INTEGER
             (upper/lower 32-bit halves of pubkey_to_swarm_space(); populated on migration
              via custom SQLite functions func_swarm_space_hi/lo registered by C++ at open time)
             new trigger: swarm_space_trigger auto-populates these on INSERT
-            new indices: owners_swarm_hi, owners_swarm_lo
+            new index: owners_swarm(swarm_space_hi, swarm_space_lo)
+    indices: messages_owner rebuilt as (owner, namespace) — ordered by id within an account's
+             namespace so retrieve pages without sorting; messages_hash dropped
     messages: public outbox namespaces (namespace < 0 AND namespace % 20 = -1, i.e. -1,-21,-41,…)
-              cleared entirely, then UNIQUE INDEX message_outbox_singleton added on
-              (owner, namespace) — enforces singleton behaviour going forward
+              reduced to the newest message per (owner, namespace) (by timestamp, then id), then
+              UNIQUE INDEX message_outbox_singleton added on (owner, namespace) — enforces the
+              singleton behaviour going forward
     new tables: retry_requests(id, command, payload, created)
                 retry_pubkeys(id, pubkey UNIQUE)
                 retry_node_requests(id, rr_id→retry_requests, pk_id→retry_pubkeys,
                                     next_retry, UNIQUE(rr_id,pk_id))
     new view+triggers: retry_node_reqs (insert view), retry_node_add, rr_cleanup
-    new table: state_kv(key TEXT UNIQUE, value TEXT)  — generic persistent key/value store
+    new table: state_kv(key TEXT PRIMARY KEY, value ANY) STRICT  — persistent non-message state
 """
 
 import sqlite3, os, sys, time
@@ -60,6 +65,10 @@ CREATE TABLE revoked_subaccounts (
     token BLOB NOT NULL,
     timestamp INTEGER NOT NULL DEFAULT (CAST((julianday('now') - 2440587.5)*86400000 AS INTEGER))
 );
+
+CREATE INDEX messages_expiry ON messages(expiry);
+CREATE INDEX messages_owner ON messages(owner, namespace, timestamp);
+CREATE INDEX messages_hash ON messages(hash);
 """)
 
     # Pubkeys: 32-byte blobs (type prefix stored separately in the type column).
@@ -76,9 +85,9 @@ CREATE TABLE revoked_subaccounts (
         c.execute("INSERT INTO owners (type, pubkey) VALUES (?, ?)", (t, pk))
         return c.lastrowid
 
-    def ins_msg(owner_id, ns, h, d=b"data"):
+    def ins_msg(owner_id, ns, h, d=b"data", ts=None):
         c.execute("INSERT INTO messages (hash, owner, namespace, timestamp, expiry, data)"
-                  " VALUES (?, ?, ?, ?, ?, ?)", (h, owner_id, ns, now_ms, future_ms, d))
+                  " VALUES (?, ?, ?, ?, ?, ?)", (h, owner_id, ns, ts or now_ms, future_ms, d))
 
     o1 = ins_owner(pk_100)     # swarm_space=100
     o2 = ins_owner(pk_1)       # swarm_space=1
@@ -89,18 +98,20 @@ CREATE TABLE revoked_subaccounts (
     ins_msg(o1, 0,   "o1_ns0")
     ins_msg(o1, 5,   "o1_ns5")
 
-    # o2: one public outbox message (ns=-1) — deleted by migration
+    # o2: one public outbox message (ns=-1) — survives (an outbox may hold one message)
     ins_msg(o2, -1,  "o2_ns-1")
 
-    # o3: multiple public outbox messages + non-outbox negative ns
-    ins_msg(o3, -1,  "o3_ns-1_a")   # deleted (public outbox)
-    ins_msg(o3, -1,  "o3_ns-1_b")   # deleted (public outbox, same ns)
-    ins_msg(o3, -21, "o3_ns-21")    # deleted (also public outbox: -21 % 20 = -1)
+    # o3: an over-full public outbox (older versions could accumulate these via peer pushes), plus
+    # another outbox namespace and a non-outbox negative namespace.  Migration keeps the newest
+    # message per outbox: here _a, which has the later timestamp despite the lower id.
+    ins_msg(o3, -1,  "o3_ns-1_a", ts=now_ms + 1000)  # survives (newest)
+    ins_msg(o3, -1,  "o3_ns-1_b")                    # deleted (older)
+    ins_msg(o3, -21, "o3_ns-21")    # survives (its own outbox: -21 % 20 = -1)
     ins_msg(o3, -2,  "o3_ns-2")     # survives (-2 % 20 = -2, not public outbox)
 
-    # o4: mix of outbox and non-outbox
-    ins_msg(o4, -1,  "o4_ns-1_a")   # deleted
-    ins_msg(o4, -1,  "o4_ns-1_b")   # deleted
+    # o4: an over-full outbox with equal timestamps -- the higher id wins -- and a non-outbox
+    ins_msg(o4, -1,  "o4_ns-1_a")   # deleted (same timestamp, lower id)
+    ins_msg(o4, -1,  "o4_ns-1_b")   # survives
     ins_msg(o4, 10,  "o4_ns10")     # survives
 
 

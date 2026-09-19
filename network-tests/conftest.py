@@ -33,7 +33,8 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line(
-        "markers", "omq: the test itself uses oxenmq features (skipped under other transports)"
+        "markers",
+        "monitor: the test subscribes to message notifications (skipped on transports without them)",
     )
     config.addinivalue_line(
         "markers", "bt: the test sends bt-encoded requests (skipped on json-only transports)"
@@ -43,8 +44,8 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     t = transport.TRANSPORTS[config.getoption("transport")]
     for item in items:
-        if "omq" in item.keywords and t is not transport.OMQ:
-            item.add_marker(pytest.mark.skip(reason="requires --transport=omq"))
+        if "monitor" in item.keywords and not t.monitor:
+            item.add_marker(pytest.mark.skip(reason=f"{t.name} transport has no message monitoring"))
         if "bt" in item.keywords and not t.bt:
             item.add_marker(pytest.mark.skip(reason=f"{t.name} transport carries json only"))
 

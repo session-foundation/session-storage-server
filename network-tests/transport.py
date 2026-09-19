@@ -12,6 +12,10 @@ Every transport delivers replies in that same shape, the shape of oxenmq's `stor
 so that the tests do not care which transport carried them.  `payload` may also be given as a
 list of message parts, which is how the tests historically passed it to oxenmq; a storage RPC
 takes at most one.
+
+Transports with `monitor` set also carry message monitoring: `rpc.monitor(conn, body)` sends a
+subscription request (bt body, bt reply in the same shape as above), and `rpc.on_notify(conn, cb)`
+has `cb(body)` called with each notification the node pushes down that connection.
 """
 
 import json
@@ -73,13 +77,24 @@ class OMQ:
 
     name = 'omq'
     bt = True
+    monitor = True
 
     def __init__(self):
-        from oxenmq import OxenMQ
+        from oxenmq import AuthLevel, OxenMQ
 
         self._omq = OxenMQ()
         self._omq.max_message_size = 10 * 1024 * 1024
+        # Nodes push monitoring notifications to us as commands in a `notify` category, which has
+        # to exist before the instance starts.
+        self._notify_callbacks = {}
+        notify = self._omq.add_category('notify', AuthLevel.none)
+        notify.add_command('message', self._on_notify)
+        notify.add_command('monitor_ended', lambda m: None)
         self._omq.start()
+
+    def _on_notify(self, m):
+        if cb := self._notify_callbacks.get(m.conn):
+            cb(m.data()[0])
 
     def close(self):
         pass
@@ -87,14 +102,24 @@ class OMQ:
     def connect(self, sn):
         from oxenmq import Address
 
+        # Without this every connection from this instance to one node shares our pubkey as its
+        # ZMQ routing id, and the node then treats each new one as taking over the last: replies
+        # to the superseded connection are lost and pushed notifications land on the wrong one.
         return self._omq.connect_remote(
-            Address(sn['ip'], sn['port_omq'], bytes.fromhex(sn['pubkey_x25519']))
+            Address(sn['ip'], sn['port_omq'], bytes.fromhex(sn['pubkey_x25519'])),
+            ephemeral_routing_id=True,
         )
 
     def request(self, conn, method, payload=b'', *, timeout=DEFAULT_TIMEOUT):
         return self._omq.request_future(
             conn, f'storage.{method}', _payload_bytes(payload), request_timeout=timeout
         )
+
+    def monitor(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
+        return self._omq.request_future(conn, 'monitor.messages', body, request_timeout=timeout)
+
+    def on_notify(self, conn, cb):
+        self._notify_callbacks[conn] = cb
 
     def oxend(self, method, params):
         from oxenmq import Address
@@ -112,6 +137,7 @@ class HTTPS:
 
     name = 'https'
     bt = False
+    monitor = False
 
     def __init__(self, workers=16):
         import urllib3
@@ -157,20 +183,45 @@ _QUIC_BT_WRAP = re.compile(rb'^li(\d+)e(.*)e$', re.DOTALL)
 
 def _quic_unwrap(body):
     """Returns (code, body) from a wrapped QUIC reply, or (None, body) for an unwrapped one (a
-    plain-text error, or a raw binary response)."""
+    plain-text error, a raw binary response, or a monitoring reply)."""
     for wrap in (_QUIC_JSON_WRAP, _QUIC_BT_WRAP):
         if m := wrap.match(body):
             return int(m.group(1)), m.group(2)
     return None, body
 
 
+class _QuicReply:
+    """Turns a seshquic request future into the oxenmq reply shape."""
+
+    def __init__(self, fut):
+        self._fut = fut
+
+    def get(self):
+        import seshquic
+
+        try:
+            body = self._fut.result()
+        except seshquic.RequestError as e:
+            # "<code> <reason>\n\n<body>", where <body> may itself be wrapped.
+            header, _, rest = e.body.partition(b'\n\n')
+            code = int(header.split(b' ', 1)[0])
+            inner_code, rest = _quic_unwrap(rest)
+            if inner_code is not None and rest.startswith(b'"'):
+                rest = json.loads(rest).encode()
+            return [str(code).encode(), rest]
+        code, body = _quic_unwrap(body)
+        return [body]
+
+
 class QUIC:
     """Storage RPC over QUIC, via the seshquic bindings for libquic: a bt-request stream on a
     connection with the storage server's client ALPN, where the request name is the RPC method.
-    The server is authenticated by its ed25519 key; the client presents a throwaway one."""
+    The server is authenticated by its ed25519 key; the client presents a throwaway one.
+    Monitoring notifications arrive as commands pushed down the same stream."""
 
     name = 'quic'
     bt = True
+    monitor = True
 
     ALPN = "oxenstorage"
 
@@ -195,26 +246,14 @@ class QUIC:
         return conn.open_bt_stream()
 
     def request(self, conn, method, payload=b'', *, timeout=DEFAULT_TIMEOUT):
-        import seshquic
+        return _QuicReply(conn.request(method, _payload_bytes(payload), timeout=timeout.total_seconds()))
 
-        fut = conn.request(method, _payload_bytes(payload), timeout=timeout.total_seconds())
+    def monitor(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
+        return _QuicReply(conn.request('monitor', body, timeout=timeout.total_seconds()))
 
-        class Reply:
-            def get(self):
-                try:
-                    body = fut.result()
-                except seshquic.RequestError as e:
-                    # "<code> <reason>\n\n<body>", where <body> may itself be wrapped.
-                    header, _, rest = e.body.partition(b'\n\n')
-                    code = int(header.split(b' ', 1)[0])
-                    inner_code, rest = _quic_unwrap(rest)
-                    if inner_code is not None and rest.startswith(b'"'):
-                        rest = json.loads(rest).encode()
-                    return [str(code).encode(), rest]
-                code, body = _quic_unwrap(body)
-                return [body]
-
-        return Reply()
+    def on_notify(self, conn, cb):
+        conn.register_handler('notify', lambda m: cb(m.body))
+        conn.register_handler('monitor_ended', lambda m: None)
 
     oxend = staticmethod(_oxend_http)
 

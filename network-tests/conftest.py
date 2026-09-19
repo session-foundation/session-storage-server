@@ -51,7 +51,9 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="module")
 def rpc(pytestconfig):
-    return transport.TRANSPORTS[pytestconfig.getoption("transport")]()
+    t = transport.TRANSPORTS[pytestconfig.getoption("transport")]()
+    yield t
+    t.close()
 
 
 @pytest.fixture(scope="module")

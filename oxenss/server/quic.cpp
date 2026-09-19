@@ -125,6 +125,7 @@ void QUIC::startup_endpoint() {
         auto handler = [this, ep_idx](quic::message m) { handle_request(std::move(m), ep_idx); };
         ep->listen(
                 tls_creds,
+                quic::opt::idle_timeout{MAX_IDLE_TIMEOUT},
                 // Stream constructor: all incoming streams become BTRequestStreams, allowing
                 // clients to use multiple streams to send higher/lower priority data in parallel by
                 // juggling streams.

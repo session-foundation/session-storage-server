@@ -34,10 +34,18 @@ inline constexpr auto SN_ALPN = "oxenstorage-sn";
 // pick the same loser: the connection initiated by the node with the lower ed25519 key wins.
 inline constexpr auto SN_CONN_REDUNDANT_LINGER = 20s;
 
-// Keep-alive and idle timeout for connections to other storage servers.  The connection is held
-// open indefinitely; the pings keep it from idling out and detect a dead peer.
+// Keep-alive and idle timeouts, after session-router's.  Connections to other storage servers are
+// held open indefinitely, with the connecting side pinging every SN_CONN_KEEP_ALIVE; the idle
+// timeout is two pings plus a little, so a little more than two consecutive pings have to go
+// unanswered before the connection dies.
+//
+// QUIC negotiates the lower of the two sides' idle timeouts, so the listener advertises a longer
+// value than the SN one: a connection between storage servers gets the SN value from the
+// connecting side, while a client gets whatever it asks for, up to MAX_IDLE_TIMEOUT.  What a
+// client asks for, and how it keeps its connection alive, is its business.
 inline constexpr auto SN_CONN_KEEP_ALIVE = 15s;
-inline constexpr auto SN_CONN_IDLE_TIMEOUT = 60s;
+inline constexpr auto SN_CONN_IDLE_TIMEOUT = 33s;
+inline constexpr auto MAX_IDLE_TIMEOUT = 63s;
 
 // On each connection with another storage server we open a fixed set of streams and send each
 // kind of traffic on its own, so that none waits behind another (a QUIC stream delivers in order

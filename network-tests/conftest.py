@@ -45,7 +45,9 @@ def pytest_collection_modifyitems(config, items):
     t = transport.TRANSPORTS[config.getoption("transport")]
     for item in items:
         if "monitor" in item.keywords and not t.monitor:
-            item.add_marker(pytest.mark.skip(reason=f"{t.name} transport has no message monitoring"))
+            item.add_marker(
+                pytest.mark.skip(reason=f"{t.name} transport has no message monitoring")
+            )
         if "bt" in item.keywords and not t.bt:
             item.add_marker(pytest.mark.skip(reason=f"{t.name} transport carries json only"))
 
@@ -80,7 +82,11 @@ def pinned_node(pytestconfig, sns):
     if not want:
         return None
     for sn in sns:
-        if want in (sn['pubkey_ed25519'], f"{sn['ip']}:{sn['port_https']}", f"{sn['ip']}:{sn['port_omq']}"):
+        if want in (
+            sn['pubkey_ed25519'],
+            f"{sn['ip']}:{sn['port_https']}",
+            f"{sn['ip']}:{sn['port_omq']}",
+        ):
             return sn
     pytest.exit(f"--node={want} does not match any active service node")
 

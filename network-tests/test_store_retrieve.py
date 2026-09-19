@@ -89,9 +89,7 @@ def test_store_retrieve_unauthenticated(rpc, random_sn, sk, exclude):
 
     conn2 = rpc.connect(sns[1])
     r = rpc.request(
-        conn2,
-        'retrieve',
-        [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex()}).encode()],
+        conn2, 'retrieve', [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex()}).encode()]
     ).get()
 
     assert r == [b'401', b'retrieve: request signature required']

@@ -56,13 +56,12 @@ QUIC::QUIC(
         // Outbound connections to other storage servers override the ALPN per connection (see
         // sn_connect); the default covers pings to pre-SN_QUIC_VERSION nodes, which only accept
         // the client ALPN.
-        endpoints.push_back(
-                quic::Endpoint::endpoint(
-                        loop,
-                        a,
-                        make_endpoint_static_secret(sk),
-                        quic::opt::inbound_alpns{ALPN, SN_ALPN},
-                        quic::opt::outbound_alpns{ALPN}));
+        endpoints.push_back(quic::Endpoint::endpoint(
+                loop,
+                a,
+                make_endpoint_static_secret(sk),
+                quic::opt::inbound_alpns{ALPN, SN_ALPN},
+                quic::opt::outbound_alpns{ALPN}));
         if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack))) {
             reach_ep = endpoints.back().get();
             reach_ep_idx = endpoints.size() - 1;

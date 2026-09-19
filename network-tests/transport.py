@@ -246,7 +246,9 @@ class QUIC:
         return conn.open_bt_stream()
 
     def request(self, conn, method, payload=b'', *, timeout=DEFAULT_TIMEOUT):
-        return _QuicReply(conn.request(method, _payload_bytes(payload), timeout=timeout.total_seconds()))
+        return _QuicReply(
+            conn.request(method, _payload_bytes(payload), timeout=timeout.total_seconds())
+        )
 
     def monitor(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
         return _QuicReply(conn.request('monitor', body, timeout=timeout.total_seconds()))

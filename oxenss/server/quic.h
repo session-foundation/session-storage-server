@@ -122,7 +122,7 @@ class QUIC : public MQBase {
     // SN_CONN_REDUNDANT_LINGER).
     struct sn_conn {
         bool inbound_wins;
-        std::shared_ptr<quic::Connection> inbound, outbound;
+        std::shared_ptr<quic::Connection> inbound{}, outbound{};
 
         // The connection to use: the winner when we have both, else whichever we have.
         std::shared_ptr<quic::Connection> preferred() const;

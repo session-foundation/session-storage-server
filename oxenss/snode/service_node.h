@@ -188,13 +188,13 @@ class ServiceNode {
     // batches in flight.  Batches are acknowledged individually and possibly out of order, so the
     // persisted cursor advances only across the contiguous prefix of acknowledged batches.
     struct dump_window {
-        int64_t next_id;                 // first id not yet acknowledged; mirrors the database row
-        int64_t end_id;                  // last id the dump covers
-        int64_t sent_next_id;            // first id not yet sent
-        std::map<int64_t, int> batches;  // last id of each sent batch -> parts awaiting an ack
-        int in_flight = 0;               // batches with parts awaiting an ack
-        bool exhausted = false;          // nothing left to send before end_id
-        uint64_t generation;             // tells acks for a discarded window from a restarted one
+        int64_t next_id;       // first id not yet acknowledged; mirrors the database row
+        int64_t end_id;        // last id the dump covers
+        int64_t sent_next_id;  // first id not yet sent
+        std::map<int64_t, int> batches{};  // last id of each sent batch -> parts awaiting an ack
+        int in_flight = 0;                 // batches with parts awaiting an ack
+        bool exhausted = false;            // nothing left to send before end_id
+        uint64_t generation;               // tells acks for a discarded window from a restarted one
         int64_t sent_messages = 0;
     };
     using dump_key = std::pair<crypto::legacy_pubkey, swarm_id_t>;

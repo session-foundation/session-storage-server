@@ -99,7 +99,7 @@ void trim(std::string_view& s);
 /// Parses an integer of some sort from a string, requiring that the entire string be consumed
 /// during parsing.  Return false if parsing failed, sets `value` and returns true if the entire
 /// string was consumed.
-template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+template <std::integral T>
 bool parse_int(const std::string_view str, T& value, int base = 10) {
     T tmp;
     auto* strend = str.data() + str.size();

@@ -1860,7 +1860,7 @@ void RequestHandler::process_onion_req(RelayToServerInfo&& info, OnionRequestMet
         urlstr += ':';
         urlstr += std::to_string(info.port);
     }
-    if (!util::starts_with(info.target, "/"))
+    if (!info.target.starts_with('/'))
         urlstr += '/';
     urlstr += info.target;
 

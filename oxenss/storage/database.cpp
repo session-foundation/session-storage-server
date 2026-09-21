@@ -368,7 +368,7 @@ CREATE TABLE messages (
                 int type;
                 std::array<char, 32> pubkey;
                 std::string old_owner = old_owners.getColumn(0);
-                if (old_owner.size() == 66 && util::starts_with(old_owner, "05") &&
+                if (old_owner.size() == 66 && old_owner.starts_with("05") &&
                     oxenc::is_hex(old_owner)) {
                     type = 5;
                     oxenc::from_hex(old_owner.begin() + 2, old_owner.end(), pubkey.begin());

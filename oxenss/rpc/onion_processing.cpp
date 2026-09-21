@@ -122,8 +122,8 @@ ParsedInfo process_ciphertext_v2(
 }
 
 bool is_onion_url_target_allowed(std::string_view target) {
-    return (util::starts_with(target, "/loki/") || util::starts_with(target, "/oxen/")) &&
-           util::ends_with(target, "/lsrpc") && target.find('?') == std::string::npos;
+    return (target.starts_with("/loki/") || target.starts_with("/oxen/")) &&
+           target.ends_with("/lsrpc") && target.find('?') == std::string::npos;
 }
 
 /// We are expecting a payload of the following shape:

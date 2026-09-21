@@ -85,7 +85,7 @@ std::vector<std::string> remaining(TestMQ& mq) {
         seen.push_back(pk.prefixed_raw());
         return true;
     });
-    std::sort(seen.begin(), seen.end());
+    std::ranges::sort(seen);
     return seen;
 }
 
@@ -127,8 +127,8 @@ TEST_CASE("monitor - foreign subscriptions are extracted and removed", "[monitor
 
     auto& conns = dropped[0].second;
     REQUIRE(conns.size() == 2);
-    CHECK(std::count(conns.begin(), conns.end(), conn_a) == 1);
-    CHECK(std::count(conns.begin(), conns.end(), conn_b) == 1);
+    CHECK(std::ranges::count(conns, conn_a) == 1);
+    CHECK(std::ranges::count(conns, conn_b) == 1);
 
     // The subscriptions for accounts we still hold must survive, including the one on a connection
     // that also had a dropped subscription.

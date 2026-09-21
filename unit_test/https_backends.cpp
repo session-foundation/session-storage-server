@@ -313,7 +313,7 @@ TEST_CASE("https backend benchmark", "[.][https-bench]") {
                 t.join();
             auto elapsed = duration<double>(clock::now() - start).count();
 
-            std::sort(latencies.begin(), latencies.end());
+            std::ranges::sort(latencies);
             auto pct = [&](double p) {
                 return latencies[std::min(latencies.size() - 1, size_t(p * latencies.size()))];
             };

@@ -131,7 +131,7 @@ RenderedResponse HTTPS::render(const rpc::Response& res) const {
 
     const auto* json = std::get_if<nlohmann::json>(&res.body);
     const auto* binary = std::get_if<std::span<const std::byte>>(&res.body);
-    if (std::none_of(begin(res.headers), end(res.headers), [](const auto& h) {
+    if (std::ranges::none_of(res.headers, [](const auto& h) {
             return util::string_iequal(h.first, "content-type");
         }))
         out.headers.emplace_back(

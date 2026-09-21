@@ -173,8 +173,7 @@ parse_result parse_cli_args(int argc, char* argv[]) {
         https_backends.emplace_back(server::to_string(b));
     // The compiled-in default is the preferred backend, but a build can leave it out; fall back to
     // whatever is available rather than shipping a binary that refuses to start without a flag.
-    if (std::find(https_backends.begin(), https_backends.end(), options.https_backend) ==
-        https_backends.end())
+    if (std::ranges::find(https_backends, options.https_backend) == https_backends.end())
         options.https_backend = https_backends.front();
     cli.add_option(
                "--https-backend",

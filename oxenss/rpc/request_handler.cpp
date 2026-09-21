@@ -873,9 +873,8 @@ namespace {
             bool b64,
             SigArgs&&... signature_args) {
 
-        std::sort(affected.begin(), affected.end(), [](const auto& a, const auto& b) {
-            return a.second < b.second;
-        });
+        std::ranges::sort(
+                affected, [](const auto& a, const auto& b) { return a.second < b.second; });
         std::vector<std::string_view> sorted_hashes;
         sorted_hashes.reserve(affected.size());
         for (const auto& [ns, hash] : affected)
@@ -899,7 +898,7 @@ namespace {
             bool b64,
             SigArgs&&... signature_args) {
 
-        std::sort(affected.begin(), affected.end());
+        std::ranges::sort(affected);
         auto sig = create_signature(std::forward<SigArgs>(signature_args)..., affected);
         mine["signature"] = b64 ? oxenc::to_base64(sig.begin(), sig.end()) : util::view_guts(sig);
         mine[mine_key] = std::move(affected);
@@ -1025,7 +1024,7 @@ void RequestHandler::process_client_req(rpc::delete_msgs&& req, std::function<vo
                        : res->result;
 
     auto deleted = service_node_.db->delete_by_hash(req.pubkey, req.messages);
-    std::sort(deleted.begin(), deleted.end());
+    std::ranges::sort(deleted);
     auto sig = create_signature(ed25519_sk_, req.pubkey.prefixed_hex(), req.messages, deleted);
     mine["deleted"] = std::move(deleted);
     mine["signature"] = req.b64 ? oxenc::to_base64(sig.begin(), sig.end()) : util::view_guts(sig);
@@ -1414,9 +1413,7 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
             extend_only,
             /*shorten_only=*/req.shorten);
 
-    std::sort(updated.begin(), updated.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first;
-    });
+    std::ranges::sort(updated, [](const auto& a, const auto& b) { return a.first < b.first; });
 
     std::map<std::string, int64_t> unchanged;
     if (req.extend || req.shorten) {

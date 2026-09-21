@@ -291,17 +291,15 @@ void QUIC::close_redundant_sn_conns() {
     // Collect first: closing re-enters on_conn_closed, which touches the maps being walked.
     std::vector<std::shared_ptr<quic::Connection>> losers;
     auto now = std::chrono::steady_clock::now();
-    for (auto it = sn_bidir_.begin(); it != sn_bidir_.end();) {
-        auto& [pk, since] = *it;
-        if (now < since + SN_CONN_REDUNDANT_LINGER) {
-            ++it;
-            continue;
-        }
+    std::erase_if(sn_bidir_, [&](const auto& e) {
+        const auto& [pk, since] = e;
+        if (now < since + SN_CONN_REDUNDANT_LINGER)
+            return false;
         if (auto cit = sn_conns_.find(pk); cit != sn_conns_.end())
             if (auto loser = cit->second.take(!cit->second.inbound_wins))
                 losers.push_back(std::move(loser));
-        it = sn_bidir_.erase(it);
-    }
+        return true;
+    });
     // The slots are already empty, so on_conn_closed ignores these.
     for (auto& c : losers)
         c->close_connection(CONN_CLOSE_REDUNDANT);
@@ -310,16 +308,19 @@ void QUIC::close_redundant_sn_conns() {
 void QUIC::sweep_sn_connections() {
     loop.call([this] {
         std::vector<std::shared_ptr<quic::Connection>> gone;
+        // Not erase_if: the connections are taken out of the element as it goes, and libstdc++
+        // 12 (Debian bookworm) hands erase_if's predicate a const element.
         for (auto it = sn_conns_.begin(); it != sn_conns_.end();) {
-            if (service_node_->contacts().find(it->first)) {
+            auto& [pk, sc] = *it;
+            if (service_node_->contacts().find(pk)) {
                 ++it;
                 continue;
             }
-            log::info(logcat, "Closing connection with {}: no longer a service node", it->first);
+            log::info(logcat, "Closing connection with {}: no longer a service node", pk);
             for (bool inbound : {true, false})
-                if (auto c = it->second.take(inbound))
+                if (auto c = sc.take(inbound))
                     gone.push_back(std::move(c));
-            sn_bidir_.erase(it->first);
+            sn_bidir_.erase(pk);
             it = sn_conns_.erase(it);
         }
         for (auto& c : gone)

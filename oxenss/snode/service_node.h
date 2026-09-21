@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -160,7 +161,7 @@ class ServiceNode {
 
     // Save multiple messages to the database at once (i.e. in a single transaction).  Returns
     // false if they could not be saved.
-    bool save_bulk(const std::vector<message>& msgs);
+    bool save_bulk(std::span<const message> msgs);
 
     void process_snodes_update(std::string_view data);
 
@@ -220,8 +221,7 @@ class ServiceNode {
     // These require dumps_mutex_ to be held.
     void check_deliveries_locked();
     void send_deliveries(const crypto::legacy_pubkey& pk);
-    void on_delivery_reply(
-            const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok);
+    void on_delivery_reply(const crypto::legacy_pubkey& pk, std::span<const int64_t> ids, bool ok);
 
     // Conducts any ping peer tests that are due; (this is designed to be called frequently and
     // does nothing if there are no tests currently due).

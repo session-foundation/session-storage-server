@@ -15,7 +15,7 @@
 #include <chrono>
 #include <string>
 #include <string_view>
-#include <type_traits>
+#include <concepts>
 #include <variant>
 
 #include <nlohmann/json_fwd.hpp>
@@ -113,7 +113,7 @@ namespace detail {
     // into the written buffer space.  For strings/string_views the string_view is returned
     // directly from the argument. system_clock::time_points are converted into integral
     // milliseconds since epoch then treated as an integer value.
-    template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+    template <std::integral T>
     std::string_view to_hashable(const T& val, char*& buffer) {
         auto [p, ec] = std::to_chars(buffer, buffer + 20, val);
         std::string_view s(buffer, p - buffer);
@@ -124,7 +124,7 @@ namespace detail {
             const std::chrono::system_clock::time_point& val, char*& buffer) {
         return to_hashable(to_epoch_ms(val), buffer);
     }
-    template <typename T, std::enable_if_t<std::is_convertible_v<T, std::string_view>, int> = 0>
+    template <std::convertible_to<std::string_view> T>
     std::string_view to_hashable(const T& value, char*&) {
         return value;
     }

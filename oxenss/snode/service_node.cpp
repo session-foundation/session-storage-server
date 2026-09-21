@@ -617,7 +617,7 @@ bool ServiceNode::process_store(
     return result != StoreResult::Full;
 }
 
-bool ServiceNode::save_bulk(const std::vector<message>& msgs) {
+bool ServiceNode::save_bulk(std::span<const message> msgs) {
     try {
         db->bulk_store(msgs);
     } catch (const std::exception& e) {
@@ -877,7 +877,7 @@ void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
     if (msgs.empty())
         return;
 
-    auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+    auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
     log::debug(logcat, "Delivering {} messages whose store forward failed to {}", msgs.size(), pk);
     deliveries_in_flight_[pk] = {static_cast<int>(parts.size()), false};
     for (auto& part : parts)
@@ -893,7 +893,7 @@ void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
 }
 
 void ServiceNode::on_delivery_reply(
-        const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok) {
+        const crypto::legacy_pubkey& pk, std::span<const int64_t> ids, bool ok) {
     std::lock_guard lock{dumps_mutex_};
     auto it = deliveries_in_flight_.find(pk);
     if (it == deliveries_in_flight_.end())
@@ -1000,7 +1000,7 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
             return;
         }
 
-        auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+        auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
         w.batches[last_id] = parts.size();
         w.in_flight++;
         w.sent_next_id = last_id + 1;
@@ -1371,7 +1371,7 @@ void ServiceNode::report_reachability(
 void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) {
     std::lock_guard guard(sn_mutex_);
 
-    std::set<swarm_id_t> targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
+    auto targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
     if (swarms.empty())
         log::info(logcat, "Bootstrapping all swarms");
     else if (logcat->level() <= log::Level::info)

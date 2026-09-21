@@ -23,6 +23,10 @@ namespace quic = oxen::quic;
 
 using Address = quic::Address;
 
+// ALPN for connections from clients, allowing access to client commands (store, retrieve, expire,
+// etc.).
+static constexpr auto ALPN = "oxenstorage";
+
 // ALPN for connections between storage servers (SN_QUIC_VERSION and later).  Node-to-node commands
 // are accepted only on connections negotiated with it, and the listener requires and verifies the
 // peer's ed25519 key on them.  The plain client ALPN carries neither requirement.

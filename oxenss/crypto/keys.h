@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -18,9 +19,9 @@ namespace detail {
     template <size_t Length>
     inline constexpr std::array<unsigned char, Length> null_bytes = {0};
 
-    void load_from_hex(void* buffer, size_t length, std::string_view hex);
-    void load_from_bytes(void* buffer, size_t length, std::string_view bytes);
-    std::string to_hex(const unsigned char* buffer, size_t length);
+    void load_from_hex(std::span<unsigned char> out, std::string_view hex);
+    void load_from_bytes(std::span<unsigned char> out, std::string_view bytes);
+    std::string to_hex(std::span<const unsigned char> bytes);
 
 }  // namespace detail
 
@@ -30,7 +31,7 @@ struct alignas(size_t) key_base : std::array<unsigned char, KeyLength> {
         return {reinterpret_cast<const char*>(this->data()), KeyLength};
     }
     std::string str() const { return {reinterpret_cast<const char*>(this->data()), KeyLength}; }
-    std::string hex() const { return detail::to_hex(this->data(), KeyLength); }
+    std::string hex() const { return detail::to_hex(*this); }
     explicit operator bool() const { return *this != detail::null_bytes<KeyLength>; }
 
     // Loads the key from a hex string; throws if the hex is the wrong size or not hex.
@@ -39,18 +40,14 @@ struct alignas(size_t) key_base : std::array<unsigned char, KeyLength> {
         d.load_from_hex(hex);
         return d;
     }
-    void load_from_hex(std::string_view hex) {
-        detail::load_from_hex(this->data(), this->size(), hex);
-    }
+    void load_from_hex(std::string_view hex) { detail::load_from_hex(*this, hex); }
     // Loads the key from a byte string; throws if the wrong size.
     [[nodiscard]] static Derived from_bytes(std::string_view bytes) {
         Derived d;
         d.load_from_bytes(bytes);
         return d;
     }
-    void load_from_bytes(std::string_view bytes) {
-        detail::load_from_bytes(this->data(), this->size(), bytes);
-    }
+    void load_from_bytes(std::string_view bytes) { detail::load_from_bytes(*this, bytes); }
 };
 
 template <typename Derived, size_t KeyLength>

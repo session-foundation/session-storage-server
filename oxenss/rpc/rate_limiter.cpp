@@ -92,6 +92,8 @@ bool RateLimiter::should_rate_limit_client(
 }
 
 void RateLimiter::clean_buckets(steady_clock::time_point now) {
+    // Not erase_if: the predicate refills the bucket, and libstdc++ 12 (Debian bookworm) hands
+    // erase_if's predicate a const element.
     for (auto it = client_buckets_.begin(); it != client_buckets_.end();) {
         if (fill_bucket(it->second, now))
             it = client_buckets_.erase(it);

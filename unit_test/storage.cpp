@@ -1,3 +1,4 @@
+#include <array>
 #include <limits>
 #include <oxenss/storage/database.hpp>
 
@@ -187,7 +188,7 @@ TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     auto now = std::chrono::system_clock::now();
     const size_t num_entries = 100;
     for (size_t i = 0; i < num_entries; i++) {
-        const auto hash = "hash" + std::to_string(i);
+        const auto hash = "hash{}"_format(i);
         storage.store({pubkey, hash, namespace_id::Default, now, now + 100s, "bytesasstring"});
     }
 
@@ -202,10 +203,10 @@ TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     }
 
     {
-        const auto lastHash = std::string("hash") + std::to_string(num_entries / 2 - 1);
+        const auto lastHash = "hash{}"_format(num_entries / 2 - 1);
         auto [items, more] = storage.retrieve(pubkey, namespace_id::Default, lastHash);
         REQUIRE(items.size() == num_entries / 2);
-        CHECK(items[0].hash == "hash" + std::to_string(num_entries / 2));
+        CHECK(items[0].hash == "hash{}"_format(num_entries / 2));
     }
 }
 
@@ -275,7 +276,7 @@ TEST_CASE("storage - bulk data storage", "[storage]") {
         for (size_t i = 0; i < num_items; ++i) {
             items.emplace_back(
                     pubkey,
-                    std::to_string(i),
+                    fmt::to_string(i),
                     namespace_id::Default,
                     timestamp,
                     timestamp + ttl,
@@ -323,7 +324,7 @@ TEST_CASE("storage - bulk storage with overlap", "[storage]") {
         for (size_t i = 0; i < num_items; ++i) {
             items.emplace_back(
                     pubkey,
-                    std::to_string(i),
+                    fmt::to_string(i),
                     namespace_id::Default,
                     timestamp,
                     timestamp + ttl,
@@ -354,7 +355,7 @@ TEST_CASE("storage - retrieve limit", "[storage]") {
     auto now = std::chrono::system_clock::now();
     const size_t num_entries = 100;
     for (size_t i = 0; i < num_entries; i++) {
-        const auto hash = "hash" + std::to_string(i);
+        const auto hash = "hash{}"_format(i);
         storage.store({pubkey, hash, namespace_id::Default, now, now + 100s, "bytesasstring"});
     }
 
@@ -362,7 +363,7 @@ TEST_CASE("storage - retrieve limit", "[storage]") {
     REQUIRE(pubkey2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
 
     for (size_t i = 0; i < 5; i++) {
-        const auto hash = "anotherhash" + std::to_string(i);
+        const auto hash = "anotherhash{}"_format(i);
         storage.store({pubkey2, hash, namespace_id::Default, now, now + 100s, "bytesasstring"});
     }
 
@@ -634,13 +635,14 @@ TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
     // The byte budget splits batches as for dumps
     CHECK(storage.next_delivery_batch(peer1, 1).first.size() == 1);
 
-    storage.remove_deliveries(peer1, {1});
+    storage.remove_deliveries(peer1, std::array<int64_t, 1>{1});
     std::tie(msgs, ids) = storage.next_delivery_batch(peer1, 1 << 20);
     REQUIRE(msgs.size() == 1);
     CHECK(msgs[0].hash == "h3");
 
     // Deleting the message takes its pending delivery with it
-    CHECK(storage.delete_by_hash(pk, {"h3"}) == std::vector<std::string>{"h3"});
+    CHECK(storage.delete_by_hash(pk, std::array<std::string, 1>{"h3"}) ==
+          std::vector<std::string>{"h3"});
     CHECK(storage.next_delivery_batch(peer1, 1 << 20).first.empty());
     CHECK(storage.delivery_peers().empty());
 

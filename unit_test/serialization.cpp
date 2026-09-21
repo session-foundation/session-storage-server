@@ -20,7 +20,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
     const auto expiry = timestamp + 3456s;
     std::vector<oxenss::message> msgs;
     msgs.emplace_back(pub_key, hash, oxenss::namespace_id::UserProfile, timestamp, expiry, data);
-    auto serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
+    auto serialized = serialize_messages(msgs, 1);
     REQUIRE(serialized.size() == 1);
     const auto expected_serialized =
             "l"
@@ -35,7 +35,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
     CHECK(serialized.front() == "\x01l"s + expected_serialized + "e");
 
     msgs.push_back(msgs.front());
-    const std::vector<std::string> batches = serialize_messages(msgs.begin(), msgs.end(), 1);
+    const auto batches = serialize_messages(msgs, 1);
     CHECK(batches.size() == 1);
     REQUIRE(batches[0] == "\x01l"s + expected_serialized + expected_serialized + "e");
 
@@ -61,15 +61,15 @@ TEST_CASE("v1 serialization - batch serialization", "[serialization]") {
     std::vector<oxenss::message> msgs;
     msgs.emplace_back(
             pub_key, hash, oxenss::namespace_id::GroupInfo, timestamp, timestamp + ttl, data);
-    auto serialized = serialize_messages(msgs.begin(), msgs.end(), 1);
+    auto serialized = serialize_messages(msgs, 1);
     REQUIRE(serialized.size() == 1);
     auto first = serialized.front();
     const size_t num_messages = (SERIALIZATION_BATCH_SIZE / (serialized.front().size() - 2)) + 1;
     msgs = {num_messages, msgs.front()};
-    serialized = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+    serialized = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
     CHECK(serialized.size() == 1);
     msgs.push_back(msgs.front());
-    serialized = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+    serialized = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
     CHECK(serialized.size() == 2);
 }
 
@@ -88,13 +88,12 @@ TEST_CASE("v1 serialization - message payload 100MiB", "[serialization]") {
     std::vector<oxenss::message> msg_list(100, base_msg);  // 100 MiB total
 
     auto begin = std::chrono::high_resolution_clock::now();
-    auto serialized =
-            serialize_messages(msg_list.begin(), msg_list.end(), SERIALIZATION_VERSION_BT);
+    auto serialized = serialize_messages(msg_list, SERIALIZATION_VERSION_BT);
     auto elapsed = std::chrono::high_resolution_clock::now() - begin;
 
     size_t total_bytes = msg_list.size() * base_msg.data.size();
     std::string total_bytes_str = oxenss::util::get_human_readable_bytes(total_bytes);
-    double total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
+    auto total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
     double gbs_per_s =
             total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 

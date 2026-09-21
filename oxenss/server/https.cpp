@@ -7,6 +7,7 @@
 #include <oxenss/snode/service_node.h>
 #include <oxenss/utils/string_utils.hpp>
 
+#include <array>
 #include <chrono>
 #include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
@@ -31,7 +32,7 @@ static auto logcat = log::Cat("server");
 using nlohmann::json;
 
 namespace {
-    const std::vector<HttpsBackend> backends{
+    constexpr std::array backends{
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
             HttpsBackend::uwebsockets,
 #endif
@@ -131,7 +132,7 @@ RenderedResponse HTTPS::render(const rpc::Response& res) const {
 
     const auto* json = std::get_if<nlohmann::json>(&res.body);
     const auto* binary = std::get_if<std::span<const std::byte>>(&res.body);
-    if (std::none_of(begin(res.headers), end(res.headers), [](const auto& h) {
+    if (std::ranges::none_of(res.headers, [](const auto& h) {
             return util::string_iequal(h.first, "content-type");
         }))
         out.headers.emplace_back(
@@ -169,7 +170,7 @@ void HTTPS::handle_cors(HttpsRequest& req) {
         req.headers.emplace("Access-Control-Allow-Origin", "*");
     else if (!cors_.empty()) {
         if (auto it = req.headers.find("origin");
-            it != req.headers.end() && cors_.count(it->second)) {
+            it != req.headers.end() && cors_.contains(it->second)) {
             req.headers.emplace("Access-Control-Allow-Origin", "*");
             req.headers.emplace("Vary", "Origin");
         }

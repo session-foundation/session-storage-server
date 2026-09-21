@@ -19,7 +19,7 @@
 #include <oxenc/base64.h>
 #include <sodium.h>
 
-#include <fmt/format.h>
+#include <oxenss/common/format.h>
 
 #include <algorithm>
 #include <chrono>
@@ -39,7 +39,7 @@ struct temp_dir {
     std::filesystem::path path;
     temp_dir() :
             path{std::filesystem::temp_directory_path() /
-                 ("oxenss-https-test-" + std::to_string(std::random_device{}()))} {
+                 "oxenss-https-test-{}"_format(std::random_device{}())} {
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
     }
@@ -108,7 +108,7 @@ struct test_node {
     ~test_node() { https->shutdown(true); }
 
     std::string url(std::string_view path) const {
-        return "https://127.0.0.1:" + std::to_string(port) + std::string{path};
+        return "https://127.0.0.1:{}{}"_format(port, path);
     }
 };
 
@@ -313,7 +313,7 @@ TEST_CASE("https backend benchmark", "[.][https-bench]") {
                 t.join();
             auto elapsed = duration<double>(clock::now() - start).count();
 
-            std::sort(latencies.begin(), latencies.end());
+            std::ranges::sort(latencies);
             auto pct = [&](double p) {
                 return latencies[std::min(latencies.size() - 1, size_t(p * latencies.size()))];
             };

@@ -105,15 +105,16 @@ void OMQ::handle_onion_request(
         log::trace(logcat, "on response: {}...", debug_string(res).substr(0, 100));
 #endif
 
+        auto status = fmt::to_string(res.status.first);
         if (auto* js = std::get_if<nlohmann::json>(&res.body))
-            send.reply(std::to_string(res.status.first), js->dump());
+            send.reply(status, js->dump());
         else if (auto* binary = std::get_if<std::span<const std::byte>>(&res.body))
             send.reply(
-                    std::to_string(res.status.first),
+                    status,
                     std::string_view{
                             reinterpret_cast<const char*>(binary->data()), binary->size()});
         else
-            send.reply(std::to_string(res.status.first), view_body(res));
+            send.reply(status, view_body(res));
     };
 
     if (data.hop_no > rpc::MAX_ONION_HOPS)
@@ -126,13 +127,13 @@ void OMQ::handle_onion_request(oxenmq::Message& message) {
     std::pair<std::string_view, rpc::OnionRequestMetadata> data;
     try {
         if (message.data.size() != 1)
-            throw std::runtime_error{"expected 1 part, got " + std::to_string(message.data.size())};
+            throw std::runtime_error{"expected 1 part, got {}"_format(message.data.size())};
 
         data = decode_onion_data(message.data[0]);
     } catch (const std::exception& e) {
         auto msg = "Invalid internal onion request: "s + e.what();
         log::error(logcat, "{}", msg);
-        message.send_reply(std::to_string(http::BAD_REQUEST.first), msg);
+        message.send_reply(fmt::to_string(http::BAD_REQUEST.first), msg);
         return;
     }
 
@@ -161,7 +162,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
                 method,
                 message.data.size());
         message.send_reply(
-                std::to_string(http::BAD_REQUEST.first),
+                fmt::to_string(http::BAD_REQUEST.first),
                 fmt::format(
                         "Invalid request: expected {} message parts, received {}",
                         full_size,
@@ -181,12 +182,9 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
         } catch (const std::exception& e) {
             log::warning(logcat, "Rejecting non-ipv4 OMQ RPC request from {}", message.remote);
             message.send_reply(
-                    std::to_string(http::BAD_REQUEST.first),
-                    fmt::format(
-                            "Invalid request: non-forwarded OMQ client RPC requests are only "
-                            "permitted via IPv4",
-                            full_size,
-                            message.data.size()));
+                    fmt::to_string(http::BAD_REQUEST.first),
+                    "Invalid request: non-forwarded OMQ client RPC requests are only permitted "
+                    "via IPv4");
             return;
         }
     }
@@ -199,7 +197,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
                 if (status == http::OK)
                     send.reply(body);
                 else
-                    send.reply(std::to_string(status.first), body);
+                    send.reply(fmt::to_string(status.first), body);
             },
             forwarded);
 
@@ -209,7 +207,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
 
 OMQ::OMQ(
         const crypto::x25519_keypair& keys,
-        const std::vector<crypto::x25519_pubkey>& stats_access_keys) :
+        std::span<const crypto::x25519_pubkey> stats_access_keys) :
         omq_{std::string{keys.pub.view()},
              std::string{keys.sec.view()},
              /*service_node=*/true,
@@ -405,8 +403,8 @@ void OMQ::init(
     omq_.listen_curve(
             fmt::format("tcp://0.0.0.0:{}", port),
             [this](std::string_view /*addr*/, std::string_view pk, bool /*sn*/) {
-                return stats_access_keys_.count(std::string{pk}) ? oxenmq::AuthLevel::admin
-                                                                 : oxenmq::AuthLevel::none;
+                return stats_access_keys_.contains(std::string{pk}) ? oxenmq::AuthLevel::admin
+                                                                    : oxenmq::AuthLevel::none;
             },
             [prom = std::move(omq_prom)](bool listen_success) {
                 if (listen_success)

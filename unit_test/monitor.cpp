@@ -1,6 +1,7 @@
 #include <catch2/catch.hpp>
 
 #include <oxenmq/oxenmq.h>
+#include <oxenss/common/format.h>
 #include <oxenss/common/message.h>
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
@@ -85,13 +86,13 @@ std::vector<std::string> remaining(TestMQ& mq) {
         seen.push_back(pk.prefixed_raw());
         return true;
     });
-    std::sort(seen.begin(), seen.end());
+    std::ranges::sort(seen);
     return seen;
 }
 
 contact dummy_contact(unsigned char fill, uint16_t https_port, uint16_t omq_port) {
     contact c{};
-    c.ip = oxen::quic::ipv4{"10.0.0." + std::to_string(fill)};
+    c.ip = oxen::quic::ipv4{"10.0.0.{}"_format(fill)};
     c.https_port = https_port;
     c.omq_quic_port = omq_port;
     c.version = {2, 9, 0};
@@ -127,8 +128,8 @@ TEST_CASE("monitor - foreign subscriptions are extracted and removed", "[monitor
 
     auto& conns = dropped[0].second;
     REQUIRE(conns.size() == 2);
-    CHECK(std::count(conns.begin(), conns.end(), conn_a) == 1);
-    CHECK(std::count(conns.begin(), conns.end(), conn_b) == 1);
+    CHECK(std::ranges::count(conns, conn_a) == 1);
+    CHECK(std::ranges::count(conns, conn_b) == 1);
 
     // The subscriptions for accounts we still hold must survive, including the one on a connection
     // that also had a dropped subscription.

@@ -152,12 +152,9 @@ SwarmEvents Swarm::update_swarms(
         for (auto swarm : events.new_swarms)
             log::info(logswarm, "New network swarm: {}", swarm);
 
-        for (auto it = members_.begin(); it != members_.end();) {
-            if (events.our_swarm_members.find(it->first) == events.our_swarm_members.end())
-                it = members_.erase(it);
-            else
-                it++;
-        }
+        std::erase_if(members_, [&](const auto& m) {
+            return !events.our_swarm_members.contains(m.first);
+        });
         for (const auto& pk : events.new_swarm_members)
             members_[pk];
 

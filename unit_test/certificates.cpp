@@ -1,5 +1,6 @@
 #include <catch2/catch.hpp>
 
+#include <oxenss/common/format.h>
 #include <oxenss/server/server_certificates.h>
 
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
@@ -23,7 +24,7 @@ struct temp_dir {
     std::filesystem::path path;
     temp_dir() :
             path{std::filesystem::temp_directory_path() /
-                 ("oxenss-cert-test-" + std::to_string(std::random_device{}()))} {
+                 "oxenss-cert-test-{}"_format(std::random_device{}())} {
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
     }

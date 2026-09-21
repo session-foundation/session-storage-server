@@ -162,17 +162,6 @@ std::string friendly_duration(std::chrono::nanoseconds dur);
 /// Converts a duration into a shorter, single-unit fractional display such as `42.3min`
 std::string short_duration(std::chrono::duration<double> dur);
 
-/// Given an array of string arguments, look for strings of the format <prefix><value> and
-/// return <value> Returns empty string view if not found.
-template <typename It>
-std::string_view find_prefixed_value(It begin, It end, std::string_view prefix) {
-    auto it = std::find_if(
-            begin, end, [&](const auto& s) { return std::string_view{s}.starts_with(prefix); });
-    if (it == end)
-        return {};
-    return std::string_view{*it}.substr(prefix.size());
-}
-
 // Returns an SI-prefixed string representing a number of bytes with 3 significant digits, such as
 // "123 MB" or "3.24 GB".
 std::string get_human_readable_bytes(uint64_t bytes);

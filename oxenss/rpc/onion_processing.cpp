@@ -162,20 +162,6 @@ CiphertextPlusJson parse_combined_payload(std::string_view payload) {
     return result;
 }
 
-bool operator==(const FinalDestinationInfo& lhs, const FinalDestinationInfo& rhs) {
-    return lhs.body == rhs.body;
-}
-
-bool operator==(const RelayToServerInfo& lhs, const RelayToServerInfo& rhs) {
-    return (lhs.protocol == rhs.protocol) && (lhs.host == rhs.host) && (lhs.port == rhs.port) &&
-           (lhs.target == rhs.target) && (lhs.payload == rhs.payload);
-}
-
-bool operator==(const RelayToNodeInfo& a, const RelayToNodeInfo& b) {
-    return std::tie(a.ciphertext, a.ephemeral_key, a.enc_type, a.next_node) ==
-           std::tie(b.ciphertext, b.ephemeral_key, b.enc_type, b.next_node);
-}
-
 crypto::x25519_pubkey extract_x25519_from_hex(std::string_view hex) {
     try {
         return crypto::x25519_pubkey::from_hex(hex);

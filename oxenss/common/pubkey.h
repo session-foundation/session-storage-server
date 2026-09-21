@@ -26,9 +26,7 @@ class user_pubkey {
     // bool conversion: returns true if this object contains a valid pubkey
     explicit operator bool() const { return !pubkey_.empty(); }
 
-    bool operator==(const user_pubkey& other) const {
-        return type() == other.type() && raw() == other.raw();
-    }
+    bool operator==(const user_pubkey& other) const = default;
 
     // Replaces the stored pubkey with one parsed from the string `pk`.  `pk` can be either raw
     // bytes (33 bytes of netid + pubkey), or hex (66 hex digits).  If `pk` is not a valid

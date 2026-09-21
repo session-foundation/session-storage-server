@@ -3,6 +3,7 @@
 #include "../crypto/keys.h"
 
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -204,7 +205,7 @@ class OMQ : public MQBase {
 
   public:
     OMQ(const crypto::x25519_keypair& keys,
-        const std::vector<crypto::x25519_pubkey>& stats_access_keys_hex);
+        std::span<const crypto::x25519_pubkey> stats_access_keys);
 
     // Initialize oxenmq: connects to oxend, loads the initial state from it, then starts the
     // oxenmq listener.  Blocks until done; `keep_going` is polled while waiting on oxend and a

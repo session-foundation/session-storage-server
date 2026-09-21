@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include "oxenss/crypto/keys.h"
@@ -92,7 +93,7 @@ class Database {
     // expiry (existing, if longer; otherwise the one from `msg`) will be copied.
     StoreResult store(const message& msg, std::chrono::system_clock::time_point* expiry = nullptr);
 
-    void bulk_store(const std::vector<message>& items);
+    void bulk_store(std::span<const message> items);
 
     // Default value for message overhead calculations in `retrieve`.  In practice, overhead for the
     // message itself (i.e. the json keys, etc.) seems to be in the 75-80 character range (depending
@@ -164,7 +165,7 @@ class Database {
     // Delete messages owned by the given pubkey having the given hashes.  Returns the hashes of any
     // deleted messages.
     std::vector<std::string> delete_by_hash(
-            const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
+            const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
 
     // Deletes all messages owned by the given pubkey with a timestamp <= timestamp.  Returns the
     // [namespace, hash] pairs of any deleted messages.
@@ -181,13 +182,13 @@ class Database {
     // Adds access tokens to the revoked token database so that users may not longer use those
     // tokens to authenticate.
     void revoke_subaccounts(
-            const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccount);
+            const user_pubkey& pubkey, std::span<const subaccount_token> subaccount);
 
     // Removes access tokens from the revoked token database so that users may use those tokens to
     // authenticate (if currently revoked).  Returns the number of tokens that were found and
     // removed.
     int unrevoke_subaccounts(
-            const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccount);
+            const user_pubkey& pubkey, std::span<const subaccount_token> subaccount);
 
     // Checks if a subaccount token exists in the revoked subaccount database. Returns true if the
     // subaccount has been revoked, false otherwise.
@@ -207,8 +208,8 @@ class Database {
     // msg_hashes to apply a different timestamp to each.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(
             const user_pubkey& pubkey,
-            const std::vector<std::string>& msg_hashes,
-            const std::vector<std::chrono::system_clock::time_point> new_exp,
+            std::span<const std::string> msg_hashes,
+            std::span<const std::chrono::system_clock::time_point> new_exp,
             bool extend_only = false,
             bool shorten_only = false);
 
@@ -229,7 +230,7 @@ class Database {
     // Retrieves the expiries of messages by hash.  Returns a map of hash -> expiry (hashes not
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
-            const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
+            const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
 
     // Adds a request retry to the database, to be retried later.  If req_id is specified, this
     // is a subsequent failure on the same request.  It's not great to leak database table indices
@@ -316,7 +317,7 @@ class Database {
             const crypto::legacy_pubkey& pubkey, size_t byte_budget);
 
     // Removes the given (delivered) messages from `pubkey`'s pending deliveries.
-    void remove_deliveries(const crypto::legacy_pubkey& pubkey, const std::vector<int64_t>& ids);
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey, std::span<const int64_t> ids);
 
     // Removes all pending deliveries to `pubkey`.
     void remove_deliveries(const crypto::legacy_pubkey& pubkey);

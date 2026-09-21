@@ -699,7 +699,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
     return ret;
 }
 
-void Database::bulk_store(const std::vector<message>& items) {
+void Database::bulk_store(std::span<const message> items) {
     auto conn = db_->conn();
     SQLite::Transaction t{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
     auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
@@ -889,7 +889,7 @@ namespace {
 }  // namespace
 
 std::vector<std::string> Database::delete_by_hash(
-        const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes) {
+        const user_pubkey& pubkey, std::span<const std::string> msg_hashes) {
 
     auto conn = db_->conn();
 
@@ -948,7 +948,7 @@ static constexpr auto ins_revoke_suffix =
         "WHERE revoked_subaccounts.timestamp < excluded.timestamp"sv;
 
 void Database::revoke_subaccounts(
-        const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccounts) {
+        const user_pubkey& pubkey, std::span<const subaccount_token> subaccounts) {
     if (subaccounts.empty())
         return;
 
@@ -982,7 +982,7 @@ void Database::revoke_subaccounts(
 }
 
 int Database::unrevoke_subaccounts(
-        const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccounts) {
+        const user_pubkey& pubkey, std::span<const subaccount_token> subaccounts) {
     if (subaccounts.empty())
         return 0;
 
@@ -1035,8 +1035,8 @@ std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey
 
 std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Database::update_expiry(
         const user_pubkey& pubkey,
-        const std::vector<std::string>& msg_hashes,
-        const std::vector<std::chrono::system_clock::time_point> new_exp,
+        std::span<const std::string> msg_hashes,
+        std::span<const std::chrono::system_clock::time_point> new_exp,
         bool extend_only,
         bool shorten_only) {
 
@@ -1109,7 +1109,7 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
 }
 
 std::map<std::string, int64_t> Database::get_expiries(
-        const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes) {
+        const user_pubkey& pubkey, std::span<const std::string> msg_hashes) {
     auto conn = db_->conn();
 
     if (msg_hashes.size() == 1) {
@@ -1432,7 +1432,7 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
 }
 
 void Database::remove_deliveries(
-        const crypto::legacy_pubkey& pubkey, const std::vector<int64_t>& ids) {
+        const crypto::legacy_pubkey& pubkey, std::span<const int64_t> ids) {
     auto conn = db_->conn();
     SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
     auto st = conn.prepared_st("DELETE FROM pending_deliveries WHERE pubkey = ? AND message = ?");

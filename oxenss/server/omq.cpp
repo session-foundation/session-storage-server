@@ -200,7 +200,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
 
 OMQ::OMQ(
         const crypto::x25519_keypair& keys,
-        const std::vector<crypto::x25519_pubkey>& stats_access_keys) :
+        std::span<const crypto::x25519_pubkey> stats_access_keys) :
         omq_{std::string{keys.pub.view()},
              std::string{keys.sec.view()},
              /*service_node=*/true,

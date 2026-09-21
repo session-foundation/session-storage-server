@@ -1,3 +1,4 @@
+#include <array>
 #include <limits>
 #include <oxenss/storage/database.hpp>
 
@@ -634,13 +635,14 @@ TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
     // The byte budget splits batches as for dumps
     CHECK(storage.next_delivery_batch(peer1, 1).first.size() == 1);
 
-    storage.remove_deliveries(peer1, {1});
+    storage.remove_deliveries(peer1, std::array<int64_t, 1>{1});
     std::tie(msgs, ids) = storage.next_delivery_batch(peer1, 1 << 20);
     REQUIRE(msgs.size() == 1);
     CHECK(msgs[0].hash == "h3");
 
     // Deleting the message takes its pending delivery with it
-    CHECK(storage.delete_by_hash(pk, {"h3"}) == std::vector<std::string>{"h3"});
+    CHECK(storage.delete_by_hash(pk, std::array<std::string, 1>{"h3"}) ==
+          std::vector<std::string>{"h3"});
     CHECK(storage.next_delivery_batch(peer1, 1 << 20).first.empty());
     CHECK(storage.delivery_peers().empty());
 

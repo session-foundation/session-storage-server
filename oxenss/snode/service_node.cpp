@@ -612,7 +612,7 @@ bool ServiceNode::process_store(
     return result != StoreResult::Full;
 }
 
-bool ServiceNode::save_bulk(const std::vector<message>& msgs) {
+bool ServiceNode::save_bulk(std::span<const message> msgs) {
     try {
         db->bulk_store(msgs);
     } catch (const std::exception& e) {
@@ -888,7 +888,7 @@ void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
 }
 
 void ServiceNode::on_delivery_reply(
-        const crypto::legacy_pubkey& pk, const std::vector<int64_t>& ids, bool ok) {
+        const crypto::legacy_pubkey& pk, std::span<const int64_t> ids, bool ok) {
     std::lock_guard lock{dumps_mutex_};
     auto it = deliveries_in_flight_.find(pk);
     if (it == deliveries_in_flight_.end())

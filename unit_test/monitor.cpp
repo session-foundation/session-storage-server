@@ -1,6 +1,7 @@
 #include <catch2/catch.hpp>
 
 #include <oxenmq/oxenmq.h>
+#include <oxenss/common/format.h>
 #include <oxenss/common/message.h>
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
@@ -91,7 +92,7 @@ std::vector<std::string> remaining(TestMQ& mq) {
 
 contact dummy_contact(unsigned char fill, uint16_t https_port, uint16_t omq_port) {
     contact c{};
-    c.ip = oxen::quic::ipv4{"10.0.0." + std::to_string(fill)};
+    c.ip = oxen::quic::ipv4{"10.0.0.{}"_format(fill)};
     c.https_port = https_port;
     c.omq_quic_port = omq_port;
     c.version = {2, 9, 0};

@@ -1,5 +1,6 @@
 #include "keys.h"
 
+#include <oxenss/common/format.h>
 #include <oxenss/logging/oxen_logger.h>
 
 #include <cstring>
@@ -24,16 +25,15 @@ namespace detail {
             throw std::runtime_error{"Hex key data is invalid: data is not hex"};
         if (hex.size() != 2 * out.size())
             throw std::runtime_error{
-                    "Hex key data is invalid: expected " + std::to_string(out.size()) +
-                    " hex digits, received " + std::to_string(hex.size())};
+                    "Hex key data is invalid: expected {} hex digits, received {}"_format(
+                            out.size(), hex.size())};
         oxenc::from_hex(hex.begin(), hex.end(), out.begin());
     }
 
     void load_from_bytes(std::span<unsigned char> out, std::string_view bytes) {
         if (bytes.size() != out.size())
-            throw std::runtime_error{
-                    "Key data is invalid: expected " + std::to_string(out.size()) +
-                    " bytes, received " + std::to_string(bytes.size())};
+            throw std::runtime_error{"Key data is invalid: expected {} bytes, received {}"_format(
+                    out.size(), bytes.size())};
         std::memmove(out.data(), bytes.data(), out.size());
     }
 

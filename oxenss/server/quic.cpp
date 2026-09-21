@@ -407,7 +407,7 @@ void QUIC::sn_request(
                         if (onion)
                             return reply(
                                     true,
-                                    {std::to_string(http::SERVICE_UNAVAILABLE.first),
+                                    {fmt::to_string(http::SERVICE_UNAVAILABLE.first),
                                      "Next hop congested"s});
                         return reply(false, {"TIMEOUT"s});
                     }
@@ -425,17 +425,17 @@ void QUIC::sn_request(
                                     if (m.is_error())
                                         return reply(
                                                 true,
-                                                {std::to_string(http::BAD_GATEWAY.first),
+                                                {fmt::to_string(http::BAD_GATEWAY.first),
                                                  std::move(b)});
                                     try {
                                         oxenc::bt_list_consumer l{b};
                                         auto code = l.consume_integer<int>();
                                         return reply(
-                                                true, {std::to_string(code), l.consume_string()});
+                                                true, {fmt::to_string(code), l.consume_string()});
                                     } catch (const std::exception&) {
                                         return reply(
                                                 true,
-                                                {std::to_string(http::INTERNAL_SERVER_ERROR.first),
+                                                {fmt::to_string(http::INTERNAL_SERVER_ERROR.first),
                                                  "Invalid response from snode"s});
                                     }
                                 }

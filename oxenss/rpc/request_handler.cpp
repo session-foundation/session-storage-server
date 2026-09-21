@@ -796,7 +796,7 @@ void RequestHandler::process_client_req(
                     req.signature,
                     "retrieve",
                     req.msg_namespace != namespace_id::Default
-                            ? std::to_string(to_int(req.msg_namespace))
+                            ? fmt::to_string(to_int(req.msg_namespace))
                             : ""s,
                     req.timestamp)) {
             log::debug(logcat, "retrieve: signature verification failed");
@@ -1855,7 +1855,7 @@ void RequestHandler::process_onion_req(RelayToServerInfo&& info, OnionRequestMet
     urlstr += info.host;
     if (info.port != (info.protocol == "https" ? 443 : 80)) {
         urlstr += ':';
-        urlstr += std::to_string(info.port);
+        urlstr += fmt::to_string(info.port);
     }
     if (!info.target.starts_with('/'))
         urlstr += '/';

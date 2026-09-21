@@ -1,5 +1,6 @@
 #include "serialization.h"
 
+#include <oxenss/common/format.h>
 #include <oxenss/logging/oxen_logger.h>
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
@@ -57,7 +58,7 @@ std::vector<std::string> serialize_messages(std::span<const message> msgs, uint8
             res.push_back(serialize_batch(msgs));
     } else {
         log::critical(logcat, "Invalid serialization version {}", +version);
-        throw std::logic_error{"Invalid serialization version " + std::to_string(version)};
+        throw std::logic_error{"Invalid serialization version {}"_format(version)};
     }
 
     return res;

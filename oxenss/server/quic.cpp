@@ -33,8 +33,6 @@ static quic::opt::static_secret make_endpoint_static_secret(const crypto::ed2551
     return quic::opt::static_secret{std::move(secret)};
 }
 
-static constexpr auto ALPN = "oxenstorage";
-
 QUIC::QUIC(
         snode::ServiceNode& snode,
         rpc::RequestHandler& rh,

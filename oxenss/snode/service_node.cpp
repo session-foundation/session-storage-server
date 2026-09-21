@@ -872,7 +872,7 @@ void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
     if (msgs.empty())
         return;
 
-    auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+    auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
     log::debug(logcat, "Delivering {} messages whose store forward failed to {}", msgs.size(), pk);
     deliveries_in_flight_[pk] = {static_cast<int>(parts.size()), false};
     for (auto& part : parts)
@@ -995,7 +995,7 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
             return;
         }
 
-        auto parts = serialize_messages(msgs.begin(), msgs.end(), SERIALIZATION_VERSION_BT);
+        auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
         w.batches[last_id] = parts.size();
         w.in_flight++;
         w.sent_next_id = last_id + 1;

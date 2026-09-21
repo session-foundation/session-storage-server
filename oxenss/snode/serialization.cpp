@@ -15,11 +15,9 @@ namespace oxenss::snode {
 
 static auto logcat = log::Cat("snode");
 
-static std::pair<std::string, bool> serialize_more_messages(
-        const std::function<const message*()>& next_msg) {
-    std::pair<std::string, bool> result{"", false};
-    auto& [payload, done] = result;
-
+// Serialises messages from the front of `msgs`, removing them from it, until the batch size is
+// reached or `msgs` runs out.
+static std::string serialize_batch(std::span<const message>& msgs) {
     // We use *two* list producers here to avoid large string reallocations.  What we want
     // is:
     //
@@ -33,44 +31,30 @@ static std::pair<std::string, bool> serialize_more_messages(
     // to move or reallocate the string.
     oxenc::bt_list_producer fake_outer;
     auto l = fake_outer.append_list();
-    bool some = false;
-    while (fake_outer.view().size() < SERIALIZATION_BATCH_SIZE) {
-        const auto* msg = next_msg();
-        if (!msg) {
-            done = true;
-            break;
-        }
-        some = true;
+    while (!msgs.empty() && fake_outer.view().size() < SERIALIZATION_BATCH_SIZE) {
+        const auto& msg = msgs.front();
+        msgs = msgs.subspan(1);
         auto item = l.append_list();
-        item.append(msg->pubkey.prefixed_raw());
-        item.append(msg->hash);
-        item.append(to_epoch_ms(msg->timestamp));
-        item.append(to_epoch_ms(msg->expiry));
-        item.append(msg->data);
-        item.append(to_int(msg->msg_namespace));
+        item.append(msg.pubkey.prefixed_raw());
+        item.append(msg.hash);
+        item.append(to_epoch_ms(msg.timestamp));
+        item.append(to_epoch_ms(msg.expiry));
+        item.append(msg.data);
+        item.append(to_int(msg.msg_namespace));
     }
 
-    if (some) {
-        payload = std::move(fake_outer).str();
-        payload[0] = SERIALIZATION_VERSION_BT;  // Replace initial l with the version
-        payload.pop_back();                     // Drop the unwanted final e
-    }
-
-    return result;
+    auto payload = std::move(fake_outer).str();
+    payload[0] = SERIALIZATION_VERSION_BT;  // Replace initial l with the version
+    payload.pop_back();                     // Drop the unwanted final e
+    return payload;
 }
 
-std::vector<std::string> serialize_messages(
-        std::function<const message*()> next_msg, uint8_t version) {
+std::vector<std::string> serialize_messages(std::span<const message> msgs, uint8_t version) {
     std::vector<std::string> res;
 
     if (version == SERIALIZATION_VERSION_BT) {
-        bool done;
-        std::string payload;
-        do {
-            std::tie(payload, done) = serialize_more_messages(next_msg);
-            if (payload.size() > 3)  // 3 = empty list: '\x01le'
-                res.push_back(std::move(payload));
-        } while (!done);
+        while (!msgs.empty())
+            res.push_back(serialize_batch(msgs));
     } else {
         log::critical(logcat, "Invalid serialization version {}", +version);
         throw std::logic_error{"Invalid serialization version " + std::to_string(version)};

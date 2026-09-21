@@ -7,6 +7,7 @@
 #include <oxenss/snode/service_node.h>
 #include <oxenss/utils/string_utils.hpp>
 
+#include <array>
 #include <chrono>
 #include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
@@ -31,7 +32,7 @@ static auto logcat = log::Cat("server");
 using nlohmann::json;
 
 namespace {
-    const std::vector<HttpsBackend> backends{
+    constexpr std::array backends{
 #ifdef OXENSS_HTTPS_UWEBSOCKETS
             HttpsBackend::uwebsockets,
 #endif

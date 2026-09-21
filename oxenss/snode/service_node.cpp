@@ -1366,7 +1366,7 @@ void ServiceNode::report_reachability(
 void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) {
     std::lock_guard guard(sn_mutex_);
 
-    std::set<swarm_id_t> targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
+    auto targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
     if (swarms.empty())
         log::info(logcat, "Bootstrapping all swarms");
     else if (logcat->level() <= log::Level::info)

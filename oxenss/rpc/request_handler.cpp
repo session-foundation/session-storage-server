@@ -260,7 +260,7 @@ namespace {
             bool skip_revoke_check,
             const std::array<unsigned char, 64>& sig,
             const T&... val) {
-        std::string data = concatenate_sig_message_parts(val...);
+        auto data = concatenate_sig_message_parts(val...);
 
         const auto& raw = pubkey.raw();
         const unsigned char* pk;
@@ -312,7 +312,7 @@ namespace {
     std::array<unsigned char, 64> create_signature(
             const crypto::ed25519_seckey& sk, const T&... val) {
         std::array<unsigned char, 64> sig;
-        std::string data = concatenate_sig_message_parts(val...);
+        auto data = concatenate_sig_message_parts(val...);
         crypto_sign_detached(
                 sig.data(),
                 nullptr,
@@ -337,7 +337,7 @@ std::string compute_hash_blake2b_b64(std::vector<std::string_view> parts) {
     std::array<unsigned char, HASH_SIZE> hash;
     crypto_generichash_final(&state, hash.data(), HASH_SIZE);
 
-    std::string b64hash = oxenc::to_base64(hash.begin(), hash.end());
+    auto b64hash = oxenc::to_base64(hash.begin(), hash.end());
     // Trim padding:
     while (!b64hash.empty() && b64hash.back() == '=')
         b64hash.pop_back();
@@ -345,7 +345,7 @@ std::string compute_hash_blake2b_b64(std::vector<std::string_view> parts) {
 }
 
 std::string computeMessageHash(const user_pubkey& pubkey, namespace_id ns, std::string_view data) {
-    char netid = static_cast<char>(pubkey.type());
+    auto netid = static_cast<char>(pubkey.type());
     std::array<char, 20> ns_buf;
     char* ns_buf_ptr = ns_buf.data();
     std::string_view ns_for_hash =
@@ -626,7 +626,7 @@ void RequestHandler::process_client_req(rpc::store&& req, std::function<void(Res
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
-    std::string message_hash = computeMessageHash(req.pubkey, req.msg_namespace, req.data);
+    auto message_hash = computeMessageHash(req.pubkey, req.msg_namespace, req.data);
 
     bool new_msg;
     std::chrono::system_clock::time_point expiry;
@@ -1747,7 +1747,7 @@ Response RequestHandler::wrap_proxy_response(
     else  // Yuck: double-encoded json
         body = json{{"status", status}, {"body", std::get<json>(res.body).dump()}}.dump();
 
-    std::string ciphertext = channel_cipher_.encrypt(enc_type, body, client_key);
+    auto ciphertext = channel_cipher_.encrypt(enc_type, body, client_key);
     if (base64)
         ciphertext = oxenc::to_base64(std::move(ciphertext));
 

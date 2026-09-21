@@ -108,7 +108,7 @@ void Network::update_swarms(
     // We are only called from Swarm, which already holds the lock:
     // std::unique_lock lock{mut_};
 
-    std::set<crypto::legacy_pubkey> old_pks = contacts.get_pubkeys();
+    auto old_pks = contacts.get_pubkeys();
     auto new_pks = std::views::keys(new_contacts);
     std::vector<crypto::legacy_pubkey> removed;
     std::set_difference(

@@ -35,7 +35,7 @@ TEST_CASE("v1 serialization - basic values", "[serialization]") {
     CHECK(serialized.front() == "\x01l"s + expected_serialized + "e");
 
     msgs.push_back(msgs.front());
-    const std::vector<std::string> batches = serialize_messages(msgs.begin(), msgs.end(), 1);
+    const auto batches = serialize_messages(msgs.begin(), msgs.end(), 1);
     CHECK(batches.size() == 1);
     REQUIRE(batches[0] == "\x01l"s + expected_serialized + expected_serialized + "e");
 
@@ -94,7 +94,7 @@ TEST_CASE("v1 serialization - message payload 100MiB", "[serialization]") {
 
     size_t total_bytes = msg_list.size() * base_msg.data.size();
     std::string total_bytes_str = oxenss::util::get_human_readable_bytes(total_bytes);
-    double total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
+    auto total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
     double gbs_per_s =
             total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 

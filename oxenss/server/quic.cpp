@@ -581,7 +581,7 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
                        name == "storage_cc" || name == "onion_request"))
             throw quic::no_such_endpoint{};
     } else if (!(name == "snode_ping" || name == "monitor" || name == "onion_req" ||
-                 rpc::RequestHandler::client_rpc_endpoints.count(name)))
+                 rpc::RequestHandler::client_rpc_endpoints.contains(name)))
         throw quic::no_such_endpoint{};
 
     // We handle everything inside an inject task because if we do *anything* that requires

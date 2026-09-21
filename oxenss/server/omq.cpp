@@ -387,8 +387,8 @@ void OMQ::init(
     omq_.listen_curve(
             fmt::format("tcp://0.0.0.0:{}", port),
             [this](std::string_view /*addr*/, std::string_view pk, bool /*sn*/) {
-                return stats_access_keys_.count(std::string{pk}) ? oxenmq::AuthLevel::admin
-                                                                 : oxenmq::AuthLevel::none;
+                return stats_access_keys_.contains(std::string{pk}) ? oxenmq::AuthLevel::admin
+                                                                    : oxenmq::AuthLevel::none;
             },
             [prom = std::move(omq_prom)](bool listen_success) {
                 if (listen_success)

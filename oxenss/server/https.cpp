@@ -169,7 +169,7 @@ void HTTPS::handle_cors(HttpsRequest& req) {
         req.headers.emplace("Access-Control-Allow-Origin", "*");
     else if (!cors_.empty()) {
         if (auto it = req.headers.find("origin");
-            it != req.headers.end() && cors_.count(it->second)) {
+            it != req.headers.end() && cors_.contains(it->second)) {
             req.headers.emplace("Access-Control-Allow-Origin", "*");
             req.headers.emplace("Vary", "Origin");
         }

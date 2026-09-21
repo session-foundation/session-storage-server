@@ -105,16 +105,13 @@ QUIC::QUIC(
             });
 
     // Everything arriving over QUIC is handed to oxenmq workers as injected tasks; these categories
-    // give them threads and a queue.  Node-to-node work gets its own so that a node ingesting dumps
-    // from several peers does not queue client requests behind them (or drop them when the queue
-    // fills), mirroring oxenmq's own separate `sn` category.
-    service_node_->omq_server()->add_category(
-            "quic",
-            oxenmq::AuthLevel::basic,
-            2,    // minimum # of threads reserved threads for this category
-            1000  // max queued requests
-    );
-    service_node_->omq_server()->add_category(
+    // give them threads and a queue, and keep client requests and node-to-node commands (small and
+    // latency-sensitive: forwarded client commands, onion hops, handshakes) from queueing behind,
+    // or being dropped in favour of, each other.  Message batches go to the `bulkdata` category
+    // that OMQ creates, shared with batches arriving over oxenmq.
+    auto& omq = *service_node_->omq_server();
+    omq.add_category("quic", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
+    omq.add_category(
             "quicsn", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
 }
 
@@ -590,7 +587,9 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
     // `sn_mutex_` we could deadlock (because the `open_stream` we do in reachability testing is
     // synchronous, but is also called with the `sn_mutex_` held).
     omq.inject_task(
-            peer ? "quicsn" : "quic",
+            !peer            ? "quic"
+            : name == "data" ? "bulkdata"
+                             : "quicsn",
             "quic:{}"_format(msg.endpoint()),
             remote_host.host(),
             [this, msg, remote_ip, ep_idx, peer]() mutable {

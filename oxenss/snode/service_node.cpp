@@ -62,7 +62,12 @@ constexpr auto RETRY_REQUEST_TIMEOUT = 10s;
 // the batches in flight) while still filling a 100Mbit link at a few hundred ms of latency.
 constexpr size_t DUMP_BATCH_BYTES = 1'000'000;
 constexpr int DUMP_WINDOW = 5;
-constexpr auto DUMP_REQUEST_TIMEOUT = 30s;
+// A batch is acknowledged only once the receiver has committed it, and on a busy node (several
+// dumps arriving at once, a slow disk) that can lag well behind receipt with nothing wrong.  A
+// dead peer is caught by the connection's idle timeout, which fails every pending request, so this
+// only bounds a batch that was lost outright; make it long so that a merely slow peer is not sent
+// the same window again.
+constexpr auto DUMP_REQUEST_TIMEOUT = 5min;
 // How long a dump pauses after a batch fails or when the node is not contactable.
 constexpr auto DUMP_RETRY_DELAY = 15s;
 // How often to look for dumps that are due to start or resume; once running they are driven by the

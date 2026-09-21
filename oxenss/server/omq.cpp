@@ -74,12 +74,21 @@ void OMQ::handle_sn_data(oxenmq::Message& message) {
         return;
     }
 
-    // TODO: process push batch should move to "Request handler"
-    if (!service_node_->process_push_batch(message.data[0], message.conn.to_string()))
-        return message.send_reply("Failed to store messages");
-
-    message.send_reply("OK");
-};
+    // Onto the same queue as batches arriving over QUIC (see the bulkdata category); the body has
+    // to be copied because the message does not outlive this handler.
+    omq_.inject_task(
+            "bulkdata",
+            "sn.data",
+            message.remote,
+            [this,
+             body = std::string{message.data[0]},
+             from = message.conn.to_string(),
+             send = message.send_later()] {
+                if (!service_node_->process_push_batch(body, from))
+                    return send.reply("Failed to store messages");
+                send.reply("OK");
+            });
+}
 
 void OMQ::handle_ping(oxenmq::Message& message) {
     log::debug(logcat, "Remote pinged me");
@@ -221,6 +230,15 @@ OMQ::OMQ(
             log::warning(logcat, "Invalid forwarded client request: incorrect number of message parts ({})",  m.data.size());
         })
         ;
+
+    // Incoming message batches (swarm dumps and deliveries), whichever transport they arrived
+    // over: each is up to a megabyte and ends in a bulk database write, so they get their own
+    // queue rather than holding up the small, latency-sensitive node-to-node commands, and one
+    // thread, since the database serialises writers and more would only contend.  A full queue
+    // drops the task, which the sender sees as a timeout and answers by resending the window, so
+    // the queue is deep enough for every peer to have a full window in flight at once.  Only
+    // injected tasks land here (see handle_sn_data and QUIC::handle_request).
+    omq_.add_category("bulkdata", oxenmq::AuthLevel::basic, 1 /*reserved threads*/, 200 /*max queue*/);
 
     // storage.WHATEVER (e.g. storage.store, storage.retrieve, etc.) endpoints are invokable by
     // anyone (i.e. clients) and have the same WHATEVER endpoints as the "method" values for the

@@ -366,6 +366,7 @@ Response RequestHandler::handle_wrong_swarm(const user_pubkey& pubKey) {
         return {http::INTERNAL_SERVER_ERROR, "No swarms known!"s};
 
     json swarm = snode::swarm_to_json(maybe_swarm, contacts_);
+    swarm["pubkey"] = pubKey.prefixed_hex();
     add_misc_response_fields(swarm, service_node_);
     return {http::MISDIRECTED_REQUEST, std::move(swarm)};
 }

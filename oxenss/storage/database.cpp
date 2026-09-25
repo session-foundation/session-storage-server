@@ -514,6 +514,10 @@ DROP INDEX IF EXISTS owners_swarm_hi;
 DROP INDEX IF EXISTS owners_swarm_lo;
 CREATE INDEX IF NOT EXISTS owners_swarm ON owners(swarm_space_hi, swarm_space_lo);
 
+-- Expired retry requests are looked for every few seconds.  Without this that is a table scan, and
+-- as `created` comes after the payload each row's scan walks the payload's overflow pages.
+CREATE INDEX IF NOT EXISTS retry_requests_created ON retry_requests(created);
+
 DROP VIEW IF EXISTS owned_messages;
 DROP TRIGGER IF EXISTS owned_messages_insert;
 DROP TRIGGER IF EXISTS owned_messages_upsert;

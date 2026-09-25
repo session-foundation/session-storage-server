@@ -13,18 +13,15 @@
 [submodule "unit_test/Catch2"]
 	path = unit_test/Catch2
 	url = https://github.com/catchorg/Catch2
-[submodule "vendors/SQLiteCpp"]
-	path = external/SQLiteCpp
-	url = https://github.com/SRombauts/SQLiteCpp.git
-[submodule "vendors/oxenc"]
-	path = external/oxenc
-	url = https://github.com/session-foundation/oxen-encoding.git
 [submodule "vendors/CLI11"]
 	path = external/CLI11
 	url = https://github.com/CLIUtils/CLI11
 [submodule "external/oxen-libquic"]
 	path = external/oxen-libquic
-	url = https://github.com/oxen-io/oxen-libquic.git
-[submodule "oxen-logging"]
-	path = external/oxen-logging
-	url = https://github.com/oxen-io/oxen-logging.git
+	url = https://github.com/session-foundation/libquic.git
+[submodule "cmake/session-deps"]
+	path = cmake/session-deps
+	url = https://github.com/session-foundation/session-deps.git
+[submodule "external/session-sqlite"]
+	path = external/session-sqlite
+	url = https://github.com/session-foundation/session-sqlite.git

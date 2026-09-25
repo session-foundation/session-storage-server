@@ -47,7 +47,12 @@ class RateLimiter {
             const oxen::quic::ipv6& ip,
             std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
+    // Turns per-client (IP) limiting off or back on; with it off should_rate_limit_client()
+    // always returns false.  For benchmarks driving a server from a single address.
+    void set_client_limiting(bool enabled) { client_limiting_ = enabled; }
+
   private:
+    bool client_limiting_ = true;
     struct TokenBucket {
         uint32_t num_tokens;
         std::chrono::steady_clock::time_point last_time_point;

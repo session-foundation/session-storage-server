@@ -2,17 +2,55 @@
 
 // Copied entirely from oxen-core, minus the epee bits.
 
+#include <oxenc/common.h>
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <concepts>
 #include <cstring>
+#include <span>
 #include <string_view>
 #include <vector>
 
 namespace oxenss::util {
 
 using namespace std::literals;
+
+/// Reinterprets a span of one char-like type as a span of another (`std::byte` by default),
+/// preserving the static extent.
+template <oxenc::basic_char OutChar = std::byte, oxenc::basic_char InChar, size_t Extent>
+inline std::span<const OutChar, Extent> as_span(std::span<const InChar, Extent> sp) {
+    return std::span<const OutChar, Extent>{reinterpret_cast<const OutChar*>(sp.data()), sp.size()};
+}
+template <oxenc::basic_char OutChar = std::byte, oxenc::basic_char InChar, size_t Extent>
+inline std::span<OutChar, Extent> as_span(std::span<InChar, Extent> sp) {
+    return std::span<OutChar, Extent>{reinterpret_cast<OutChar*>(sp.data()), sp.size()};
+}
+
+/// Converts a string-like value into a span of char-like values (`std::byte` by default).  The
+/// span points at the argument's storage, so it must not outlive it.
+template <typename OutChar = std::byte, oxenc::bt_input_string T>
+inline std::span<const OutChar> to_span(const T& c) {
+    return {reinterpret_cast<const OutChar*>(c.data()), c.size()};
+}
+
+template <typename OutChar = std::byte, size_t N>
+inline std::span<const OutChar> to_span(const char (&literal)[N]) {
+    return {reinterpret_cast<const OutChar*>(literal), N - 1};
+}
+
+template <typename OutChar = std::byte, typename Container>
+    requires(
+            std::convertible_to<
+                    const Container&,
+                    std::span<const typename Container::value_type>> &&
+            !oxenc::bt_input_string<Container> && oxenc::basic_char<typename Container::value_type>)
+inline auto to_span(const Container& c) {
+    constexpr size_t Extent{decltype(std::span{c})::extent};
+    return std::span<const OutChar, Extent>{reinterpret_cast<const OutChar*>(c.data()), c.size()};
+}
 
 /// Returns true if the first string is equal to the second string, compared case-insensitively.
 inline bool string_iequal(std::string_view s1, std::string_view s2) {
@@ -27,16 +65,6 @@ inline bool string_iequal(std::string_view s1, std::string_view s2) {
 template <typename S1, typename... S>
 bool string_iequal_any(const S1& s1, const S&... s) {
     return (... || string_iequal(s1, s));
-}
-
-/// Returns true if the first argument begins with the second argument
-inline bool starts_with(std::string_view str, std::string_view prefix) {
-    return str.substr(0, prefix.size()) == prefix;
-}
-
-/// Returns true if the first argument ends with the second argument
-inline bool ends_with(std::string_view str, std::string_view suffix) {
-    return str.size() >= suffix.size() && str.substr(str.size() - suffix.size()) == suffix;
 }
 
 /// Splits a string on some delimiter string and returns a vector of string_view's pointing into
@@ -71,7 +99,7 @@ void trim(std::string_view& s);
 /// Parses an integer of some sort from a string, requiring that the entire string be consumed
 /// during parsing.  Return false if parsing failed, sets `value` and returns true if the entire
 /// string was consumed.
-template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+template <std::integral T>
 bool parse_int(const std::string_view str, T& value, int base = 10) {
     T tmp;
     auto* strend = str.data() + str.size();
@@ -114,7 +142,7 @@ T make_from_guts(std::string_view s) {
 }
 
 template <typename T>
-T make_from_guts(std::basic_string_view<std::byte> s) {
+T make_from_guts(std::span<const std::byte> s) {
     return make_from_guts<T>(std::string_view{reinterpret_cast<const char*>(s.data()), s.size()});
 }
 
@@ -133,16 +161,6 @@ std::string friendly_duration(std::chrono::nanoseconds dur);
 
 /// Converts a duration into a shorter, single-unit fractional display such as `42.3min`
 std::string short_duration(std::chrono::duration<double> dur);
-
-/// Given an array of string arguments, look for strings of the format <prefix><value> and
-/// return <value> Returns empty string view if not found.
-template <typename It>
-std::string_view find_prefixed_value(It begin, It end, std::string_view prefix) {
-    auto it = std::find_if(begin, end, [&](const auto& s) { return starts_with(s, prefix); });
-    if (it == end)
-        return {};
-    return std::string_view{*it}.substr(prefix.size());
-}
 
 // Returns an SI-prefixed string representing a number of bytes with 3 significant digits, such as
 // "123 MB" or "3.24 GB".

@@ -122,8 +122,8 @@ ParsedInfo process_ciphertext_v2(
 }
 
 bool is_onion_url_target_allowed(std::string_view target) {
-    return (util::starts_with(target, "/loki/") || util::starts_with(target, "/oxen/")) &&
-           util::ends_with(target, "/lsrpc") && target.find('?') == std::string::npos;
+    return (target.starts_with("/loki/") || target.starts_with("/oxen/")) &&
+           target.ends_with("/lsrpc") && target.find('?') == std::string::npos;
 }
 
 /// We are expecting a payload of the following shape:
@@ -160,20 +160,6 @@ CiphertextPlusJson parse_combined_payload(std::string_view payload) {
     json = json::parse(payload);
 
     return result;
-}
-
-bool operator==(const FinalDestinationInfo& lhs, const FinalDestinationInfo& rhs) {
-    return lhs.body == rhs.body;
-}
-
-bool operator==(const RelayToServerInfo& lhs, const RelayToServerInfo& rhs) {
-    return (lhs.protocol == rhs.protocol) && (lhs.host == rhs.host) && (lhs.port == rhs.port) &&
-           (lhs.target == rhs.target) && (lhs.payload == rhs.payload);
-}
-
-bool operator==(const RelayToNodeInfo& a, const RelayToNodeInfo& b) {
-    return std::tie(a.ciphertext, a.ephemeral_key, a.enc_type, a.next_node) ==
-           std::tie(b.ciphertext, b.ephemeral_key, b.enc_type, b.next_node);
 }
 
 crypto::x25519_pubkey extract_x25519_from_hex(std::string_view hex) {

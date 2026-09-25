@@ -1,7 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <nlohmann/json_fwd.hpp>
@@ -11,6 +16,7 @@
 #include <shared_mutex>
 
 #include "../common/namespace.h"
+#include "../common/pubkey.h"
 #include "utils.h"
 
 namespace oxenss {
@@ -23,6 +29,7 @@ namespace rpc {
 namespace snode {
     class ServiceNode;
     struct sn_test;
+    struct contact;
 }  // namespace snode
 
 struct message;
@@ -100,17 +107,95 @@ class MQBase {
 
     void update_monitors(std::vector<sub_info>& subs, connection_id conn);
 
+    // Removes every monitor subscription belonging to `conn`, for a connection that has gone away.
+    // Only connections tracked in `monitoring_conns_` can be removed this way; for anything else
+    // this does nothing.
+    void remove_monitors_for(const connection_id& conn);
+
+    // Drops `account` from `conn`'s entry in `monitoring_conns_`.  Must be called with
+    // `monitoring_mutex_` held for writing.
+    void unindex_monitor(const connection_id& conn, const std::string& account);
+
+    // Removes every monitor subscription whose account `still_ours` rejects, returning the dropped
+    // accounts along with the connections that had been subscribed to each.
+    //
+    // `still_ours` is called without `monitoring_mutex_` held, because it takes network locks of
+    // its own; the table is therefore sampled, tested, and then modified in three separate steps.
+    std::vector<std::pair<user_pubkey, std::vector<connection_id>>> extract_foreign_monitors(
+            const std::function<bool(const user_pubkey&)>& still_ours);
+
+    // Builds the bt-encoded body of a monitor-terminated notification for `pubkey`: the account,
+    // the reason it ended, and the swarm that now holds the account so that the subscriber can
+    // resubscribe without first asking us where to go.
+    std::string monitor_ended_payload(
+            const user_pubkey& pubkey, MonitorResponse reason, std::string_view message);
+
     // Tracks accounts we are monitoring for OMQ push notification messages
     std::unordered_multimap<std::string, MonitorData> monitoring_;
+
+    // Reverse index of `monitoring_`, listing the accounts subscribed to by each connection so
+    // that a connection going away doesn't require a scan of the whole table.
+    //
+    // Only quic connections are indexed: a closed quic connection is gone for good, and we get
+    // told when it closes.  oxenmq, in contrast, gives us no notification at all when an inbound
+    // connection goes away, so there would be nothing to trigger a lookup and the index would only
+    // accumulate entries; oxenmq subscriptions are cleaned up by expiry instead.
+    //
+    // Guarded by `monitoring_mutex_` along with `monitoring_` itself so that the two cannot drift
+    // apart.
+    std::map<connection_id, std::vector<std::string>> monitoring_conns_;
+
     mutable std::shared_mutex monitoring_mutex_;
 
   public:
     void get_notifiers(
             message& m, std::vector<connection_id>& to, std::vector<connection_id>& with_data);
 
+    /// Terminates every monitor subscription for an account this node no longer serves, pushing a
+    /// `monitor_ended` notification to each affected subscriber.
+    ///
+    /// A subscription is only useful for as long as we would not answer a request for the account
+    /// with a 421, so this must be called after a swarm update has taken effect.  Without it a
+    /// client that has stopped polling cannot tell "the swarm moved" from "no messages arrived".
+    void drop_foreign_monitors();
+
     virtual void notify(std::vector<connection_id>&, std::string_view notification) = 0;
 
+    /// Pushes a notification telling `conns` that a monitor subscription of theirs has been
+    /// terminated.  This is a separate command from `notify` so that clients which only know
+    /// about message notifications are unaffected by it.
+    virtual void notify_monitor_ended(
+            std::vector<connection_id>&, std::string_view notification) = 0;
+
     virtual void reachability_test(std::shared_ptr<snode::sn_test> test) = 0;
+
+    // Called after each service node list update so that connections held open to nodes that are
+    // no longer service nodes can be closed.  The default does nothing.
+    virtual void sweep_sn_connections() {}
+
+    // True if this transport currently holds a node-to-node connection with the given node.  The
+    // default (for transports that connect on demand) is false.
+    virtual bool sn_connected(const snode::contact&) { return false; }
+
+    using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
+    using sn_fallback = std::function<void(std::vector<std::string> parts)>;
+
+    // Sends node-to-node request `cmd` ("data", "data_ready", "storage_cc" or "onion_request")
+    // with the given message parts to `ct` over this transport, if this transport carries
+    // node-to-node traffic with that node; otherwise hands the parts to `fallback`, which tries
+    // the next transport (the default does only that: no such traffic).  The decision, and so
+    // `fallback`, may happen later on another thread.  Whatever the transport, the reply reaches
+    // `cb` in oxenmq's shape: `success` is false on timeout (with parts {"TIMEOUT"}), otherwise
+    // the parts are the reply body, or [code, reason] for a refused storage_cc or a hop reply.
+    virtual void sn_request(
+            const snode::contact&,
+            std::string_view,
+            std::vector<std::string> parts,
+            sn_reply_callback,
+            std::chrono::milliseconds,
+            sn_fallback fallback) {
+        fallback(std::move(parts));
+    }
 
     virtual ~MQBase() = default;
 

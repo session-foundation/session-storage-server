@@ -1,5 +1,6 @@
 #include "keys.h"
 
+#include <oxenss/common/format.h>
 #include <oxenss/logging/oxen_logger.h>
 
 #include <cstring>
@@ -19,26 +20,25 @@ namespace oxenss::crypto {
 static auto logcat = oxen::log::Cat("crypto");
 
 namespace detail {
-    void load_from_hex(void* buffer, size_t length, std::string_view hex) {
+    void load_from_hex(std::span<unsigned char> out, std::string_view hex) {
         if (!oxenc::is_hex(hex))
             throw std::runtime_error{"Hex key data is invalid: data is not hex"};
-        if (hex.size() != 2 * length)
+        if (hex.size() != 2 * out.size())
             throw std::runtime_error{
-                    "Hex key data is invalid: expected " + std::to_string(length) +
-                    " hex digits, received " + std::to_string(hex.size())};
-        oxenc::from_hex(hex.begin(), hex.end(), reinterpret_cast<unsigned char*>(buffer));
+                    "Hex key data is invalid: expected {} hex digits, received {}"_format(
+                            out.size(), hex.size())};
+        oxenc::from_hex(hex.begin(), hex.end(), out.begin());
     }
 
-    void load_from_bytes(void* buffer, size_t length, std::string_view bytes) {
-        if (bytes.size() != length)
-            throw std::runtime_error{
-                    "Key data is invalid: expected " + std::to_string(length) +
-                    " bytes, received " + std::to_string(bytes.size())};
-        std::memmove(buffer, bytes.data(), length);
+    void load_from_bytes(std::span<unsigned char> out, std::string_view bytes) {
+        if (bytes.size() != out.size())
+            throw std::runtime_error{"Key data is invalid: expected {} bytes, received {}"_format(
+                    out.size(), bytes.size())};
+        std::memmove(out.data(), bytes.data(), out.size());
     }
 
-    std::string to_hex(const unsigned char* buffer, size_t length) {
-        return oxenc::to_hex(buffer, buffer + length);
+    std::string to_hex(std::span<const unsigned char> bytes) {
+        return oxenc::to_hex(bytes.begin(), bytes.end());
     }
 
 }  // namespace detail
@@ -70,7 +70,7 @@ static T parse_pubkey(std::string_view pubkey_in) {
     T pk{};
     static_assert(pk.size() == 32);
     if (pubkey_in.size() == 32)
-        detail::load_from_bytes(pk.data(), 32, pubkey_in);
+        pk.load_from_bytes(pubkey_in);
     else if (pubkey_in.size() == 64 && oxenc::is_hex(pubkey_in))
         oxenc::from_hex(pubkey_in.begin(), pubkey_in.end(), pk.begin());
     else if (

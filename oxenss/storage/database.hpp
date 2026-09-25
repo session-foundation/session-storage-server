@@ -66,6 +66,8 @@ class Database {
     // Clients refresh config message TTLs on every poll; applying an extension of a few seconds
     // rewrites the row and its index entries each time, for a message that lives for weeks.
     static constexpr int TRIVIAL_EXTENSION_DIVISOR = 100;
+    // The lifetime is measured from the original store and grows with every applied extension.
+    static constexpr auto TRIVIAL_EXTENSION_LIFETIME_CAP = 30 * 24h;
 
     // How long after a swarm request to a peer times out before we first retry it.
     static constexpr auto RETRY_INITIAL_DELAY = 15s;
@@ -212,8 +214,9 @@ class Database {
     // msg_hashes to apply a different timestamp to each.
     //
     // With ignore_trivial_extension, an extend_only update that would move a message's expiry by
-    // less than 1/TRIVIAL_EXTENSION_DIVISOR of its lifetime (expiry - timestamp) is treated as
-    // already applied: the message is not updated and not returned.
+    // less than 1/TRIVIAL_EXTENSION_DIVISOR of its lifetime (expiry - timestamp, capped at
+    // TRIVIAL_EXTENSION_LIFETIME_CAP) is treated as already applied: the message is not updated
+    // and not returned.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(
             const user_pubkey& pubkey,
             std::span<const std::string> msg_hashes,

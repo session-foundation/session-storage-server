@@ -315,6 +315,23 @@ TEST_CASE("storage - trivial expiry extensions", "[storage][expiry]") {
         CHECK(storage.update_expiry(pubkey, short_hash, exp_list{now + 21s}, true, false, true)
                       .size() == 1);
     }
+
+    SECTION("the boundary is inclusive") {
+        const auto threshold = std::chrono::milliseconds{ttl} / Database::TRIVIAL_EXTENSION_DIVISOR;
+        CHECK(storage.update_expiry(
+                             pubkey, one, exp_list{now + ttl + threshold - 1ms}, true, false, true)
+                      .empty());
+        CHECK(storage.update_expiry(pubkey, one, exp_list{now + ttl + threshold}, true, false, true)
+                      .size() == 1);
+    }
+
+    SECTION("the threshold is capped for a message far older than the maximum TTL") {
+        const message old{pubkey, "old", namespace_id::Default, now - 3200 * 24h, now + 1h, "data"};
+        REQUIRE(storage.store(old) == StoreResult::New);
+        const std::vector<std::string> old_hash{"old"};
+        CHECK(storage.update_expiry(pubkey, old_hash, exp_list{now + 30 * 24h}, true, false, true)
+                      .size() == 1);
+    }
 }
 
 TEST_CASE("storage - bulk data storage", "[storage]") {

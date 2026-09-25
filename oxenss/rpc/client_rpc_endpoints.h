@@ -622,10 +622,10 @@ struct expire_all final : recursive {
 /// - extend -- if provided and set to true then the expiry is only extended, but not shortened.  If
 ///   the expiry of a given message is already at or beyond the given `expiry` timestamp then its
 ///   expiry will not be changed.  An extension that would move the expiry by less than 1% of the
-///   message's lifetime (its current expiry minus its timestamp) is not applied either, and the
-///   message is reported in "unchanged" with its current expiry: a client may refresh a long TTL on
-///   every poll without the storage server rewriting the message each time.  This option is
-///   mutually exclusive of "shorten".
+///   message's lifetime (its current expiry minus its timestamp, capped at the 30-day maximum TTL)
+///   is not applied either, and the message is reported in "unchanged" with its current expiry: a
+///   client may refresh a long TTL on every poll without the storage server rewriting the message
+///   each time.  This option is mutually exclusive of "shorten".
 /// - signature -- When passing a single expiry this is an Ed25519 signature of:
 ///       ("expire" || ShortenOrExtend || expiry || messages[0] || ... || messages[N])
 ///   where `expiry` is the expiry timestamp expressed as a string, for a single expiry, or the

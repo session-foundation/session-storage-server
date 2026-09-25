@@ -1054,7 +1054,9 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
                                           : ""s;
     if (extend_only && ignore_trivial_extension)
         expiry_constraint += fmt::format(
-                " AND (?1 - expiry) * {} >= expiry - timestamp", TRIVIAL_EXTENSION_DIVISOR);
+                " AND (?1 - expiry) * {} >= MIN(expiry - timestamp, {})",
+                TRIVIAL_EXTENSION_DIVISOR,
+                std::chrono::milliseconds{TRIVIAL_EXTENSION_LIFETIME_CAP}.count());
 
     auto conn = db_->conn();
 

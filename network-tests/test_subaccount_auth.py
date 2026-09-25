@@ -827,3 +827,55 @@ def test_subaccount_permissions(rpc, random_sn, sk, exclude):
             assert r == {"messages": [], "more": False}
         else:
             assert r == [b'401', b'retrieve signature verification failed']
+
+
+def test_expire_subaccount_trivial_extension(rpc, random_sn, sk, exclude):
+    """A subaccount without delete access is forced into extend-only mode, but the trivial-extension
+    rule only applies when the request set `extend` itself."""
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+
+    sn = ss.random_swarm_members(swarm, 1, exclude)[0]
+    conn = rpc.connect(sn)
+
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 3, netid=3, ttl=14 * 24 * 60 * 60)
+    stored = {m["hash"]: m["req"]["expiry"] for m in msgs}
+    hashes = sorted(stored)
+
+    dude_sk, dude_token, dude_sig = subaccount.make_subaccount(0x03, sk)
+
+    expiry = max(stored.values()) + 60_000
+
+    def expire(extend):
+        params = {
+            "pubkey": '03' + sk.verify_key.encode().hex(),
+            'subaccount': b64(dude_token),
+            'subaccount_sig': b64(dude_sig),
+            'messages': hashes,
+            'expiry': expiry,
+            'signature': b64(
+                dude_sk.sign(
+                    f"expire{'extend' if extend else ''}{expiry}{''.join(hashes)}".encode()
+                ).signature
+            ),
+        }
+        if extend:
+            params['extend'] = True
+        r = rpc.request(conn, 'expire', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        return json.loads(r[0])
+
+    # Explicit extend: a minute more on a two-week message is trivial and is not applied.
+    r = expire(extend=True)
+    assert 5 <= len(r['swarm']) <= 10
+    for pk, exp in r['swarm'].items():
+        assert exp['updated'] == []
+        assert exp['unchanged'] == stored
+
+    # No extend flag: the subaccount is still limited to extending, but the trivial-extension rule
+    # does not apply, so the same request goes through.
+    r = expire(extend=False)
+    assert 5 <= len(r['swarm']) <= 10
+    for pk, exp in r['swarm'].items():
+        assert exp['updated'] == hashes
+        assert exp['expiry'] == expiry
+        assert 'unchanged' not in exp

@@ -836,8 +836,7 @@ std::vector<std::string> ServiceNode::data_ready_handshake(
             // there to gate on.
             auto version = d.require<uint32_t>("#");
             needs_db_dump = d.require<bool>("t");
-            log::debug(
-                    logcat, "data_ready from {} (v{})", pk, format_handshake_version(version));
+            log::debug(logcat, "data_ready from {} (v{})", pk, format_handshake_version(version));
         } catch (const std::exception& e) {
             log::info(logcat, "Malformed data_ready request from {}: {}", pk, e.what());
             return {"Request payload malformed"s};

@@ -210,8 +210,7 @@ TEST_CASE("storage - tracked message count", "[storage]") {
 
         // A public outbox holds one message: a newer one replaces it, an older one is refused
         REQUIRE(storage.store({pk1, "o1", outbox, now, now + 1h, "data"}) == StoreResult::New);
-        REQUIRE(storage.store({pk1, "o2", outbox, now + 1s, now + 1h, "data"}) ==
-                StoreResult::New);
+        REQUIRE(storage.store({pk1, "o2", outbox, now + 1s, now + 1h, "data"}) == StoreResult::New);
         REQUIRE(storage.store({pk1, "o0", outbox, now - 1s, now + 1h, "data"}) ==
                 StoreResult::Obsolete);
         check(storage, 6);
@@ -233,8 +232,7 @@ TEST_CASE("storage - tracked message count", "[storage]") {
         CHECK(storage.delete_by_timestamp(pk2, now).size() == 1);
         check(storage, 1);
 
-        REQUIRE(storage.store({pk2, "gone", def, now - 2h, now - 1h, "data"}) ==
-                StoreResult::New);
+        REQUIRE(storage.store({pk2, "gone", def, now - 2h, now - 1h, "data"}) == StoreResult::New);
         check(storage, 2);
         storage.clean_expired();
         check(storage, 1);
@@ -259,8 +257,7 @@ TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
 
     const auto now = std::chrono::system_clock::now();
     int n = 0;
-    for (auto [pk, ns, count] :
-         {std::tuple{&pk1, 0, 3}, {&pk1, 2, 1}, {&pk2, 0, 2}, {&pk2, 5, 4}})
+    for (auto [pk, ns, count] : {std::tuple{&pk1, 0, 3}, {&pk1, 2, 1}, {&pk2, 0, 2}, {&pk2, 5, 4}})
         for (int i = 0; i < count; i++)
             REQUIRE(storage.store(
                             {*pk,
@@ -298,10 +295,9 @@ TEST_CASE("storage - delete by timestamp", "[storage][namespace]") {
 
     auto deleted = storage.delete_by_timestamp(pk, now);
     std::ranges::sort(deleted);
-    CHECK(deleted == std::vector<std::pair<namespace_id, std::string>>{
-                             {namespace_id::Default, "new0"},
-                             {namespace_id::Default, "old0"},
-                             {ns2, "new2"}});
+    CHECK(deleted ==
+          std::vector<std::pair<namespace_id, std::string>>{
+                  {namespace_id::Default, "new0"}, {namespace_id::Default, "old0"}, {ns2, "new2"}});
     CHECK(storage.get_namespace_counts().empty());
 }
 
@@ -317,7 +313,8 @@ TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]
 
     const auto now = std::chrono::system_clock::now();
     for (int i = 1; i <= 4; i++)
-        REQUIRE(storage.store({pk1, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
+        REQUIRE(storage.store(
+                        {pk1, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
                 StoreResult::New);
     REQUIRE(storage.store({pk2, "other", namespace_id::Default, now, now + 1h, "data"}) ==
             StoreResult::New);
@@ -925,8 +922,7 @@ CREATE INDEX pending_deliveries_message ON pending_deliveries(message);
         dump.bind(1, std::string{peer1.str()});
         dump.exec();
         SQLite::Statement delivery{
-                db,
-                "INSERT INTO pending_deliveries SELECT ?, id FROM messages WHERE hash = ?"};
+                db, "INSERT INTO pending_deliveries SELECT ?, id FROM messages WHERE hash = ?"};
         for (auto [peer, hash] : {std::pair{&peer1, "h1"}, {&peer1, "h2"}, {&peer2, "h2"}}) {
             delivery.bind(1, std::string{peer->str()});
             delivery.bind(2, hash);

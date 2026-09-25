@@ -346,8 +346,8 @@ CREATE TABLE IF NOT EXISTS pending_deliveries (
 CREATE INDEX IF NOT EXISTS pending_deliveries_message ON pending_deliveries(message);
         )");
 
-        // (The `WHERE true`s are needed for an upsert on INSERT ... SELECT: without one sqlite would
-        // parse the ON of ON CONFLICT as a join constraint.)
+        // (The `WHERE true`s are needed for an upsert on INSERT ... SELECT: without one sqlite
+        // would parse the ON of ON CONFLICT as a join constraint.)
         if (old_dumps)
             db.exec(R"(
 INSERT INTO pending_recipients (pubkey) SELECT pubkey FROM pending_dumps_old WHERE true
@@ -1025,8 +1025,8 @@ std::vector<std::string> Database::delete_by_timestamp(
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ? AND namespace = ?"
             " RETURNING hash");
-    auto deleted = get_all<std::string>(
-            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
+    auto deleted =
+            get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
     message_count_ -= static_cast<int64_t>(deleted.size());
     return deleted;
 }
@@ -1129,8 +1129,8 @@ namespace {
     // decode as 0, which only makes collisions for such (invalid) hashes more likely.
     //
     // Deliberately not noexcept: libstdc++ stores each node's hash code only for a hash that may
-    // throw, and otherwise recomputes neighbouring nodes' hashes while walking a bucket, which would
-    // repeat this decode.
+    // throw, and otherwise recomputes neighbouring nodes' hashes while walking a bucket, which
+    // would repeat this decode.
     struct b64_prefix_hash {
         static constexpr size_t chars = (std::numeric_limits<size_t>::digits + 5) / 6;
 
@@ -1420,9 +1420,10 @@ std::vector<Database::pending_dump> Database::pending_dumps() {
     auto conn = db_->conn();
     std::vector<pending_dump> result;
     for (auto& [pk, swarm, next_id, end_id, next_attempt] :
-         get_all<std::string, int64_t, int64_t, int64_t, double>(conn.prepared_st(
-                 "SELECT pubkey, swarm, next_id, end_id, next_attempt"
-                 " FROM pending_dumps JOIN pending_recipients ON pending_recipients.id = recipient")))
+         get_all<std::string, int64_t, int64_t, int64_t, double>(
+                 conn.prepared_st("SELECT pubkey, swarm, next_id, end_id, next_attempt"
+                                  " FROM pending_dumps"
+                                  " JOIN pending_recipients ON pending_recipients.id = recipient")))
         result.push_back(
                 {crypto::legacy_pubkey::from_bytes(pk),
                  static_cast<uint64_t>(swarm),
@@ -1538,8 +1539,9 @@ std::vector<crypto::legacy_pubkey> Database::delivery_peers() {
 void Database::clean_pending_recipients() {
     db_->conn().prepared_exec(
             "DELETE FROM pending_recipients WHERE"
-            " NOT EXISTS (SELECT 1 FROM pending_dumps WHERE recipient = pending_recipients.id) AND"
-            " NOT EXISTS (SELECT 1 FROM pending_deliveries WHERE recipient = pending_recipients.id)");
+            " NOT EXISTS (SELECT 1 FROM pending_dumps WHERE recipient = pending_recipients.id)"
+            " AND NOT EXISTS (SELECT 1 FROM pending_deliveries"
+            " WHERE recipient = pending_recipients.id)");
 }
 
 std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_batch(
@@ -1594,8 +1596,8 @@ void Database::remove_deliveries(
             conn.prepared_st("SELECT id FROM pending_recipients WHERE pubkey = ?"), pubkey.str());
     if (!recipient)
         return;
-    auto st = conn.prepared_st(
-            "DELETE FROM pending_deliveries WHERE recipient = ? AND message = ?");
+    auto st =
+            conn.prepared_st("DELETE FROM pending_deliveries WHERE recipient = ? AND message = ?");
     for (auto id : ids) {
         exec_query(st, *recipient, id);
         st->reset();

@@ -979,7 +979,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ?"
-            " RETURNING hash");
+            " RETURNING namespace, hash");
     return get_all_pairs<namespace_id, std::string>(
             st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp));
 }

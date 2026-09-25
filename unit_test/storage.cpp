@@ -208,6 +208,33 @@ TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
                             {static_cast<namespace_id>(5), 4}});
 }
 
+TEST_CASE("storage - delete by timestamp", "[storage][namespace]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+    const auto ns2 = static_cast<namespace_id>(2);
+    for (auto [hash, ns, ts] :
+         {std::tuple{"old0", namespace_id::Default, now - 1h},
+          {"old2", ns2, now - 1h},
+          {"new0", namespace_id::Default, now},
+          {"new2", ns2, now}})
+        REQUIRE(storage.store({pk, hash, ns, ts, now + 1h, "data"}) == StoreResult::New);
+
+    CHECK(storage.delete_by_timestamp(pk, ns2, now - 30min) == std::vector<std::string>{"old2"});
+
+    auto deleted = storage.delete_by_timestamp(pk, now);
+    std::ranges::sort(deleted);
+    CHECK(deleted == std::vector<std::pair<namespace_id, std::string>>{
+                             {namespace_id::Default, "new0"},
+                             {namespace_id::Default, "old0"},
+                             {ns2, "new2"}});
+    CHECK(storage.get_namespace_counts().empty());
+}
+
 TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]") {
     StorageDeleter fixture;
 

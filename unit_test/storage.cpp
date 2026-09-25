@@ -12,6 +12,7 @@
 #include <thread>
 #include <future>
 
+#include <SQLiteCpp/SQLiteCpp.h>
 #include <catch2/catch.hpp>
 #include "oxenss/common/format.h"
 #include "oxenss/utils/time.hpp"
@@ -738,6 +739,90 @@ TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
 
     storage.remove_deliveries(peer2);
     CHECK(storage.delivery_peers().empty());
+
+    // A recipient with only a dump pending isn't a delivery peer
+    storage.queue_dump(peer1, 123, 5);
+    CHECK(storage.delivery_peers().empty());
+
+    // Cleaning up recipients keeps the ones still referred to, and a removed one comes back when
+    // something is queued for it again
+    storage.clean_pending_recipients();
+    CHECK(storage.pending_dumps().size() == 1);
+    storage.queue_delivery(peer1, "h2");
+    storage.queue_delivery(peer2, "h2");
+    storage.clean_pending_recipients();
+    CHECK(storage.delivery_peers().size() == 2);
+    CHECK(storage.next_delivery_batch(peer2, 1 << 20).first.size() == 1);
+}
+
+TEST_CASE("storage - upgrading pubkey-keyed pending tables", "[storage][swarm]") {
+    StorageDeleter fixture;
+
+    user_pubkey pk;
+    REQUIRE(pk.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    const auto now = std::chrono::system_clock::now();
+    const auto peer1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto peer2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+    {
+        Database storage{"."};
+        for (int i = 1; i <= 2; i++)
+            REQUIRE(storage.store(
+                            {pk, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
+                    StoreResult::New);
+    }
+    {
+        // Put the tables back as unreleased development builds created them
+        SQLite::Database db{"storage.db", SQLite::OPEN_READWRITE};
+        db.exec(R"(
+DROP TABLE pending_dumps;
+DROP TABLE pending_deliveries;
+DROP TABLE pending_recipients;
+CREATE TABLE pending_dumps (
+    pubkey BLOB NOT NULL,
+    swarm INTEGER NOT NULL,
+    next_id INTEGER NOT NULL,
+    end_id INTEGER NOT NULL,
+    next_attempt DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY(pubkey, swarm)
+);
+CREATE TABLE pending_deliveries (
+    pubkey BLOB NOT NULL,
+    message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY(pubkey, message)
+) WITHOUT ROWID;
+CREATE INDEX pending_deliveries_message ON pending_deliveries(message);
+        )");
+        SQLite::Statement dump{db, "INSERT INTO pending_dumps VALUES (?, 123, 2, 5, 0)"};
+        dump.bind(1, std::string{peer1.str()});
+        dump.exec();
+        SQLite::Statement delivery{
+                db,
+                "INSERT INTO pending_deliveries SELECT ?, id FROM messages WHERE hash = ?"};
+        for (auto [peer, hash] : {std::pair{&peer1, "h1"}, {&peer1, "h2"}, {&peer2, "h2"}}) {
+            delivery.bind(1, std::string{peer->str()});
+            delivery.bind(2, hash);
+            delivery.exec();
+            delivery.reset();
+        }
+    }
+
+    Database storage{"."};
+
+    auto dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].pubkey == peer1);
+    CHECK(dumps[0].swarm == 123);
+    CHECK(dumps[0].next_id == 2);
+    CHECK(dumps[0].end_id == 5);
+
+    CHECK(storage.delivery_peers().size() == 2);
+    auto [msgs, ids] = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0].hash == "h1");
+    CHECK(msgs[1].hash == "h2");
+    CHECK(storage.next_delivery_batch(peer2, 1 << 20).first.size() == 1);
 }
 
 TEST_CASE("storage - swarm space range queries", "[storage][swarm]") {

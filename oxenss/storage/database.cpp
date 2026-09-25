@@ -283,27 +283,80 @@ CREATE TABLE state_kv (
             )");
         }
 
-        // Not part of the block above: databases that already went through it exist, and this is
-        // cheap to apply unconditionally.
+        SQLite::Transaction transaction{db, SQLite::TransactionBehavior::IMMEDIATE};
+
+        // Unreleased development builds keyed pending_dumps and pending_deliveries by the
+        // recipient's pubkey itself.  Such tables are moved aside so that the current ones can be
+        // created, then their rows are carried over below.
+        auto keyed_by_pubkey = [this](const char* table) {
+            SQLite::Statement st{db, "SELECT 1 FROM pragma_table_info(?) WHERE name = 'pubkey'"};
+            st.bind(1, table);
+            return st.executeStep();
+        };
+        const bool old_dumps = keyed_by_pubkey("pending_dumps");
+        const bool old_deliveries = keyed_by_pubkey("pending_deliveries");
+        if (old_dumps || old_deliveries)
+            log::info(logcat, "Upgrading database schema: keying pending dumps/deliveries by id");
+        if (old_dumps)
+            db.exec("ALTER TABLE pending_dumps RENAME TO pending_dumps_old");
+        if (old_deliveries)
+            db.exec(R"(
+DROP INDEX pending_deliveries_message;
+ALTER TABLE pending_deliveries RENAME TO pending_deliveries_old;
+            )");
+
+        // Not part of the pre_swarm_sync upgrade: databases that already went through it exist, and
+        // this is cheap to apply unconditionally.
         db.exec(R"(
+-- The nodes that pending dumps and deliveries go to, so that those rows refer to their recipient by
+-- id rather than each repeating its pubkey.  Recipients that neither table refers to any more are
+-- removed by Database::clean_pending_recipients.
+CREATE TABLE IF NOT EXISTS pending_recipients (
+    id INTEGER PRIMARY KEY,
+    pubkey BLOB NOT NULL UNIQUE
+);
+
 CREATE TABLE IF NOT EXISTS pending_dumps (
-    pubkey BLOB NOT NULL,
+    recipient INTEGER NOT NULL REFERENCES pending_recipients(id),
     swarm INTEGER NOT NULL,
     next_id INTEGER NOT NULL,
     end_id INTEGER NOT NULL,
     next_attempt DOUBLE PRECISION NOT NULL DEFAULT 0,
-    PRIMARY KEY(pubkey, swarm)
+    PRIMARY KEY(recipient, swarm)
 );
 
 CREATE TABLE IF NOT EXISTS pending_deliveries (
-    pubkey BLOB NOT NULL,
+    recipient INTEGER NOT NULL REFERENCES pending_recipients(id),
     message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    PRIMARY KEY(pubkey, message)
+    PRIMARY KEY(recipient, message)
 ) WITHOUT ROWID;
 
 -- Deleting a message has to find its pending deliveries, if any
 CREATE INDEX IF NOT EXISTS pending_deliveries_message ON pending_deliveries(message);
         )");
+
+        // (The `WHERE true`s are needed for an upsert on INSERT ... SELECT: without one sqlite would
+        // parse the ON of ON CONFLICT as a join constraint.)
+        if (old_dumps)
+            db.exec(R"(
+INSERT INTO pending_recipients (pubkey) SELECT pubkey FROM pending_dumps_old WHERE true
+    ON CONFLICT DO NOTHING;
+INSERT INTO pending_dumps (recipient, swarm, next_id, end_id, next_attempt)
+    SELECT pending_recipients.id, swarm, next_id, end_id, next_attempt
+    FROM pending_dumps_old JOIN pending_recipients USING (pubkey);
+DROP TABLE pending_dumps_old;
+            )");
+        if (old_deliveries)
+            db.exec(R"(
+INSERT INTO pending_recipients (pubkey) SELECT pubkey FROM pending_deliveries_old WHERE true
+    ON CONFLICT DO NOTHING;
+INSERT INTO pending_deliveries (recipient, message)
+    SELECT pending_recipients.id, message
+    FROM pending_deliveries_old JOIN pending_recipients USING (pubkey);
+DROP TABLE pending_deliveries_old;
+            )");
+
+        transaction.commit();
 
         views_triggers_indices();
         log::info(logcat, "Database setup complete");
@@ -1300,15 +1353,25 @@ int64_t Database::max_message_id() {
     return db_->conn().prepared_get<int64_t>("SELECT COALESCE(MAX(id), 0) FROM messages");
 }
 
+static constexpr auto insert_pending_recipient =
+        "INSERT INTO pending_recipients (pubkey) VALUES (?) ON CONFLICT DO NOTHING"sv;
+
 void Database::queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, int64_t end_id) {
     auto conn = db_->conn();
+
+    // One transaction so that clean_pending_recipients can't remove a new recipient before the
+    // dump refers to it.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    conn.prepared_exec(insert_pending_recipient, pubkey.str());
     conn.prepared_exec(
-            "INSERT INTO pending_dumps (pubkey, swarm, next_id, end_id) VALUES (?, ?, 1, ?)"
-            " ON CONFLICT (pubkey, swarm) DO UPDATE SET"
+            "INSERT INTO pending_dumps (recipient, swarm, next_id, end_id)"
+            " SELECT id, ?, 1, ? FROM pending_recipients WHERE pubkey = ?"
+            " ON CONFLICT (recipient, swarm) DO UPDATE SET"
             " next_id = 1, end_id = MAX(pending_dumps.end_id, excluded.end_id), next_attempt = 0",
-            pubkey.str(),
             static_cast<int64_t>(swarm),
-            end_id);
+            end_id,
+            pubkey.str());
+    transaction.commit();
 }
 
 std::vector<Database::pending_dump> Database::pending_dumps() {
@@ -1316,7 +1379,8 @@ std::vector<Database::pending_dump> Database::pending_dumps() {
     std::vector<pending_dump> result;
     for (auto& [pk, swarm, next_id, end_id, next_attempt] :
          get_all<std::string, int64_t, int64_t, int64_t, double>(conn.prepared_st(
-                 "SELECT pubkey, swarm, next_id, end_id, next_attempt FROM pending_dumps")))
+                 "SELECT pubkey, swarm, next_id, end_id, next_attempt"
+                 " FROM pending_dumps JOIN pending_recipients ON pending_recipients.id = recipient")))
         result.push_back(
                 {crypto::legacy_pubkey::from_bytes(pk),
                  static_cast<uint64_t>(swarm),
@@ -1333,7 +1397,8 @@ void Database::update_dump(
         std::chrono::system_clock::time_point next_attempt) {
     auto conn = db_->conn();
     conn.prepared_exec(
-            "UPDATE pending_dumps SET next_id = ?, next_attempt = ? WHERE pubkey = ? AND swarm = ?",
+            "UPDATE pending_dumps SET next_id = ?, next_attempt = ?"
+            " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?) AND swarm = ?",
             next_id,
             to_epoch_double(next_attempt),
             pubkey.str(),
@@ -1343,7 +1408,8 @@ void Database::update_dump(
 void Database::remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm) {
     auto conn = db_->conn();
     conn.prepared_exec(
-            "DELETE FROM pending_dumps WHERE pubkey = ? AND swarm = ?",
+            "DELETE FROM pending_dumps"
+            " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?) AND swarm = ?",
             pubkey.str(),
             static_cast<int64_t>(swarm));
 }
@@ -1391,28 +1457,54 @@ std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
     return result;
 }
 
+static constexpr auto queue_delivery_sql =
+        "INSERT INTO pending_deliveries (recipient, message)"
+        " SELECT pending_recipients.id, messages.id FROM pending_recipients, messages"
+        " WHERE pending_recipients.pubkey = ?1 AND messages.hash = ?2"
+        " ON CONFLICT DO NOTHING"sv;
+
 void Database::queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash) {
-    db_->conn().prepared_exec(
-            "INSERT OR IGNORE INTO pending_deliveries (pubkey, message)"
-            " SELECT ?, id FROM messages WHERE hash = ?",
-            pubkey.str(),
-            hash);
+    auto conn = db_->conn();
+
+    // Almost always the recipient already exists and this one statement queues the delivery.
+    if (conn.prepared_exec(queue_delivery_sql, pubkey.str(), hash) > 0)
+        return;
+
+    // Nothing inserted: this is the recipient's first pending delivery (so no pending_recipients
+    // row yet), or it is already queued, or the message is gone.  Add the recipient and retry, in
+    // one transaction so that clean_pending_recipients can't remove the recipient in between, and
+    // rolled back if the retry inserts nothing either so that the recipient isn't left unused.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    conn.prepared_exec(insert_pending_recipient, pubkey.str());
+    if (conn.prepared_exec(queue_delivery_sql, pubkey.str(), hash) > 0)
+        transaction.commit();
 }
 
 std::vector<crypto::legacy_pubkey> Database::delivery_peers() {
     auto conn = db_->conn();
     std::vector<crypto::legacy_pubkey> peers;
-    auto st = conn.prepared_st("SELECT DISTINCT pubkey FROM pending_deliveries");
+    // A recipient may have only dumps pending, or nothing at all until clean_pending_recipients
+    // next runs.
+    auto st = conn.prepared_st(
+            "SELECT pubkey FROM pending_recipients WHERE EXISTS"
+            " (SELECT 1 FROM pending_deliveries WHERE recipient = pending_recipients.id)");
     while (st->executeStep())
         peers.push_back(crypto::legacy_pubkey::from_bytes(get<std::string>(st)));
     return peers;
+}
+
+void Database::clean_pending_recipients() {
+    db_->conn().prepared_exec(
+            "DELETE FROM pending_recipients WHERE"
+            " NOT EXISTS (SELECT 1 FROM pending_dumps WHERE recipient = pending_recipients.id) AND"
+            " NOT EXISTS (SELECT 1 FROM pending_deliveries WHERE recipient = pending_recipients.id)");
 }
 
 std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_batch(
         const crypto::legacy_pubkey& pubkey, size_t byte_budget) {
     auto conn = db_->conn();
     // Ordered by pending_deliveries.message rather than the equal messages.id: the primary key
-    // (pubkey, message) already yields the peer's rows in that order, but the planner does not
+    // (recipient, message) already yields the peer's rows in that order, but the planner does not
     // carry the join equality into ORDER BY and would sort the whole backlog before the byte
     // budget could stop the scan.
     auto st = conn.prepared_st(
@@ -1421,7 +1513,8 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
             " FROM pending_deliveries"
             " JOIN messages ON messages.id = pending_deliveries.message"
             " JOIN owners ON owners.id = messages.owner"
-            " WHERE pending_deliveries.pubkey = ?"
+            " WHERE pending_deliveries.recipient ="
+            " (SELECT id FROM pending_recipients WHERE pubkey = ?)"
             " ORDER BY pending_deliveries.message");
     st->bind(1, pubkey.str());
 
@@ -1455,16 +1548,24 @@ void Database::remove_deliveries(
         const crypto::legacy_pubkey& pubkey, std::span<const int64_t> ids) {
     auto conn = db_->conn();
     SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
-    auto st = conn.prepared_st("DELETE FROM pending_deliveries WHERE pubkey = ? AND message = ?");
+    auto recipient = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM pending_recipients WHERE pubkey = ?"), pubkey.str());
+    if (!recipient)
+        return;
+    auto st = conn.prepared_st(
+            "DELETE FROM pending_deliveries WHERE recipient = ? AND message = ?");
     for (auto id : ids) {
-        exec_query(st, pubkey.str(), id);
+        exec_query(st, *recipient, id);
         st->reset();
     }
     transaction.commit();
 }
 
 void Database::remove_deliveries(const crypto::legacy_pubkey& pubkey) {
-    db_->conn().prepared_exec("DELETE FROM pending_deliveries WHERE pubkey = ?", pubkey.str());
+    db_->conn().prepared_exec(
+            "DELETE FROM pending_deliveries"
+            " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?)",
+            pubkey.str());
 }
 
 void Database::remove_node_retry_request(int64_t req_id) {

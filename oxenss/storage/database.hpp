@@ -322,6 +322,11 @@ class Database {
     // Removes all pending deliveries to `pubkey`.
     void remove_deliveries(const crypto::legacy_pubkey& pubkey);
 
+    // Pending dumps and deliveries refer to their recipient node through a shared recipients
+    // table; this removes the recipients that neither refers to any more.  Meant to be called
+    // periodically.
+    void clean_pending_recipients();
+
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);

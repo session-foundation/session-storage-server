@@ -837,6 +837,7 @@ void ServiceNode::check_dumps() {
     std::lock_guard lock{dumps_mutex_};
     check_dumps_locked();
     check_deliveries_locked();
+    db->clean_pending_recipients();
 }
 
 void ServiceNode::queue_delivery(const crypto::legacy_pubkey& pk, const std::string& hash) {

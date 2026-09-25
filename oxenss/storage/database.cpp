@@ -35,6 +35,17 @@ namespace {
     using namespace session::sqlite;
     using util::to_span;
 
+    // For an INSERT that may take an ON CONFLICT DO UPDATE branch instead: sqlite's change count
+    // counts such an update the same as an insert, but only an actual insert sets the connection's
+    // last insert rowid.  It is reset beforehand, rather than compared with its previous value,
+    // because a new row can be given the rowid of one since deleted.
+    void reset_last_insert(SQLite::Database& db) {
+        sqlite3_set_last_insert_rowid(db.getHandle(), 0);
+    }
+    bool inserted_row(SQLite::Database& db) {
+        return sqlite3_last_insert_rowid(db.getHandle()) != 0;
+    }
+
     // session-sqlite's get_all yields tuples for multi-column results; several of our signatures
     // predate that and use pairs.
     template <typename A, typename B, typename... Bind>
@@ -588,6 +599,7 @@ Database::Database(std::filesystem::path db_path) : db_path_{std::move(db_path)}
     {
         auto conn = db_->conn();
         DatabaseImpl{*this, conn.sql}.initialize_database();
+        message_count_ = conn.prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
     }
 
     clean_expired();
@@ -608,13 +620,13 @@ Database::~Database() = default;
 /// relying on holding a connection; see store() for why DEFERRED is not good enough.
 
 void Database::clean_expired() {
-    db_->conn().prepared_exec(
+    message_count_ -= db_->conn().prepared_exec(
             "DELETE FROM messages WHERE expiry <= ?",
             to_epoch_ms(std::chrono::system_clock::now()));
 }
 
 int64_t Database::get_message_count() {
-    return db_->conn().prepared_get<int64_t>("SELECT COUNT(*) FROM messages");
+    return message_count_;
 }
 
 int64_t Database::get_owner_count() {
@@ -676,6 +688,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
     auto conn = db_->conn();
 
     StoreResult ret;
+    bool added = false;
     try {
 
         // IMMEDIATE, not the default DEFERRED: this transaction reads (the owner/message lookups
@@ -711,6 +724,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
             if (expiry)
                 *expiry = from_epoch_ms(exp);
         } else {
+            reset_last_insert(conn.sql);
             auto rows = conn.prepared_exec(
                     "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
                     " VALUES (?, ?, ?, ?, ?, ?)"
@@ -731,12 +745,16 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                 return StoreResult::Obsolete;
 
             ret = StoreResult::New;
+            // Not so for a newer public outbox message, which replaces the existing one
+            added = inserted_row(conn.sql);
 
             if (expiry)
                 *expiry = msg.expiry;
         }
 
         transaction.commit();
+        if (added)
+            message_count_++;
 
     } catch (const SQLite::Exception& e) {
         if (e.getErrorCode() == SQLITE_FULL) {
@@ -794,6 +812,7 @@ void Database::bulk_store(std::span<const message> items) {
             " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
             " WHERE EXCLUDED.timestamp > messages.timestamp");
 
+    int64_t added = 0;
     for (auto& m : items) {
         if (!m.pubkey)
             continue;
@@ -801,6 +820,7 @@ void Database::bulk_store(std::span<const message> items) {
         if (owner_it == seen.end())
             continue;
 
+        reset_last_insert(conn.sql);
         exec_query(
                 insert_message,
                 owner_it->second,
@@ -810,9 +830,12 @@ void Database::bulk_store(std::span<const message> items) {
                 to_epoch_ms(m.expiry),
                 to_span(m.data));
         insert_message->reset();
+        if (inserted_row(conn.sql))
+            added++;
     }
 
     t.commit();
+    message_count_ += added;
 }
 
 std::pair<std::vector<message>, bool> Database::retrieve(
@@ -911,7 +934,9 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_all(const use
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " RETURNING namespace, hash");
-    return get_all_pairs<namespace_id, std::string>(st, pubkey.raw_bytes(), pubkey.type());
+    auto deleted = get_all_pairs<namespace_id, std::string>(st, pubkey.raw_bytes(), pubkey.type());
+    message_count_ -= static_cast<int64_t>(deleted.size());
+    return deleted;
 }
 
 std::vector<std::string> Database::delete_all(const user_pubkey& pubkey, namespace_id ns) {
@@ -922,7 +947,9 @@ std::vector<std::string> Database::delete_all(const user_pubkey& pubkey, namespa
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), ns);
+    auto deleted = get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), ns);
+    message_count_ -= static_cast<int64_t>(deleted.size());
+    return deleted;
 }
 
 namespace {
@@ -968,6 +995,7 @@ std::vector<std::string> Database::delete_by_hash(
     }
 
     transaction.commit();
+    message_count_ -= static_cast<int64_t>(deleted.size());
     return deleted;
 }
 
@@ -980,8 +1008,10 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ?"
             " RETURNING namespace, hash");
-    return get_all_pairs<namespace_id, std::string>(
+    auto deleted = get_all_pairs<namespace_id, std::string>(
             st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp));
+    message_count_ -= static_cast<int64_t>(deleted.size());
+    return deleted;
 }
 
 std::vector<std::string> Database::delete_by_timestamp(
@@ -995,7 +1025,10 @@ std::vector<std::string> Database::delete_by_timestamp(
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND timestamp <= ? AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
+    auto deleted = get_all<std::string>(
+            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
+    message_count_ -= static_cast<int64_t>(deleted.size());
+    return deleted;
 }
 
 static constexpr auto ins_revoke_prefix = "INSERT INTO revoked_subaccounts (owner, token) "sv;

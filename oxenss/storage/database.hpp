@@ -57,6 +57,11 @@ class Database {
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
+    // Counted once at startup, then kept current by the methods that store and delete messages:
+    // counting them with a query reads an entire index, which is slow on a big database or slow
+    // storage.
+    std::atomic<int64_t> message_count_ = 0;
+
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
@@ -124,7 +129,8 @@ class Database {
     // Retrieves all messages.
     std::vector<message> retrieve_all();
 
-    // Return the total number of messages stored
+    // Return the total number of messages stored.  This is tracked in memory from a count taken
+    // at startup, so changes made to the database by anything else are not seen.
     int64_t get_message_count();
 
     // Returns the per-owner counts of stored messages, for storage statistics purposes.

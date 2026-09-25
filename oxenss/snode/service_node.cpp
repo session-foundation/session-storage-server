@@ -1499,8 +1499,8 @@ std::string ServiceNode::get_status_line() const {
     // status message has to be fairly short: has to fit on one line, and if
     // it's too long systemd just truncates it when displaying it.
 
-    // syncing_ is all that needs sn_mutex_; in particular the database counts below must not be
-    // made while holding it, as counting every message takes a noticeable time.
+    // syncing_ is all that needs sn_mutex_: the swarm and stats accessors lock internally, and the
+    // database has its own connection pool.
     bool syncing;
     {
         std::lock_guard guard(sn_mutex_);

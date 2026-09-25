@@ -178,6 +178,76 @@ TEST_CASE("storage - only return entries for specified pubkey", "[storage]") {
     }
 }
 
+TEST_CASE("storage - tracked message count", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    const auto now = std::chrono::system_clock::now();
+    const auto def = namespace_id::Default;
+    const auto outbox = static_cast<namespace_id>(-1);
+    using hashes = std::vector<std::string>;
+
+    // Checks the tracked count against one actually counted from the database
+    auto check = [](Database& storage, int64_t expected) {
+        int64_t actual = 0;
+        for (auto& [ns, count] : storage.get_namespace_counts())
+            actual += count;
+        CHECK(actual == expected);
+        CHECK(storage.get_message_count() == expected);
+    };
+
+    {
+        Database storage{"."};
+        for (int i = 0; i < 5; i++)
+            REQUIRE(storage.store({pk1, "a{}"_format(i), def, now, now + 1h, "data"}) ==
+                    StoreResult::New);
+        check(storage, 5);
+        REQUIRE(storage.store({pk1, "a0", def, now, now + 1h, "data"}) == StoreResult::Exists);
+        REQUIRE(storage.store({pk1, "a0", def, now, now + 2h, "data"}) == StoreResult::Extended);
+        check(storage, 5);
+
+        // A public outbox holds one message: a newer one replaces it, an older one is refused
+        REQUIRE(storage.store({pk1, "o1", outbox, now, now + 1h, "data"}) == StoreResult::New);
+        REQUIRE(storage.store({pk1, "o2", outbox, now + 1s, now + 1h, "data"}) ==
+                StoreResult::New);
+        REQUIRE(storage.store({pk1, "o0", outbox, now - 1s, now + 1h, "data"}) ==
+                StoreResult::Obsolete);
+        check(storage, 6);
+
+        // Two new messages, one already stored, and another outbox replacement
+        storage.bulk_store(std::vector<message>{
+                {pk2, "b0", def, now - 10s, now + 1h, "data"},
+                {pk2, "b1", def, now, now + 1h, "data"},
+                {pk1, "a1", def, now, now + 3h, "data"},
+                {pk1, "o3", outbox, now + 2s, now + 1h, "data"}});
+        check(storage, 8);
+
+        CHECK(storage.delete_by_hash(pk1, hashes{"a1", "a2", "nope"}).size() == 2);
+        check(storage, 6);
+        CHECK(storage.delete_all(pk1, def).size() == 3);
+        check(storage, 3);
+        CHECK(storage.delete_by_timestamp(pk2, def, now - 5s).size() == 1);
+        check(storage, 2);
+        CHECK(storage.delete_by_timestamp(pk2, now).size() == 1);
+        check(storage, 1);
+
+        REQUIRE(storage.store({pk2, "gone", def, now - 2h, now - 1h, "data"}) ==
+                StoreResult::New);
+        check(storage, 2);
+        storage.clean_expired();
+        check(storage, 1);
+        REQUIRE(storage.store({pk2, "c0", def, now, now + 1h, "data"}) == StoreResult::New);
+        CHECK(storage.delete_all(pk1).size() == 1);
+        check(storage, 1);
+    }
+
+    // Counted afresh on startup
+    Database storage{"."};
+    check(storage, 1);
+}
+
 TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
     StorageDeleter fixture;
 

@@ -1025,12 +1025,12 @@ std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey
     return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
-static const auto update_expiry_any =
-        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3"s;
-static const auto update_expiry_extend =
-        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry < ?1"s;
-static const auto update_expiry_shorten =
-        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry > ?1"s;
+static constexpr auto update_expiry_any =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3"sv;
+static constexpr auto update_expiry_extend =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry < ?1"sv;
+static constexpr auto update_expiry_shorten =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry > ?1"sv;
 
 std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Database::update_expiry(
         const user_pubkey& pubkey,

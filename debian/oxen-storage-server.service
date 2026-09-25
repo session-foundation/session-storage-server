@@ -7,6 +7,7 @@ After=oxen-node.service
 [Service]
 User=_loki
 Type=notify
+TimeoutStartSec=10min
 WatchdogSec=5min
 WorkingDirectory=/var/lib/oxen
 LimitNOFILE=16384

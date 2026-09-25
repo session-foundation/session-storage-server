@@ -228,6 +228,18 @@ TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]
     CHECK(storage.get_expiries(pk2, hashes{"other", "h1"}) == expiries{{"other", exp1h}});
     CHECK(storage.update_expiry(nobody, hashes{"h1", "h2"}, std::array{now + 5h}).empty());
 
+    // A repeat can't match a second time under an extend or shorten constraint either
+    updated = storage.update_expiry(
+            pk1, hashes{"h2", "h2"}, std::array{now + 150min}, /*extend_only=*/true);
+    CHECK(updated == updates{{"h2", now + 150min}});
+    updated = storage.update_expiry(
+            pk1,
+            hashes{"h2", "h2"},
+            std::array{now + 140min},
+            /*extend_only=*/false,
+            /*shorten_only=*/true);
+    CHECK(updated == updates{{"h2", now + 140min}});
+
     auto deleted = storage.delete_by_hash(pk1, hashes{"h4", "h1", "other", "nope", "h1"});
     std::ranges::sort(deleted);
     CHECK(deleted == hashes{"h1", "h4"});

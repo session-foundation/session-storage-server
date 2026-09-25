@@ -1064,11 +1064,13 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
             : shorten_only ? update_expiry_shorten
                            : update_expiry_any);
 
-    // With a single expiry a repeated hash has to be reported updated only once, but with no
-    // extend/shorten constraint the repeat would match (and so count as updated) again.
+    // A repeated hash has to be reported updated only once.  With a single expiry and an
+    // extend/shorten constraint a repeat can't match again (the row's expiry now equals the one
+    // being set), but with neither constraint it would.
+    const bool dedupe = new_exp.size() == 1 && !extend_only && !shorten_only;
     std::unordered_set<std::string_view> seen;
     for (size_t i = 0; i < msg_hashes.size(); i++) {
-        if (new_exp.size() == 1 && !seen.insert(msg_hashes[i]).second)
+        if (dedupe && !seen.insert(msg_hashes[i]).second)
             continue;
         auto exp = new_exp.size() == 1 ? new_exp[0] : new_exp[i];
         if (exec_query(st, to_epoch_ms(exp), msg_hashes[i], *owner) > 0)

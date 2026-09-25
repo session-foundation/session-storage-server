@@ -106,7 +106,7 @@ QUIC::QUIC(
     // give them threads and a queue, and keep client requests and node-to-node commands (small and
     // latency-sensitive: forwarded client commands, onion hops, handshakes) from queueing behind,
     // or being dropped in favour of, each other.  Message batches go to the `bulkdata` category
-    // that OMQ creates, shared with batches arriving over oxenmq.
+    // that OMQ creates.
     auto& omq = *service_node_->omq_server();
     omq.add_category("quic", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
     omq.add_category(

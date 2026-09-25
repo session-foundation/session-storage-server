@@ -75,10 +75,9 @@ void OMQ::handle_sn_data(oxenmq::Message& message) {
         return;
     }
 
-    // Onto the same queue as batches arriving over QUIC (see the bulkdata category); the body has
-    // to be copied because the message does not outlive this handler.
+    // The body has to be copied because the message does not outlive this handler.
     omq_.inject_task(
-            "bulkdata",
+            "bulkdata_omq",
             "sn.data",
             message.remote,
             [this,
@@ -230,14 +229,21 @@ OMQ::OMQ(
         })
         ;
 
-    // Incoming message batches (swarm dumps and deliveries), whichever transport they arrived
-    // over: each is up to a megabyte and ends in a bulk database write, so they get their own
-    // queue rather than holding up the small, latency-sensitive node-to-node commands, and one
-    // thread, since the database serialises writers and more would only contend.  A full queue
-    // drops the task, which the sender sees as a timeout and answers by resending the window, so
-    // the queue is deep enough for every peer to have a full window in flight at once.  Only
-    // injected tasks land here (see handle_sn_data and QUIC::handle_request).
+    // Incoming message batches (swarm dumps and deliveries) arriving over QUIC: each is up to a
+    // megabyte and ends in a bulk database write, so they get their own queue rather than holding
+    // up the small, latency-sensitive node-to-node commands, and one thread, since the database
+    // serialises writers and more would only contend.  A full queue drops the task, which the
+    // sender sees as a timeout and answers by resending the window, so the queue is deep enough
+    // for every peer to have a full window in flight at once.  Only injected tasks land here (see
+    // QUIC::handle_request).
     omq_.add_category("bulkdata", oxenmq::AuthLevel::basic, 1 /*reserved threads*/, 200 /*max queue*/);
+
+    // The same for batches arriving over oxenmq (see handle_sn_data), kept apart so that they
+    // cannot crowd out the paced QUIC ones: a pre-2.12 peer sends its entire database in 9MB
+    // batches all at once, never retries one that fails, and never gets asked again, so a dropped
+    // batch is a permanent gap.  The depth matches what 2.11.x allowed the same blast in its "sn"
+    // category.  This goes away with the oxenmq listener.
+    omq_.add_category("bulkdata_omq", oxenmq::AuthLevel::basic, 1 /*reserved threads*/, 1000 /*max queue*/);
 
     // storage.WHATEVER (e.g. storage.store, storage.retrieve, etc.) endpoints are invokable by
     // anyone (i.e. clients) and have the same WHATEVER endpoints as the "method" values for the

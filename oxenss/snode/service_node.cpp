@@ -248,6 +248,8 @@ static std::optional<block_update> parse_swarm_update(
 }
 
 void ServiceNode::register_mq_server(server::MQBase* server) {
+    if (quic_server_)
+        throw std::logic_error{"register_mq_server called more than once"};
     mq_servers_.push_back(server);
     quic_server_ = server;
 }

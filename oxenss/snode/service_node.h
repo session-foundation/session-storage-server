@@ -138,6 +138,10 @@ class ServiceNode {
     Swarm swarm_;
 
     server::OMQ& omq_server_;
+
+    // DO NOT MODIFY THESE AFTER STARTUP.  They are set up by the constructor and by the single
+    // register_mq_server call made before the servers start accepting requests, and from then on
+    // are read with no lock held (by stores, notifications, and sn_request, from any thread).
     std::vector<server::MQBase*> mq_servers_;
     // The QUIC server, once registered: node-to-node requests go to it first, and it hands back
     // those for nodes that do not speak QUIC to be sent over oxenmq (see sn_request).
@@ -257,8 +261,10 @@ class ServiceNode {
 
     const contact& own_address() { return our_contact_; }
 
-    // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
-    // should not be added.
+    // Adds the QUIC MQ server.  The OMQ server is added automatically during construction and
+    // should not be added.  This must be called exactly once, during startup, before either server
+    // starts accepting requests: the server list is read without locking from then on.  Throws if
+    // called a second time.
     void register_mq_server(server::MQBase* server);
 
     // Sets the http client needed to perform HTTPS reachability tests

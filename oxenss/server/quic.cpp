@@ -371,7 +371,8 @@ void QUIC::sn_request(
         else if (!parts.empty())
             body = oxenc::bt_serialize(parts);
 
-        const bool storage_cc = cmd == "storage_cc", onion = cmd == "onion_request";
+        const bool storage_cc = cmd == "storage_cc", onion = cmd == "onion_request",
+                   data_ready = cmd == "data_ready";
         const auto kind = cmd == "data" ? sn_stream_kind::data
                         : onion         ? sn_stream_kind::onion
                                         : sn_stream_kind::command;
@@ -384,6 +385,7 @@ void QUIC::sn_request(
                  reply,
                  storage_cc,
                  onion,
+                 data_ready,
                  kind,
                  timeout](std::shared_ptr<quic::Connection> conn) {
                     if (!conn)
@@ -410,10 +412,20 @@ void QUIC::sn_request(
                     }
 
                     stream->command(
-                            cmd, body, timeout, [reply, storage_cc, onion](quic::message m) {
+                            cmd,
+                            body,
+                            timeout,
+                            [reply, storage_cc, onion, data_ready](quic::message m) {
                                 if (m.timed_out)
                                     return reply(false, {"TIMEOUT"s});
                                 std::string b{m.body()};
+
+                                // A handshake reply is the peer's info on success or the refusal
+                                // reason (see handle_sn_data_ready); oxenmq's shape puts the "OK"
+                                // in front of the former.
+                                if (data_ready)
+                                    return m.is_error() ? reply(true, {std::move(b)})
+                                                        : reply(true, {"OK"s, std::move(b)});
 
                                 if (onion) {
                                     // A hop reply is a bt list of [code, body] (see
@@ -638,8 +650,13 @@ void QUIC::handle_sn_data_ready(quic::message msg, const crypto::ed25519_pubkey&
     auto pk = service_node_->contacts().lookup(peer);
     if (!pk)
         return msg.respond("Swarm mismatch", true);
+    // The reply's oxenmq shape is ["OK", info] or [reason]; here the error flag carries the
+    // distinction and the body is the info or the reason (see the data_ready case in sn_request).
     auto reply = service_node_->data_ready_handshake(*pk, msg.body());
-    msg.respond(reply, reply != "OK");
+    if (reply.size() > 1 && reply[0] == "OK")
+        msg.respond(std::move(reply[1]));
+    else
+        msg.respond(std::move(reply[0]), true);
 }
 
 void QUIC::handle_sn_storage_cc(quic::message msg) {

@@ -62,8 +62,9 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
     if (!pk)
         return message.send_reply("Swarm mismatch");
 
-    message.send_reply(service_node_->data_ready_handshake(
-            *pk, message.data.empty() ? std::string_view{} : message.data[0]));
+    auto reply = service_node_->data_ready_handshake(
+            *pk, message.data.empty() ? std::string_view{} : message.data[0]);
+    message.send_reply(oxenmq::send_option::data_parts(reply));
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {

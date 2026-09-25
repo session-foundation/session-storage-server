@@ -89,10 +89,6 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 // The storage server version at which initial handshaking is supported before attempting a swarm
 // message transfer.
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
-// The storage server version at which the sn.data_ready handshake carries a request payload (which
-// lets the new member ask us for a copy of the swarm's messages).  Older versions ignore any
-// payload, and send none.
-inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 12, 0};
 
 // The storage server version from which node-to-node traffic goes over a held QUIC connection
 // (negotiated with server::SN_ALPN) rather than oxenmq.  Older versions only accept the client
@@ -353,9 +349,11 @@ class ServiceNode {
     void queue_swarm_dump(const crypto::legacy_pubkey& pk);
 
     // Handles a data_ready handshake from swarm member `pk` (see check_new_members).  `payload`
-    // is the request payload, empty from pre-2.12 nodes.  Returns the reply to send: "OK", or a
-    // reason the handshake was refused.
-    std::string data_ready_handshake(const crypto::legacy_pubkey& pk, std::string_view payload);
+    // is the request payload, empty from pre-2.12 nodes.  Returns the reply parts to send: "OK"
+    // followed by a bt dict about us (currently just our version under "#"), or a single reason
+    // the handshake was refused.
+    std::vector<std::string> data_ready_handshake(
+            const crypto::legacy_pubkey& pk, std::string_view payload);
 
     // Sends a node-to-node request to `ct` (see server::MQBase::sn_request): over QUIC for a node
     // that speaks it, over oxenmq for the rest.

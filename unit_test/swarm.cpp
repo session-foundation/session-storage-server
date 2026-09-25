@@ -353,6 +353,13 @@ TEST_CASE("swarm - when we ask our peers for the swarm's messages", "[swarm]") {
                 result.insert(pk);
         return result;
     };
+    auto joined = [](const Swarm& swarm) {
+        pks result;
+        for (const auto& [pk, state] : swarm.members())
+            if (state.joined_our_swarm)
+                result.insert(pk);
+        return result;
+    };
 
     oxenmq::OxenMQ omq;
 
@@ -364,6 +371,8 @@ TEST_CASE("swarm - when we ask our peers for the swarm's messages", "[swarm]") {
 
         swarm.update_swarms(1, swarms_t{swarms}, {});
         CHECK(requested(swarm) == pks{peer1, peer2});
+        // Members found at startup did not join us; they merely predate the restart.
+        CHECK(joined(swarm).empty());
     }
 
     SECTION("first update with our swarm's messages present asks nobody") {
@@ -381,20 +390,23 @@ TEST_CASE("swarm - when we ask our peers for the swarm's messages", "[swarm]") {
         Swarm swarm{network, us, db};
         swarm.update_swarms(1, swarms_t{swarms}, {});
         CHECK(requested(swarm).empty());
+        CHECK(joined(swarm).empty());
         // The peers are still tracked, for the handshake.
         CHECK(swarm.members().size() == 2);
 
-        // A peer joining our swarm is not asked; it asks us.
+        // A peer joining our swarm is not asked; it asks us (or, if too old to ask, gets pushed
+        // to), so it is the one flagged as having joined.
         swarms[100].insert(peer4);
         swarm.update_swarms(2, swarms_t{swarms}, {});
         CHECK(requested(swarm).empty());
-        CHECK(swarm.members().count(peer4) == 1);
+        CHECK(joined(swarm) == pks{peer4});
 
-        // Moving to another swarm asks all of its members.
+        // Moving to another swarm asks all of its members, none of which joined us.
         swarms[100].erase(us);
         swarms[200].insert(us);
         swarm.update_swarms(3, swarms_t{swarms}, {});
         CHECK(requested(swarm) == pks{peer3});
+        CHECK(joined(swarm).empty());
         CHECK(swarm.members().size() == 1);
     }
 }

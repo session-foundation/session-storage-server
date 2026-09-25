@@ -37,11 +37,14 @@ class Network {
 
     friend class Swarm;
 
-    swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
+    friend class ServiceNode;
 
     // Cached value of the all_nodes_blob() return value.  The cache is cleared whenever swarms or
     // any contact info changes.
     mutable std::shared_ptr<std::vector<std::byte>> all_nodes_blob_;
+
+    // The lowest storage server version among contactable nodes, {0,0,0} until we have any.
+    std::array<uint16_t, 3> min_peer_version_{};
 
     // Processes a swarm update; this replaces the current swarm map with the given one, and updates
     // contacts to remove any no-longer-present nodes, add any new ones, and update any changed
@@ -53,16 +56,28 @@ class Network {
             swarms_t&& new_swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts);
 
   public:
+    // The (lower, upper] swarm space range owned by `swarm`, which must be a key of `swarms`: the
+    // lower bound is the midpoint to the previous swarm and the upper the midpoint to the next,
+    // wrapping around past UINT64_MAX; a pubkey exactly on a boundary belongs to the lower swarm.
+    // Returns (0, 0), meaning the whole space, when there is only one swarm.
+    static std::pair<uint64_t, uint64_t> swarm_boundaries(const swarms_t& swarms, swarm_id_t swarm);
+
+    // swarm_boundaries() on the current swarm list.
+    std::pair<uint64_t, uint64_t> get_swarm_boundaries(swarm_id_t swarm) const;
+
+    // The lowest storage server version any contactable node on the network reports, as of the
+    // last swarm update; {0,0,0} before the first.
+    std::array<uint16_t, 3> min_peer_version() const;
+
+    swarms_t::const_iterator _find_swarm_for(const user_pubkey& pk) const;
+    swarms_t::const_iterator _find_swarm_for_swarm_space(const swarm_id_t swarm_pos) const;
+
     /// Constructs a Network object.  The omq instance will be passed to `contacts` so that any
     /// x25519 pubkey list changes are automatically propagated to oxenmq for SN authentication.
     Network(oxenmq::OxenMQ& omq);
 
     // Holds all current contact information for network nodes.
     Contacts contacts;
-
-    /// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
-    /// has a swarm id closest to this pubkey-derived value.
-    static uint64_t pubkey_to_swarm_space(const user_pubkey& pk);
 
     // Looks up the swarm for a pubkey and returns the swarm_id.  Returns nullopt on error (which
     // will only happen if there are no swarms at all).
@@ -97,6 +112,8 @@ class Network {
     // This value is cached and recomputed whenever swarms or contact info of any active node
     // changes.
     std::shared_ptr<std::vector<std::byte>> all_nodes_blob() const;
+
+    std::set<swarm_id_t> get_all_swarm_ids() const;
 };
 
 }  // namespace oxenss::snode

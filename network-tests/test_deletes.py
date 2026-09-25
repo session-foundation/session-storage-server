@@ -1,4 +1,3 @@
-from util import sn_address
 import ss
 import time
 import base64
@@ -9,12 +8,12 @@ from nacl.signing import VerifyKey
 import nacl.exceptions
 
 
-def test_delete_all(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_delete_all(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 5)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -23,7 +22,7 @@ def test_delete_all(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "timestamp": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[1], 'storage.delete_all', [params]).get()
+    resp = rpc.request(conns[1], 'delete_all', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -39,9 +38,9 @@ def test_delete_all(omq, random_sn, sk, exclude):
         edpk = VerifyKey(k, encoder=HexEncoder)
         edpk.verify(expected_signed, base64.b64decode(v['signature']))
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -59,19 +58,19 @@ def test_delete_all(omq, random_sn, sk, exclude):
     assert not r['messages']
 
 
-def test_delete_all_all(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_delete_all_all(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 5)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
     ts = int(time.time() * 1000)
 
-    h42 = omq.request_future(
+    h42 = rpc.request(
         conns[0],
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -96,7 +95,7 @@ def test_delete_all_all(omq, random_sn, sk, exclude):
         {"pubkey": my_ss_id, "timestamp": ts, "signature": sig, "namespace": "all"}
     ).encode()
 
-    resp = omq.request_future(conns[1], 'storage.delete_all', [params]).get()
+    resp = rpc.request(conns[1], 'delete_all', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -113,9 +112,9 @@ def test_delete_all_all(omq, random_sn, sk, exclude):
         edpk = VerifyKey(k, encoder=HexEncoder)
         edpk.verify(expected_signed, base64.b64decode(v['signature']))
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -133,12 +132,12 @@ def test_delete_all_all(omq, random_sn, sk, exclude):
     assert not r['messages']
 
 
-def test_stale_delete_all(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_stale_delete_all(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sn = ss.random_swarm_members(swarm, 2, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    msgs = ss.store_n(omq, conn, sk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 5)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -147,25 +146,25 @@ def test_stale_delete_all(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = {"pubkey": my_ss_id, "timestamp": ts, "signature": sig}
 
-    resp_too_old = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()])
+    resp_too_old = rpc.request(conn, 'delete_all', [json.dumps(params).encode()])
 
     ts = int((time.time() + 120) * 1000)
     to_sign = "delete_all{}".format(ts).encode()
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params["signature"] = sig
 
-    resp_too_new = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()])
+    resp_too_new = rpc.request(conn, 'delete_all', [json.dumps(params).encode()])
 
     assert resp_too_old.get() == [b'406', b'delete_all timestamp too far from current time']
     assert resp_too_new.get() == [b'406', b'delete_all timestamp too far from current time']
 
 
-def test_delete(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, netid=2)
+def test_delete(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, netid=2)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 5, netid=2)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 5, netid=2)
 
     my_ss_id = '02' + sk.verify_key.encode().hex()
 
@@ -179,7 +178,7 @@ def test_delete(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "messages": del_msgs, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[1], 'storage.delete', [params]).get()
+    resp = rpc.request(conns[1], 'delete', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -197,9 +196,9 @@ def test_delete(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -217,12 +216,12 @@ def test_delete(omq, random_sn, sk, exclude):
     assert len(r['messages']) == 3
 
 
-def test_delete_required(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, netid=2)
+def test_delete_required(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, netid=2)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 2, netid=2)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 2, netid=2)
 
     my_ss_id = '02' + sk.verify_key.encode().hex()
 
@@ -233,30 +232,30 @@ def test_delete_required(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = {"pubkey": my_ss_id, "messages": del_msgs, "required": True, "signature": sig}
 
-    resp = omq.request_future(conns[1], 'storage.delete', [json.dumps(params)]).get()
+    resp = rpc.request(conns[1], 'delete', [json.dumps(params)]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
 
     # Submit again; since they are already deleted, this should give back a 404
-    resp = omq.request_future(conns[1], 'storage.delete', [json.dumps(params)]).get()
+    resp = rpc.request(conns[1], 'delete', [json.dumps(params)]).get()
 
     assert len(resp) == 2
     assert resp[0] == b'404'
 
     # Make sure we don't get a 404 without required specified, even when nothing found:
     del params["required"]
-    resp = omq.request_future(conns[1], 'storage.delete', [json.dumps(params)]).get()
+    resp = rpc.request(conns[1], 'delete', [json.dumps(params)]).get()
 
     assert len(resp) == 1
 
 
-def test_delete_before(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_delete_before(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 10)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 10)
 
     # store_n submits msgs with decreasing timestamps:
     assert all(
@@ -273,7 +272,7 @@ def test_delete_before(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "before": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[1], 'storage.delete_before', [params]).get()
+    resp = rpc.request(conns[1], 'delete_before', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -291,9 +290,9 @@ def test_delete_before(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -316,7 +315,7 @@ def test_delete_before(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "before": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[0], 'storage.delete_before', [params]).get()
+    resp = rpc.request(conns[0], 'delete_before', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -334,9 +333,9 @@ def test_delete_before(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -361,7 +360,7 @@ def test_delete_before(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "before": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[0], 'storage.delete_before', [params]).get()
+    resp = rpc.request(conns[0], 'delete_before', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -379,9 +378,9 @@ def test_delete_before(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -406,7 +405,7 @@ def test_delete_before(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "before": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[1], 'storage.delete_before', [params]).get()
+    resp = rpc.request(conns[1], 'delete_before', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -424,9 +423,9 @@ def test_delete_before(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[1],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {

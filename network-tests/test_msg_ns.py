@@ -1,4 +1,3 @@
-from util import sn_address
 import ss
 import time
 import base64
@@ -13,19 +12,19 @@ def b64(data: bytes):
     return base64.b64encode(data).decode()
 
 
-def test_store_ns(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_store_ns(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message (publicly depositable namespace, divisible by 10)
-    spub = omq.request_future(
+    spub = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -40,9 +39,9 @@ def test_store_ns(omq, random_sn, sk, exclude):
     )
 
     # Store a message for myself in a private namespace (not divisible by 10)
-    spriv = omq.request_future(
+    spriv = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -98,9 +97,9 @@ def test_store_ns(omq, random_sn, sk, exclude):
     # NB: assumes the test machine is reasonably time synced
     assert ts - 30000 <= spriv['t'] <= ts + 30000
 
-    rpub = omq.request_future(
+    rpub = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -114,9 +113,9 @@ def test_store_ns(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    rpriv = omq.request_future(
+    rpriv = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -130,9 +129,9 @@ def test_store_ns(omq, random_sn, sk, exclude):
             ).encode()
         ],
     )
-    rdenied = omq.request_future(
+    rdenied = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {"pubkey": '05' + sk.verify_key.encode().hex(), "timestamp": ts, "namespace": 40}
@@ -155,23 +154,23 @@ def test_store_ns(omq, random_sn, sk, exclude):
     assert rdenied.get() == [b'400', b"invalid request: Required field 'signature' missing"]
 
 
-def test_legacy_closed_ns(omq, random_sn, sk, exclude):
+def test_legacy_closed_ns(rpc, random_sn, sk, exclude):
     # For legacy closed groups the secret key is generated but then immediately discarded; it's only
     # used to generate a primary key storage address:
 
-    swarm = ss.get_swarm(omq, random_sn, sk)
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # namespace -10 is a special, no-auth namespace for legacy closed group messages.
-    sclosed = omq.request_future(
+    sclosed = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -205,9 +204,9 @@ def test_legacy_closed_ns(omq, random_sn, sk, exclude):
     assert ts - 30000 <= sclosed['t'] <= ts + 30000
 
     # Now retrieve it: this is the only namespace we can access without authentication
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex(), "namespace": -10}).encode()],
     )
 
@@ -223,18 +222,18 @@ def test_legacy_closed_ns(omq, random_sn, sk, exclude):
     assert msg['hash'] == hash
 
 
-def test_store_invalid_ns(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_store_invalid_ns(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     # Attempt to store a message without authentication in a non-public (% 10 != 0) namespace:
-    s42 = omq.request_future(
+    s42 = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -249,9 +248,9 @@ def test_store_invalid_ns(omq, random_sn, sk, exclude):
     )
 
     # Attempt to store a message in a too-big/too-small namespace:
-    s32k = omq.request_future(
+    s32k = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -267,9 +266,9 @@ def test_store_invalid_ns(omq, random_sn, sk, exclude):
 
     # Bad signature:
     dude_sk = SigningKey.generate()
-    sdude = omq.request_future(
+    sdude = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -294,11 +293,11 @@ def test_store_invalid_ns(omq, random_sn, sk, exclude):
     assert sdude.get() == [b'401', b"store signature verification failed"]
 
 
-def test_public_outbox(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_public_outbox(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 60000
@@ -306,9 +305,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
 
     # Attempt to store a message without authentication in a public outbox (-1, -21, -41, ...)
     # namespace without authentication:
-    s1 = omq.request_future(
+    s1 = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -323,9 +322,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     )
 
     # Another store, this time *with* authentication:
-    s2 = omq.request_future(
+    s2 = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -349,9 +348,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     h1 = r["hash"]
 
     # *Unauthenticated* retrieval:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex(), "namespace": -1}).encode()],
     ).get()
     assert len(r) == 1
@@ -364,9 +363,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     }
 
     # Store another message to the namespace, which should replace the earlier one
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -387,9 +386,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     r = json.loads(r[0])
     h2 = r["hash"]
 
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex(), "namespace": -1}).encode()],
     ).get()
     assert len(r) == 1
@@ -406,9 +405,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     # Store the same message again, this time it should just update the ttl but *not* the timestamp
     # (which indicates that it properly recognized the duplicate and didn't wipe-and-store-again on
     # it).
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.store',
+        'store',
         [
             json.dumps(
                 {
@@ -429,9 +428,9 @@ def test_public_outbox(omq, random_sn, sk, exclude):
     r = json.loads(r[0])
     assert r["hash"] == h2
 
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [json.dumps({"pubkey": '05' + sk.verify_key.encode().hex(), "namespace": -1}).encode()],
     ).get()
     assert len(r) == 1

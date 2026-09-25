@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <span>
 #include <string>
 
 namespace oxenss {
@@ -13,20 +15,18 @@ class user_pubkey {
     int network_ = -1;
     std::string pubkey_;
 
-    user_pubkey(int network, std::string raw_pk) : network_{network}, pubkey_{std::move(raw_pk)} {}
-
     friend class DatabaseImpl;
 
   public:
     // Default constructor; constructs an invalid pubkey
     user_pubkey() = default;
 
+    user_pubkey(int network, std::string raw_pk) : network_{network}, pubkey_{std::move(raw_pk)} {}
+
     // bool conversion: returns true if this object contains a valid pubkey
     explicit operator bool() const { return !pubkey_.empty(); }
 
-    bool operator==(const user_pubkey& other) const {
-        return type() == other.type() && raw() == other.raw();
-    }
+    bool operator==(const user_pubkey& other) const = default;
 
     // Replaces the stored pubkey with one parsed from the string `pk`.  `pk` can be either raw
     // bytes (33 bytes of netid + pubkey), or hex (66 hex digits).  If `pk` is not a valid
@@ -52,10 +52,18 @@ class user_pubkey {
     // Returns the raw bytes that make up the pubkey (not including the type/network prefix).
     const std::string& raw() const { return pubkey_; }
 
+    // As raw(), but as a byte span, which is what binds as a database BLOB (a std::string binds as
+    // TEXT).  The span points at this object's storage, so it must not outlive it.
+    std::span<const std::byte> raw_bytes() const { return std::as_bytes(std::span{pubkey_}); }
+
     // Returns the raw bytes that makes up the pubkey, including the type/network prefix byte.
     // Returns an empty string for an invalid (default constructed) pubkey.
     std::string prefixed_raw() const;
 };
+
+/// Maps a pubkey into a 64-bit "swarm space" value; the swarm you belong to is whichever one
+/// has a swarm id closest to this pubkey-derived value.
+uint64_t pubkey_to_swarm_space(const user_pubkey& pk);
 
 }  // namespace oxenss
 

@@ -10,50 +10,79 @@
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
-#include <stack>
+#include <span>
 #include <string>
 #include <vector>
+#include "oxenss/crypto/keys.h"
+
+namespace session::sqlite {
+class Connection;
+class Database;
+}  // namespace session::sqlite
 
 namespace oxenss {
 
 using namespace std::literals;
-
-class DatabaseImpl;
-class LockedDBImpl;
 
 /// Possible return values of a `store()`:
 enum class StoreResult {
     New,       // Message did not exist and was inserted.
     Extended,  // Message existed, but the expiry was extended to match the stored timestamp.
     Exists,    // Message exists and already has an expiry >= the stored one.
+    Obsolete,  // Newer message exists and message type is singleton (e.g. public outbox)
     Full,      // Can't insert right now because the database is full.
 };
 
 // Storage database class.
 class Database {
-    std::stack<std::unique_ptr<DatabaseImpl>> impl_pool_;
+    // Held by pointer so that this header does not have to pull in SQLiteCpp.
+    std::unique_ptr<session::sqlite::Database> db_;
     friend class DatabaseImpl;
-    friend class LockedDBImpl;
-    std::mutex impl_lock_;
-    std::shared_mutex access_lock_;
-    LockedDBImpl get_impl(bool write);
+
+    // Applied to every connection the pool opens, not just the first.
+    void setup_connection(session::sqlite::Connection& conn);
 
     const std::filesystem::path db_path_;
 
+    // Constant for the database, but written from whichever thread opens a connection, so atomic
+    // even though every write stores the same value.
+    std::atomic<int> page_size_ = 0;
+
     friend class TestSuiteHacks;
-    void test_suite_block_for(std::chrono::milliseconds duration);
+    // Shifts every pending retry's next_retry earlier, so that a test can reach the ready state
+    // without waiting out RETRY_INITIAL_DELAY.
+    void test_suite_backdate_retries(std::chrono::seconds age);
 
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
+
+    // Counted once at startup, then kept current by the methods that store and delete messages:
+    // counting them with a query reads an entire index, which is slow on a big database or slow
+    // storage.
+    std::atomic<int64_t> message_count_ = 0;
 
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
 
     static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
+
+    // How long after a swarm request to a peer times out before we first retry it.
+    static constexpr auto RETRY_INITIAL_DELAY = 15s;
+    // How long to wait between retry attempts once a retry has been sent.  With the initial delay
+    // this puts the first two attempts at 15s and 45s (plus up to one retry check interval), both
+    // inside the ±60s the peer allows on a timestamped request's signature; the third attempt at
+    // 75s is refused for those, which ends their retries.
+    static constexpr auto RETRY_INTERVAL = 30s;
+    // How long to wait before re-checking a retry that could not be sent because we had no contact
+    // details for the peer.
+    static constexpr auto RETRY_NO_CONTACT_INTERVAL = 15s;
+    // How long to keep retrying a request.  This bounds how stale a replayed delete or expiry can
+    // be: a peer that has been unreachable for longer than a brief outage is more likely to have
+    // state the client has since changed (a re-stored message, a new expiry) than to still want
+    // the original request.
+    static constexpr auto RETRY_EXPIRY = 15min;
 
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().
@@ -69,7 +98,7 @@ class Database {
     // expiry (existing, if longer; otherwise the one from `msg`) will be copied.
     StoreResult store(const message& msg, std::chrono::system_clock::time_point* expiry = nullptr);
 
-    void bulk_store(const std::vector<message>& items);
+    void bulk_store(std::span<const message> items);
 
     // Default value for message overhead calculations in `retrieve`.  In practice, overhead for the
     // message itself (i.e. the json keys, etc.) seems to be in the 75-80 character range (depending
@@ -100,7 +129,8 @@ class Database {
     // Retrieves all messages.
     std::vector<message> retrieve_all();
 
-    // Return the total number of messages stored
+    // Return the total number of messages stored.  This is tracked in memory from a count taken
+    // at startup, so changes made to the database by anything else are not seen.
     int64_t get_message_count();
 
     // Returns the per-owner counts of stored messages, for storage statistics purposes.
@@ -122,9 +152,6 @@ class Database {
     // bound on actual stored size as there may be partially filled pages.
     int64_t get_used_bytes();
 
-    // Get random message. Returns nullopt if there are no messages.
-    std::optional<message> retrieve_random();
-
     // Get message by `msg_hash`, return true if found.  Note that this does *not* filter by
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
@@ -144,7 +171,7 @@ class Database {
     // Delete messages owned by the given pubkey having the given hashes.  Returns the hashes of any
     // deleted messages.
     std::vector<std::string> delete_by_hash(
-            const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
+            const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
 
     // Deletes all messages owned by the given pubkey with a timestamp <= timestamp.  Returns the
     // [namespace, hash] pairs of any deleted messages.
@@ -161,13 +188,13 @@ class Database {
     // Adds access tokens to the revoked token database so that users may not longer use those
     // tokens to authenticate.
     void revoke_subaccounts(
-            const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccount);
+            const user_pubkey& pubkey, std::span<const subaccount_token> subaccount);
 
     // Removes access tokens from the revoked token database so that users may use those tokens to
     // authenticate (if currently revoked).  Returns the number of tokens that were found and
     // removed.
     int unrevoke_subaccounts(
-            const user_pubkey& pubkey, const std::vector<subaccount_token>& subaccount);
+            const user_pubkey& pubkey, std::span<const subaccount_token> subaccount);
 
     // Checks if a subaccount token exists in the revoked subaccount database. Returns true if the
     // subaccount has been revoked, false otherwise.
@@ -187,8 +214,8 @@ class Database {
     // msg_hashes to apply a different timestamp to each.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(
             const user_pubkey& pubkey,
-            const std::vector<std::string>& msg_hashes,
-            const std::vector<std::chrono::system_clock::time_point> new_exp,
+            std::span<const std::string> msg_hashes,
+            std::span<const std::chrono::system_clock::time_point> new_exp,
             bool extend_only = false,
             bool shorten_only = false);
 
@@ -209,7 +236,114 @@ class Database {
     // Retrieves the expiries of messages by hash.  Returns a map of hash -> expiry (hashes not
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
-            const user_pubkey& pubkey, const std::vector<std::string>& msg_hashes);
+            const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
+
+    // Adds a request retry to the database, to be retried later.  If req_id is specified, this
+    // is a subsequent failure on the same request.  It's not great to leak database table indices
+    // into the rest of the code if avoidable, but deduplication would be otherwise tedious.
+    int64_t add_retry_request(
+            const crypto::legacy_pubkey& key,
+            const std::string& cmd,
+            const std::string& payload,
+            int64_t req_id = 0);
+
+    // executes the provided callback for each request retry in the database which ready to retry.
+    // The table id is provided so the callback can call remove_retry_request on success.  The
+    // callback returns true if it sent the request, in which case the next retry is scheduled
+    // RETRY_INTERVAL out, or false if it could not send it (e.g. no contact details yet), in which
+    // case the next retry is scheduled RETRY_NO_CONTACT_INTERVAL out.
+    void foreach_ready_retry_request(std::function<
+                                     bool(const crypto::legacy_pubkey& key,
+                                          const std::string& cmd,
+                                          const std::string& payload,
+                                          int64_t req_id)>);
+
+    // This is just for the test suite, as using "ready retry requests" as above would require it
+    // to take several seconds longer to execute, per call.
+    int64_t retry_request_count();
+
+    // Swarm space ranges below are (lower, upper] on the circular uint64 swarm space, as returned
+    // by Network::get_swarm_boundaries(): lower < upper is an ordinary interval, lower > upper
+    // wraps around past UINT64_MAX, and lower == upper (only when there is a single swarm) is the
+    // whole space.
+
+    // True if any message owner falls in the given swarm space range.
+    bool has_owners_in_range(uint64_t lower, uint64_t upper);
+
+    // The highest message id in the database, or 0 if there are no messages.
+    int64_t max_message_id();
+
+    // A queued or in-progress dump of our messages to another service node: every message with id
+    // in [next_id, end_id] whose owner is in `swarm`'s swarm space range still has to be sent.
+    struct pending_dump {
+        crypto::legacy_pubkey pubkey;
+        uint64_t swarm;
+        int64_t next_id;
+        int64_t end_id;
+        std::chrono::system_clock::time_point next_attempt;
+    };
+
+    // Queues a dump to `pubkey` of all current messages (up to and including `end_id`) for the
+    // given swarm.  If a dump to that node for that swarm is already queued it is restarted from
+    // the beginning with the later end id, so that nothing the new request covers is skipped.
+    void queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, int64_t end_id);
+
+    std::vector<pending_dump> pending_dumps();
+
+    // Records progress on a dump: `next_id` is the first id not yet confirmed received, and
+    // `next_attempt` the earliest time to send more.
+    void update_dump(
+            const crypto::legacy_pubkey& pubkey,
+            uint64_t swarm,
+            int64_t next_id,
+            std::chrono::system_clock::time_point next_attempt);
+
+    void remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm);
+
+    // Returns the next batch of a dump: messages with id in [from_id, end_id] whose owner is in the
+    // swarm space range, in id order, stopping after the message that takes the batch past
+    // `byte_budget`.  The second element is the id of the last message returned (0 if none).
+    std::pair<std::vector<message>, int64_t> next_dump_batch(
+            int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget);
+
+    // Pending deliveries: messages whose forwarded store did not reach a swarm peer, to be sent
+    // to it later over sn.data.  A pending delivery references the message and is removed with
+    // it, so a message that is deleted or expires first is never delivered.
+
+    // Queues delivery of the stored message with the given hash to `pubkey`.  Does nothing if no
+    // such message is stored.
+    void queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash);
+
+    // The nodes with at least one pending delivery.
+    std::vector<crypto::legacy_pubkey> delivery_peers();
+
+    // The next batch of pending deliveries to `pubkey`, in message id order, stopping after the
+    // message that takes the batch past `byte_budget`.  Returns the messages and their ids.
+    std::pair<std::vector<message>, std::vector<int64_t>> next_delivery_batch(
+            const crypto::legacy_pubkey& pubkey, size_t byte_budget);
+
+    // Removes the given (delivered) messages from `pubkey`'s pending deliveries.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey, std::span<const int64_t> ids);
+
+    // Removes all pending deliveries to `pubkey`.
+    void remove_deliveries(const crypto::legacy_pubkey& pubkey);
+
+    // Pending dumps and deliveries refer to their recipient node through a shared recipients
+    // table; this removes the recipients that neither refers to any more.  Meant to be called
+    // periodically.
+    void clean_pending_recipients();
+
+    // Remove the specified request retry.  This is one node's retry request, not the request
+    // itself -- if no more nodes need the request retried it will be removed as well.
+    void remove_node_retry_request(int64_t req_id);
+
+    // the `now` argument here only exists for the test suite; do not use it.
+    void remove_expired_retry_requests(
+            std::chrono::system_clock::time_point now = std::chrono::system_clock::now());
+
+    void update_current_swarm(uint64_t swarm_id);
+
+    std::optional<uint64_t> get_current_swarm();
 };
 
 }  // namespace oxenss

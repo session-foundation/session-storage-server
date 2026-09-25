@@ -44,6 +44,7 @@ enum class MonitorResponse {
     BAD_TS = 4,
     BAD_SIG = 5,
     WRONG_SWARM = 6,
+    NO_SWARM_INFO = 7,
 };
 
 inline void monitor_error(oxenc::bt_dict_producer& out, MonitorResponse r, std::string message) {

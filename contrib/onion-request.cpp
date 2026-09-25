@@ -33,7 +33,7 @@ int usage(std::string_view argv0, std::string_view err = "") {
         std::cerr << "\x1b[31;1mError: " << err << "\x1b[0m\n\n";
     std::cerr
             << "Usage: " << argv0
-            << R"( [--mainnet] [--quic] [--xchacha20|--aes-gcm|--aes-cbc|--random] SNODE_PK [SNODE_PK ...] PAYLOAD CONTROL
+            << R"( [--mainnet] [--quic] [--xchacha20|--aes-gcm|--random] SNODE_PK [SNODE_PK ...] PAYLOAD CONTROL
 
 Sends an onion request via the given path
 
@@ -47,7 +47,7 @@ SNODE_PK should be primary (legacy) pubkey(s) on test (or mainnet if --mainnet i
 
 The encryption to use at each hop is controlled by the following:
 --xchacha20 uses xchacha20+poly1305 encryption (which is the default);
---aes-gcm and --aes-cbc use aes-gcm and aes-cbc, respectively, instead.
+--aes-gcm uses aes-gcm instead.
 --random uses a random encryption type for each hop.
 
 PAYLOAD/CONTROL are values to pass to the request and should be:
@@ -101,7 +101,6 @@ int main(int argc, char** argv) {
         if (arg == "--testnet"sv) { omq_addr = TESTNET_OMQ; continue; }
         if (arg == "--xchacha20"sv) { enc_type = EncryptType::xchacha20; continue; }
         if (arg == "--aes-gcm"sv) { enc_type = EncryptType::aes_gcm; continue; }
-        if (arg == "--aes-cbc"sv) { enc_type = EncryptType::aes_cbc; continue; }
         if (arg == "--random"sv) { enc_type = std::nullopt; continue; }
         if (arg == "--quic"sv) { quic = true; continue; }
 
@@ -216,11 +215,8 @@ std::string encode_size(uint32_t s) {
 
 static std::mt19937_64 rng{std::random_device{}()};
 EncryptType random_etype() {
-    std::uniform_int_distribution<int> dist{0, 2};
-    size_t i = dist(rng);
-    return i == 0 ? EncryptType::aes_cbc :
-        i == 1 ? EncryptType::aes_gcm :
-        EncryptType::xchacha20;
+    std::uniform_int_distribution<int> dist{0, 1};
+    return dist(rng) == 0 ? EncryptType::aes_gcm : EncryptType::xchacha20;
 }
 
 void onion_request(std::string ip, uint16_t port, std::vector<std::pair<ed25519_pubkey, x25519_pubkey>> keys,

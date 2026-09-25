@@ -3,6 +3,7 @@
 #include "../crypto/keys.h"
 
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,7 +28,6 @@ namespace snode {
 }  // namespace oxenss
 
 namespace oxenss::server {
-
 class OMQ : public MQBase {
     oxenmq::OxenMQ omq_;
     oxenmq::ConnectionID oxend_conn_;
@@ -129,8 +129,14 @@ class OMQ : public MQBase {
     ///     or is in the future.
     ///   - 5 -- signature failed -- the signature failed to validate.
     ///   - 6 -- wrong swarm -- the given pubkey is not stored by this service node's swarm.
+    ///   - 7 -- no swarm info -- this service node does not currently know of any swarms, and so
+    ///     cannot tell whether the account is one it stores.  This is a temporary condition and
+    ///     the request can be retried.
     /// - error -- included whenever `errcode` is, this contains an English description of the
     ///   error.
+    /// - snodes, swarm -- included with errcode 6, and describing the swarm that *does* store the
+    ///   account, in the same form as the body of a 421 response (see `get_swarm`).  This lets a
+    ///   client redirect itself without a further request.
     ///
     /// Each time a message is received the service node sends a message to the connection with a
     /// first part (i.e. endpoint) of "notify.message", and second part containing the bt-encoded
@@ -165,6 +171,23 @@ class OMQ : public MQBase {
     /// Thus any code that is managing subscriptions for multiple end clients should take care to
     /// check the namespace/data values and only pass it on if actually desired by a client.
     ///
+    /// A subscription can also be terminated by the service node before it expires, which happens
+    /// when the account stops being one that this node stores (because this node moved swarm, or
+    /// because the swarm boundaries moved around the account).  The subscriber is sent a message
+    /// with a first part of "notify.monitor_ended" and a second part containing a bt-encoded dict
+    /// with keys:
+    ///
+    /// - @ -- the account pubkey, in bytes (33), whose subscription has ended.
+    /// - errcode -- why it ended, using the same codes as the subscription response above;
+    ///   currently always 6 (wrong swarm).
+    /// - error -- an English description of the reason.
+    /// - snodes, swarm -- the swarm that now stores the account, in the same form as the body of a
+    ///   421 response.  A client that has stopped polling can reconnect to one of these nodes and
+    ///   resubscribe immediately, without having to ask where the account went.
+    ///
+    /// No notification is sent for a subscription that simply expires, nor when this node no
+    /// longer knows of any swarms at all (in which case it has nowhere to redirect the client).
+    ///
     /// Note that the client should accept (and ignore) unknown keys, to allow for future expansion.
     void handle_monitor_messages(oxenmq::Message& message);
 
@@ -176,20 +199,27 @@ class OMQ : public MQBase {
     std::unordered_set<std::string> stats_access_keys_;
 
     // Connects (and blocks until connected) to oxend.  When this returns an oxend connection
-    // will be available (and oxend_conn_ will be set to the connection id to reach it).
-    void connect_oxend(const oxenmq::address& oxend_rpc);
+    // will be available (and oxend_conn_ will be set to the connection id to reach it).  Throws
+    // snode::startup_aborted if `keep_going` returns false while waiting.
+    void connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going);
 
   public:
     OMQ(const crypto::x25519_keypair& keys,
-        const std::vector<crypto::x25519_pubkey>& stats_access_keys_hex);
+        std::span<const crypto::x25519_pubkey> stats_access_keys);
 
-    // Initialize oxenmq; return a future that completes once we have connected to and
-    // initialized from oxend.
+    // Initialize oxenmq: connects to oxend, loads the initial state from it, then starts the
+    // oxenmq listener.  Blocks until done; `keep_going` is polled while waiting on oxend and a
+    // false return aborts startup with snode::startup_aborted.
     void init(
             snode::ServiceNode* sn,
             rpc::RequestHandler* rh,
             rpc::RateLimiter* rl,
-            oxenmq::address oxend_rpc);
+            oxenmq::address oxend_rpc,
+            const std::function<bool()>& keep_going);
+
+    // Blocks until oxend tells us how old its top block is.  Throws after a few failed attempts,
+    // or snode::startup_aborted when `keep_going` says to stop; either aborts startup.
+    std::chrono::seconds oxend_top_block_age(const std::function<bool()>& keep_going);
 
     /// Dereferencing via * or -> accesses the contained OxenMQ instance.
     oxenmq::OxenMQ& operator*() { return omq_; }
@@ -224,7 +254,26 @@ class OMQ : public MQBase {
 
     void notify(std::vector<connection_id>&, std::string_view notification) override;
 
+    void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;
+
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
+
+    // Always sends: oxenmq is the transport for every node not (yet) reached over QUIC.
+    void sn_request(
+            const snode::contact& ct,
+            std::string_view cmd,
+            std::vector<std::string> parts,
+            sn_reply_callback cb,
+            std::chrono::milliseconds timeout,
+            sn_fallback) override;
+
+  private:
+    // Fire-and-forget push of `notification` to the OMQ connections in `conns`, using `command`
+    // as the endpoint name.
+    void send_notification(
+            std::vector<connection_id>& conns,
+            std::string_view command,
+            std::string_view notification);
 };
 
 }  // namespace oxenss::server

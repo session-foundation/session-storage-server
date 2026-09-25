@@ -21,7 +21,7 @@ target_link_libraries(rpc
     cpr::cpr
     oxenmq::oxenmq
     oxenc::oxenc
-    sodium)
+    sessiondep::libsodium)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(rpc PUBLIC JSON_DIAGNOSTICS=1)

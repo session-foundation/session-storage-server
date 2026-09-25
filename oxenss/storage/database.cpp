@@ -629,7 +629,12 @@ std::vector<int> Database::get_message_counts() {
 
 std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts() {
     auto conn = db_->conn();
-    auto st = conn.prepared_st("SELECT namespace, COUNT(*) FROM messages GROUP BY namespace");
+    // Grouped by (owner, namespace) first, which streams off the messages_owner index; grouping
+    // every message by namespace directly would push them all through a temporary b-tree.
+    auto st = conn.prepared_st(
+            "SELECT namespace, SUM(n) FROM"
+            " (SELECT namespace, COUNT(*) AS n FROM messages GROUP BY owner, namespace)"
+            " GROUP BY namespace");
     return get_all_pairs<namespace_id, int64_t>(st);
 }
 

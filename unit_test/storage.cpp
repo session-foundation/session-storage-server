@@ -178,6 +178,36 @@ TEST_CASE("storage - only return entries for specified pubkey", "[storage]") {
     }
 }
 
+TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+
+    const auto now = std::chrono::system_clock::now();
+    int n = 0;
+    for (auto [pk, ns, count] :
+         {std::tuple{&pk1, 0, 3}, {&pk1, 2, 1}, {&pk2, 0, 2}, {&pk2, 5, 4}})
+        for (int i = 0; i < count; i++)
+            REQUIRE(storage.store(
+                            {*pk,
+                             "h{}"_format(n++),
+                             static_cast<namespace_id>(ns),
+                             now,
+                             now + 1h,
+                             "data"}) == StoreResult::New);
+
+    auto counts = storage.get_namespace_counts();
+    std::ranges::sort(counts);
+    CHECK(counts == std::vector<std::pair<namespace_id, int64_t>>{
+                            {static_cast<namespace_id>(0), 5},
+                            {static_cast<namespace_id>(2), 1},
+                            {static_cast<namespace_id>(5), 4}});
+}
+
 TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]") {
     StorageDeleter fixture;
 

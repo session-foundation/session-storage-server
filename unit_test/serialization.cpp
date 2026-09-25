@@ -97,8 +97,8 @@ TEST_CASE("v1 serialization - message payload 100MiB", "[serialization]") {
     double gbs_per_s =
             total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
-    fmt::println(
-            "Messages: {}; Size: {}; Elapsed: {}; Rate: {:.2f} GiB/s",
+    fmt::print(
+            "Messages: {}; Size: {}; Elapsed: {}; Rate: {:.2f} GiB/s\n",
             msg_list.size(),
             oxenss::util::get_human_readable_bytes(total_bytes),
             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed),

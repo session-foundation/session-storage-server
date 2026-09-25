@@ -63,6 +63,10 @@ class Database {
 
     static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
 
+    // Clients refresh config message TTLs on every poll; applying an extension of a few seconds
+    // rewrites the row and its index entries each time, for a message that lives for weeks.
+    static constexpr int TRIVIAL_EXTENSION_DIVISOR = 100;
+
     // How long after a swarm request to a peer times out before we first retry it.
     static constexpr auto RETRY_INITIAL_DELAY = 15s;
     // How long to wait between retry attempts once a retry has been sent.  With the initial delay
@@ -206,12 +210,17 @@ class Database {
     //
     // new_exp can be length one to apply the same timestamp to all messages, or the same length as
     // msg_hashes to apply a different timestamp to each.
+    //
+    // With ignore_trivial_extension, an extend_only update that would move a message's expiry by
+    // less than 1/TRIVIAL_EXTENSION_DIVISOR of its lifetime (expiry - timestamp) is treated as
+    // already applied: the message is not updated and not returned.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(
             const user_pubkey& pubkey,
             std::span<const std::string> msg_hashes,
             std::span<const std::chrono::system_clock::time_point> new_exp,
             bool extend_only = false,
-            bool shorten_only = false);
+            bool shorten_only = false,
+            bool ignore_trivial_extension = false);
 
     // Shortens the expiry time of all messages owned by the given pubkey.  Expiries can only be
     // shortened (i.e. brought closer to now), not extended into the future.  Returns a vector of

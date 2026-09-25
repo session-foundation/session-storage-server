@@ -257,6 +257,66 @@ TEST_CASE("storage - remove expired entries", "[storage]") {
     CHECK(storage.get_message_count() == 2);
 }
 
+TEST_CASE("storage - trivial expiry extensions", "[storage][expiry]") {
+    StorageDeleter fixture;
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+
+    Database storage{"."};
+
+    auto now = std::chrono::system_clock::now();
+    const auto ttl = 30 * 24h;  // 1% of this is 7.2h
+    for (auto* hash : {"hash0", "hash1", "hash2"})
+        REQUIRE(storage.store({pubkey, hash, namespace_id::Default, now, now + ttl, "data"}) ==
+                StoreResult::New);
+    REQUIRE(storage.store({pubkey, "short", namespace_id::Default, now, now + 20s, "data"}) ==
+            StoreResult::New);
+
+    const std::vector<std::string> hashes{"hash0", "hash1", "hash2"};
+    const std::vector<std::string> one{"hash0"};
+    using exp_list = std::vector<std::chrono::system_clock::time_point>;
+
+    SECTION("an extension below 1% of the lifetime is not applied") {
+        exp_list exp{now + ttl + 1min};
+        CHECK(storage.update_expiry(pubkey, hashes, exp, true, false, true).empty());
+        CHECK(storage.update_expiry(pubkey, one, exp, true, false, true).empty());
+        auto expiries = storage.get_expiries(pubkey, hashes);
+        REQUIRE(expiries.size() == 3);
+        for (auto& [hash, e] : expiries)
+            CHECK(e == to_epoch_ms(now + ttl));
+    }
+
+    SECTION("the same extension is applied when the caller does not opt in") {
+        exp_list exp{now + ttl + 1min};
+        CHECK(storage.update_expiry(pubkey, hashes, exp, true, false).size() == 3);
+        CHECK(storage.update_expiry(pubkey, one, exp, false, false).size() == 1);
+    }
+
+    SECTION("an extension of at least 1% of the lifetime is applied") {
+        exp_list exp{now + ttl + 8h};
+        CHECK(storage.update_expiry(pubkey, hashes, exp, true, false, true).size() == 3);
+        CHECK(storage.update_expiry(pubkey, one, exp_list{now + ttl + 16h}, true, false, true)
+                      .size() == 1);
+        auto expiries = storage.get_expiries(pubkey, hashes);
+        CHECK(expiries["hash0"] == to_epoch_ms(now + ttl + 16h));
+        CHECK(expiries["hash1"] == to_epoch_ms(now + ttl + 8h));
+    }
+
+    SECTION("per-message expiries follow the same rule") {
+        exp_list exp{now + ttl + 1min, now + ttl + 8h, now + ttl + 1s};
+        auto updated = storage.update_expiry(pubkey, hashes, exp, true, false, true);
+        REQUIRE(updated.size() == 1);
+        CHECK(updated[0].first == "hash1");
+    }
+
+    SECTION("a short-lived message still takes a small extension") {
+        const std::vector<std::string> short_hash{"short"};
+        CHECK(storage.update_expiry(pubkey, short_hash, exp_list{now + 21s}, true, false, true)
+                      .size() == 1);
+    }
+}
+
 TEST_CASE("storage - bulk data storage", "[storage]") {
     StorageDeleter fixture;
 

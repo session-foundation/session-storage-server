@@ -1038,7 +1038,8 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
         std::span<const std::string> msg_hashes,
         std::span<const std::chrono::system_clock::time_point> new_exp,
         bool extend_only,
-        bool shorten_only) {
+        bool shorten_only,
+        bool ignore_trivial_extension) {
 
     if (new_exp.size() != 1 && new_exp.size() != msg_hashes.size())
         throw std::logic_error{"update_expiry: new_exp must be 1 or N"};
@@ -1051,6 +1052,9 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
     auto expiry_constraint = extend_only  ? " AND expiry < ?1"s
                            : shorten_only ? " AND expiry > ?1"s
                                           : ""s;
+    if (extend_only && ignore_trivial_extension)
+        expiry_constraint += fmt::format(
+                " AND (?1 - expiry) * {} >= expiry - timestamp", TRIVIAL_EXTENSION_DIVISOR);
 
     auto conn = db_->conn();
 

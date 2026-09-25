@@ -621,7 +621,11 @@ struct expire_all final : recursive {
 ///   expiry of that message will not be changed.
 /// - extend -- if provided and set to true then the expiry is only extended, but not shortened.  If
 ///   the expiry of a given message is already at or beyond the given `expiry` timestamp then its
-///   expiry will not be changed.  This option is mutually exclusive of "shorten".
+///   expiry will not be changed.  An extension that would move the expiry by less than 1% of the
+///   message's lifetime (its current expiry minus its timestamp) is not applied either, and the
+///   message is reported in "unchanged" with its current expiry: a client may refresh a long TTL on
+///   every poll without the storage server rewriting the message each time.  This option is
+///   mutually exclusive of "shorten".
 /// - signature -- When passing a single expiry this is an Ed25519 signature of:
 ///       ("expire" || ShortenOrExtend || expiry || messages[0] || ... || messages[N])
 ///   where `expiry` is the expiry timestamp expressed as a string, for a single expiry, or the
@@ -636,8 +640,9 @@ struct expire_all final : recursive {
 ///     - "updated": ascii-sorted list of hashes that had their expiries changed (messages that were
 ///       not found, and messages excluded by the shorten/extend options, are not included).
 ///     - "unchanged": dict of hashes to current expiries of hashes that were found, but did not get
-///       updated expiries due a given "shorten"/"extend" constraint in the request.  This field is
-///       only included when the "shorten" or "extend" parameter is explicitly given.
+///       updated expiries due a given "shorten"/"extend" constraint in the request (including
+///       extensions too small to apply, see "extend" above).  This field is only included when the
+///       "shorten" or "extend" parameter is explicitly given.
 ///     - "expiry": the expiry timestamp that was applied (which might be different from the request
 ///       expiry, e.g. if the requested value exceeded the permitted TTL).  If the request provided
 ///       multiple expiries then this field will be an array of expiries corresponding to the

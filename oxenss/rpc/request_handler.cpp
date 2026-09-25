@@ -1407,12 +1407,15 @@ void RequestHandler::process_client_req(rpc::expire_msgs&& req, std::function<vo
                        ? res->result["swarm"][service_node_.own_address().pubkey_ed25519.hex()]
                        : res->result;
 
+    // Trivial extensions are skipped only when the client asked for extend explicitly: that is the
+    // only case where skipped hashes are reported back to it in "unchanged".
     auto updated = service_node_.db->update_expiry(
             req.pubkey,
             req.messages,
             expiry,
             extend_only,
-            /*shorten_only=*/req.shorten);
+            /*shorten_only=*/req.shorten,
+            /*ignore_trivial_extension=*/req.extend);
 
     std::ranges::sort(updated, [](const auto& a, const auto& b) { return a.first < b.first; });
 

@@ -687,3 +687,55 @@ def test_expire_multi(rpc, random_sn, sk, exclude):
     assert len(r) == 1
     r = json.loads(r[0])
     assert r['messages'] == expected_msgs
+
+
+def test_expire_extend_trivial(rpc, random_sn, sk, exclude):
+    """An extend-only request that would move a message's expiry by less than 1% of its lifetime is
+    not applied: the hashes come back in `unchanged` with their current expiry."""
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+    sn = ss.random_swarm_members(swarm, 1, exclude)[0]
+    conn = rpc.connect(sn)
+
+    ttl = 14 * 24 * 60 * 60  # 1% of this is 3.4h
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 4, ttl=ttl)
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+    hashes = sorted(m["hash"] for m in msgs)
+    stored = {m["hash"]: m["req"]["expiry"] for m in msgs}
+
+    def extend(expiry):
+        r = rpc.request(
+            conn,
+            'expire',
+            [
+                json.dumps(
+                    {
+                        "pubkey": my_ss_id,
+                        "messages": hashes,
+                        "expiry": expiry,
+                        "extend": True,
+                        "signature": sk.sign(
+                            f"expireextend{expiry}{''.join(hashes)}".encode(),
+                            encoder=Base64Encoder,
+                        ).signature.decode(),
+                    }
+                )
+            ],
+        ).get()
+        assert len(r) == 1
+        return json.loads(r[0])
+
+    # A minute more on a two-week message is trivial: nothing is rewritten.
+    e = extend(max(stored.values()) + 60_000)
+    assert 5 <= len(e['swarm']) <= 10
+    for s in e['swarm'].values():
+        assert s['updated'] == []
+        assert s['unchanged'] == stored
+
+    # A day more is not.
+    exp_day = max(stored.values()) + 24 * 60 * 60 * 1000
+    e = extend(exp_day)
+    assert 5 <= len(e['swarm']) <= 10
+    for s in e['swarm'].values():
+        assert s['expiry'] == exp_day
+        assert s['updated'] == hashes
+        assert s['unchanged'] == {}

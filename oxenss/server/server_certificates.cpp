@@ -1,203 +1,116 @@
 #include "server_certificates.h"
 
-extern "C" {
-#include <openssl/conf.h>
-#include <openssl/crypto.h>
-#include <openssl/dh.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509v3.h>
-}
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 
-#include <oxenss/logging/oxen_logger.h>
+#include <oxenss/common/format.h>
 
-#include <cstddef>
+#include <array>
+#include <chrono>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
+#include <type_traits>
 
 namespace oxenss {
 
 namespace {
 
-    auto logcat = log::Cat("server");
-
-    /* Add extension using V3 code: we can set the config file as NULL
-     * because we won't reference any other sections.
-     */
-
-    int add_ext(X509* cert, int nid, char* value) {
-        X509_EXTENSION* ex;
-        X509V3_CTX ctx;
-        /* This sets the 'context' of the extensions. */
-        /* No configuration database */
-        X509V3_set_ctx_nodb(&ctx);
-        /* Issuer and subject certs: both the target since it is self signed,
-         * no request and no CRL
-         */
-        X509V3_set_ctx(&ctx, cert, cert, NULL, NULL, 0);
-        ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
-        if (!ex)
-            return 0;
-
-        X509_add_ext(cert, ex, -1);
-        X509_EXTENSION_free(ex);
-        return 1;
+    void check(int rc, std::string_view what) {
+        if (rc < 0)
+            throw std::runtime_error{"{} failed: {}"_format(what, gnutls_strerror(rc))};
     }
 
-    int mkcert(X509** x509p, EVP_PKEY** pkeyp, int bits, int serial, int days) {
-        X509* x;
-        EVP_PKEY* pk;
-        RSA* rsa;
-        X509_NAME* name = NULL;
-        BIGNUM* bne = NULL;
-        int res = 0;
+    template <typename T>
+    using gnutls_ptr = std::unique_ptr<std::remove_pointer_t<T>, void (*)(T)>;
 
-        if ((pkeyp == NULL) || (*pkeyp == NULL)) {
-            if ((pk = EVP_PKEY_new()) == NULL) {
-                abort();
-                return (0);
-            }
-        } else
-            pk = *pkeyp;
+    // The export2 calls allocate with gnutls_malloc, so the result needs gnutls_free rather than
+    // delete.
+    struct datum {
+        gnutls_datum_t d{nullptr, 0};
+        ~datum() { gnutls_free(d.data); }
+        std::string_view view() const { return {reinterpret_cast<const char*>(d.data), d.size}; }
+    };
 
-        if ((x509p == NULL) || (*x509p == NULL)) {
-            if ((x = X509_new()) == NULL)
-                goto err;
-        } else
-            x = *x509p;
+    using std::filesystem::perms;
 
-        bne = BN_new();
-        rsa = RSA_new();
+    constexpr auto secret_perms = perms::owner_read | perms::owner_write;
+    constexpr auto public_perms = secret_perms | perms::group_read | perms::others_read;
 
-        if (BN_set_word(bne, RSA_F4) != 1) {
-            goto err;
-        }
-
-        if (!RSA_generate_key_ex(rsa, bits, bne, NULL)) {
-            goto err;
-        }
-
-        // https://www.openssl.org/docs/man1.0.2/man3/EVP_PKEY_assign_RSA.html
-        // "[rsa] will be freed when the parent pkey is freed."
-        if (!EVP_PKEY_assign_RSA(pk, rsa)) {
-            goto err;
-        }
-
-        X509_set_version(x, 2);
-        ASN1_INTEGER_set(X509_get_serialNumber(x), serial);
-        X509_gmtime_adj(X509_get_notBefore(x), 0);
-        X509_gmtime_adj(X509_get_notAfter(x), (long)60 * 60 * 24 * days);
-        X509_set_pubkey(x, pk);
-
-        name = X509_get_subject_name(x);
-
-        /* This function creates and adds the entry, working out the
-         * correct string type and performing checks on its length.
-         * Normally we'd check the return value for errors...
-         */
-        X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (const unsigned char*)"AU", -1, -1, 0);
-        X509_NAME_add_entry_by_txt(
-                name, "CN", MBSTRING_ASC, (const unsigned char*)"localhost", -1, -1, 0);
-        X509_NAME_add_entry_by_txt(
-                name, "O", MBSTRING_ASC, (const unsigned char*)"Oxen", -1, -1, 0);
-
-        /* Its self signed so set the issuer name to be the same as the
-         * subject.
-         */
-        X509_set_issuer_name(x, name);
-
-        /* Add various extensions: standard extensions */
-        //    add_ext(x, NID_basic_constraints, "critical,CA:FALSE");
-        //    add_ext(x, NID_key_usage, "critical,keyCertSign,cRLSign");
-
-        add_ext(x, NID_subject_key_identifier, (char*)"hash");
-
-        /* Some Netscape specific extensions */
-        //    add_ext(x, NID_netscape_cert_type, "sslCA");
-
-        //    add_ext(x, NID_netscape_comment, "example comment extension");
-
-#ifdef CUSTOM_EXT
-        /* Maybe even add our own extension based on existing */
-        {
-            int nid;
-            nid = OBJ_create("1.2.3.4", "MyAlias", "My Test Alias Extension");
-            X509V3_EXT_add_alias(nid, NID_netscape_comment);
-            add_ext(x, nid, "example comment alias");
-        }
-#endif
-
-        if (!X509_sign(x, pk, EVP_sha256()))
-            goto err;
-
-        *x509p = x;
-        *pkeyp = pk;
-        res = 1;
-    err:
-        BN_free(bne);
-        // rsa will be freed automatically when pk is freed by the caller
-        return (res);
+    // Permissions are applied to the created-but-still-empty file, so that a private key is never
+    // briefly on disk world-readable.
+    void write_pem(const std::filesystem::path& path, std::string_view pem, perms mode) {
+        std::ofstream out;
+        out.exceptions(std::ios::failbit | std::ios::badbit);
+        out.open(path, std::ios::binary | std::ios::trunc);
+        std::filesystem::permissions(path, mode);
+        out.write(pem.data(), pem.size());
     }
 
 }  // namespace
 
-void generate_dh_pem(const std::filesystem::path& dh_path) {
-    const int prime_len = 2048;
-    const int generator = DH_GENERATOR_2;
-    DH* dh = DH_new();
-    if (dh == NULL) {
-        log::critical(logcat, "Alloc for dh failed");
-        ERR_print_errors_fp(stderr);
-        abort();
-    }
-    log::info(logcat, "Generating DH parameter, this might take a while...");
-
-    const int res = DH_generate_parameters_ex(dh, prime_len, generator, nullptr);
-
-    if (!res) {
-        log::critical(logcat, "Alloc for dh failed");
-        ERR_print_errors_fp(stderr);
-        abort();
-    }
-
-    log::info(logcat, "DH parameter done!");
-    FILE* pFile = NULL;
-    pFile = fopen(reinterpret_cast<const char*>(dh_path.u8string().c_str()), "wt");
-    PEM_write_DHparams(pFile, dh);
-    DH_free(dh);
-    fclose(pFile);
-}
-
 void generate_cert(const std::filesystem::path& cert_path, const std::filesystem::path& key_path) {
-    BIO* bio_err;
-    X509* x509 = NULL;
-    EVP_PKEY* pkey = NULL;
-    FILE* key_f = NULL;
-    FILE* cert_f = NULL;
+    using namespace std::chrono;
 
-    OpenSSL_add_all_digests();
+    gnutls_x509_privkey_t key_raw{};
+    check(gnutls_x509_privkey_init(&key_raw), "private key init");
+    gnutls_ptr<gnutls_x509_privkey_t> key{key_raw, gnutls_x509_privkey_deinit};
 
-    bio_err = BIO_new_fp(stderr, BIO_NOCLOSE);
+    // P-256 rather than RSA because the server signs once per handshake and this certificate is
+    // never verified by anyone: ECDSA signing is roughly 30x faster than RSA-2048 here, which is
+    // the only property of it that matters to us.  It is also mandatory to implement for TLS 1.3
+    // (RFC 8446 §9.1), so no client that can reach us can fail to handle it.
+    check(gnutls_x509_privkey_generate(
+                  key.get(), GNUTLS_PK_ECDSA, GNUTLS_CURVE_TO_BITS(GNUTLS_ECC_CURVE_SECP256R1), 0),
+          "private key generation");
 
-    if (!mkcert(&x509, &pkey, 2048, 1, 10000))
-        goto err;
-    // X509_print_fp(stdout, x509);
+    gnutls_x509_crt_t crt_raw{};
+    check(gnutls_x509_crt_init(&crt_raw), "certificate init");
+    gnutls_ptr<gnutls_x509_crt_t> crt{crt_raw, gnutls_x509_crt_deinit};
 
-    key_f = fopen(reinterpret_cast<const char*>(key_path.u8string().c_str()), "wt");
-    if (!PEM_write_PrivateKey(key_f, pkey, NULL, NULL, 0, NULL, NULL))
-        goto err;
-    cert_f = fopen(reinterpret_cast<const char*>(cert_path.u8string().c_str()), "wt");
-    PEM_write_X509(cert_f, x509);
+    // 3 here is the actual X.509 version, unlike OpenSSL's X509_set_version which takes 2 for a v3
+    // certificate.
+    check(gnutls_x509_crt_set_version(crt.get(), 3), "certificate version");
 
-err:
-    fclose(cert_f);
-    fclose(key_f);
-    X509_free(x509);
-    EVP_PKEY_free(pkey);
+    constexpr unsigned char serial = 1;
+    check(gnutls_x509_crt_set_serial(crt.get(), &serial, sizeof(serial)), "certificate serial");
 
-    CRYPTO_cleanup_all_ex_data();
+    const auto now = system_clock::to_time_t(system_clock::now());
+    check(gnutls_x509_crt_set_activation_time(crt.get(), now), "certificate activation time");
+    check(gnutls_x509_crt_set_expiration_time(
+                  crt.get(), now + duration_cast<seconds>(days{10000}).count()),
+          "certificate expiration time");
 
-    //    CRYPTO_mem_leaks(bio_err);
-    BIO_free(bio_err);
+    check(gnutls_x509_crt_set_key(crt.get(), key.get()), "certificate key");
+
+    // Self-signed, so the issuer and subject are the same.
+    for (auto* set_dn : {gnutls_x509_crt_set_dn_by_oid, gnutls_x509_crt_set_issuer_dn_by_oid}) {
+        check(set_dn(crt.get(), GNUTLS_OID_X520_COUNTRY_NAME, 0, "AU", 2), "certificate DN (C)");
+        check(set_dn(crt.get(), GNUTLS_OID_X520_COMMON_NAME, 0, "localhost", 9),
+              "certificate DN (CN)");
+        check(set_dn(crt.get(), GNUTLS_OID_X520_ORGANIZATION_NAME, 0, "Oxen", 4),
+              "certificate DN (O)");
+    }
+
+    std::array<unsigned char, 20> key_id;
+    size_t key_id_len = key_id.size();
+    check(gnutls_x509_crt_get_key_id(crt.get(), 0, key_id.data(), &key_id_len),
+          "certificate key id");
+    check(gnutls_x509_crt_set_subject_key_id(crt.get(), key_id.data(), key_id_len),
+          "certificate subject key id");
+
+    check(gnutls_x509_crt_sign2(crt.get(), crt.get(), key.get(), GNUTLS_DIG_SHA256, 0),
+          "certificate signing");
+
+    datum key_pem;
+    check(gnutls_x509_privkey_export2(key.get(), GNUTLS_X509_FMT_PEM, &key_pem.d),
+          "private key export");
+    datum crt_pem;
+    check(gnutls_x509_crt_export2(crt.get(), GNUTLS_X509_FMT_PEM, &crt_pem.d),
+          "certificate export");
+
+    write_pem(key_path, key_pem.view(), secret_perms);
+    write_pem(cert_path, crt_pem.view(), public_perms);
 }
 
 }  // namespace oxenss

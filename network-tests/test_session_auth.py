@@ -1,5 +1,4 @@
 import ss
-from util import sn_address
 import time
 import base64
 import json
@@ -10,7 +9,7 @@ from nacl.public import PrivateKey
 import nacl.exceptions
 
 
-def test_session_auth(omq, random_sn, sk, exclude):
+def test_session_auth(rpc, random_sn, sk, exclude):
     """
     Session key handling is a bit convoluted because it follows Signal's messy approach of exposing
     the more specific x25519 pubkey rather than the more general ed25519 pubkey; this test's SS's
@@ -20,11 +19,11 @@ def test_session_auth(omq, random_sn, sk, exclude):
     xsk = sk.to_curve25519_private_key()
     xpk = xsk.public_key
 
-    swarm = ss.get_swarm(omq, random_sn, xsk)
+    swarm = ss.get_swarm(rpc, random_sn, xsk)
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    msgs = ss.store_n(omq, conn, xsk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conn, xsk, b"omg123", 5)
 
     my_ss_id = '05' + xsk.public_key.encode().hex()
 
@@ -33,15 +32,15 @@ def test_session_auth(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = {"pubkey": my_ss_id, "timestamp": ts, "signature": sig}
 
-    resp = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()]).get()
+    resp = rpc.request(conn, 'delete_all', [json.dumps(params).encode()]).get()
 
     # Expect this to fail because we didn't pass the Ed25519 key
     assert resp == [b'401', b'delete_all signature verification failed']
 
     # Make sure nothing was actually deleted:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -65,14 +64,14 @@ def test_session_auth(omq, random_sn, sk, exclude):
     fake_sig = fake_sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params['pubkey_ed25519'] = fake_sk.verify_key.encode().hex()
     params['signature'] = fake_sig
-    resp = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()]).get()
+    resp = rpc.request(conn, 'delete_all', [json.dumps(params).encode()]).get()
 
     assert resp == [b'401', b'delete_all signature verification failed']
 
     # Make sure nothing was actually deleted:
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -93,7 +92,7 @@ def test_session_auth(omq, random_sn, sk, exclude):
     # Now send along the correct ed pubkey to make it work
     params['pubkey_ed25519'] = sk.verify_key.encode().hex()
     params['signature'] = sig
-    resp = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()]).get()
+    resp = rpc.request(conn, 'delete_all', [json.dumps(params).encode()]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -107,9 +106,9 @@ def test_session_auth(omq, random_sn, sk, exclude):
         edpk.verify(expected_signed, base64.b64decode(v['signature']))
 
     # Verify deletion
-    r = omq.request_future(
+    r = rpc.request(
         conn,
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -128,7 +127,7 @@ def test_session_auth(omq, random_sn, sk, exclude):
     assert not r['messages']
 
 
-def test_non_session_no_ed25519(omq, random_sn, sk, exclude):
+def test_non_session_no_ed25519(rpc, random_sn, sk, exclude):
     """
     Test that the session key hack doesn't work for non-Session addresses (i.e. when not using the
     05 prefix).
@@ -137,11 +136,11 @@ def test_non_session_no_ed25519(omq, random_sn, sk, exclude):
     xsk = sk.to_curve25519_private_key()
     xpk = xsk.public_key
 
-    swarm = ss.get_swarm(omq, random_sn, xsk, netid=4)
+    swarm = ss.get_swarm(rpc, random_sn, xsk, netid=4)
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    msgs = ss.store_n(omq, conn, xsk, b"omg123", 4)
+    msgs = ss.store_n(rpc, conn, xsk, b"omg123", 4)
 
     my_ss_id = '04' + xsk.public_key.encode().hex()
 
@@ -155,7 +154,7 @@ def test_non_session_no_ed25519(omq, random_sn, sk, exclude):
         "signature": sig,
     }
 
-    resp = omq.request_future(conn, 'storage.delete_all', [json.dumps(params).encode()]).get()
+    resp = rpc.request(conn, 'delete_all', [json.dumps(params).encode()]).get()
 
     assert resp == [
         b'400',

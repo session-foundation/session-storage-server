@@ -2,6 +2,7 @@
 
 #include "serialization.h"
 #include "sn_test.h"
+#include <fmt/chrono.h>
 #include <fmt/ranges.h>
 #include <oxenmq/connections.h>
 #include <oxen/quic/format.hpp>
@@ -43,31 +44,70 @@ using MISSING_PUBKEY_THRESHOLD = std::ratio<3, 100>;
 /// TODO: there should be config.h to store constants like these
 constexpr auto OXEND_PING_INTERVAL = 30s;
 
+// How often to trigger 'check_new_members' which checks for 'data ready' handshakes from
+// swarm members and propagate a DB dump if necessary.
 constexpr auto NEW_SWARM_MEMBER_INTERVAL = 10s;
+
+// How often to look for stored swarm requests that are due to be retried.  This bounds how late a
+// retry can go out past its Database::RETRY_INITIAL_DELAY / RETRY_INTERVAL schedule.
+constexpr auto RETRY_REQUEST_CHECK_INTERVAL = 5s;
+
+// How long to wait for a reply to a retried swarm request.  This is longer than the timeout on the
+// original request since the peer has already failed to answer within that once.
+constexpr auto RETRY_REQUEST_TIMEOUT = 10s;
+
+// Dumps of swarm messages to another node go out in batches of about this many bytes, with at most
+// DUMP_WINDOW batches unacknowledged at once.  Together these bound how much of the connection to
+// that node a dump occupies (everything else sent to it, onion requests included, queues behind
+// the batches in flight) while still filling a 100Mbit link at a few hundred ms of latency.
+constexpr size_t DUMP_BATCH_BYTES = 1'000'000;
+constexpr int DUMP_WINDOW = 5;
+// A batch is acknowledged only once the receiver has committed it, and on a busy node (several
+// dumps arriving at once, a slow disk) that can lag well behind receipt with nothing wrong.  A
+// dead peer is caught by the connection's idle timeout, which fails every pending request, so this
+// only bounds a batch that was lost outright; make it long so that a merely slow peer is not sent
+// the same window again.
+constexpr auto DUMP_REQUEST_TIMEOUT = 5min;
+// How long a dump pauses after a batch fails or when the node is not contactable.
+constexpr auto DUMP_RETRY_DELAY = 15s;
+
+// Our version as the single integer MMmmpp (e.g. 21204 for 2.12.4) that the data_ready handshake
+// carries in each direction.
+static uint32_t handshake_version() {
+    const auto& [major, minor, patch] = STORAGE_SERVER_VERSION;
+    return major * 10000 + minor * 100 + patch;
+}
+
+static std::string format_handshake_version(uint32_t v) {
+    return "{}.{}.{}"_format(v / 10000, v / 100 % 100, v % 100);
+}
+// How often to look for dumps that are due to start or resume; once running they are driven by the
+// acknowledgements.
+constexpr auto DUMP_CHECK_INTERVAL = 5s;
 
 ServiceNode::ServiceNode(
         const crypto::legacy_keypair& keys,
         const contact& contact,
         server::OMQ& omq_server,
         const std::filesystem::path& db_location,
-        const bool force_start) :
+        bool force_start,
+        bool skip_bootstrap) :
         force_start_{force_start},
-        db_{std::make_unique<Database>(db_location)},
+        skip_bootstrap_{skip_bootstrap},
+        db{std::make_unique<Database>(db_location)},
         our_keys_{keys},
         our_contact_{contact},
         network_{*omq_server},
+        swarm_{network_, our_keys_.pub, *db},
         omq_server_{omq_server},
         all_stats_{*omq_server} {
     mq_servers_.push_back(&omq_server);
 
-    log::info(logcat, "Requesting initial swarm state");
+    // Lets the first swarm update tell whether our swarm dissolved while we were down.
+    if (auto id = db->get_current_swarm())
+        swarm_.cur_swarm_id_ = *id;
 
-    omq_server->add_timer(
-            [this] {
-                std::lock_guard l{sn_mutex_};
-                db_->clean_expired();
-            },
-            Database::CLEANUP_PERIOD);
+    omq_server->add_timer([this] { db->clean_expired(); }, Database::CLEANUP_PERIOD);
 
     omq_server->add_timer([this] { check_new_members(); }, NEW_SWARM_MEMBER_INTERVAL);
 
@@ -86,25 +126,39 @@ ServiceNode::ServiceNode(
                 syncing_ = false;
             },
             1h);
+
+    omq_server_->add_timer([this] { check_retry_requests(); }, RETRY_REQUEST_CHECK_INTERVAL);
+    omq_server_->add_timer([this] { check_dumps(); }, DUMP_CHECK_INTERVAL);
 }
 
-void ServiceNode::on_oxend_connected() {
+void ServiceNode::on_oxend_connected(const std::function<bool()>& keep_going) {
     // This should be the first time we ever trigger a block update from Oxen, i.e. the initial
     // call to `update_swarms` should not early out which would cause a deadlock on the promise.
     assert(!updating_swarms_.load());
     auto started = std::chrono::steady_clock::now();
 
-    bool success;
-    do {
-        std::promise<bool> update_swarms_promise;
-        std::future<bool> update_swarms_result = update_swarms_promise.get_future();
-        update_swarms(&update_swarms_promise);
+    // Whether oxend's node list can be used as-is is a question of whether oxend is synced, and
+    // the age of its top block answers that directly.  This has to be settled before the list
+    // arrives: process_snodes_update() drops the list of an oxend that is still syncing.
+    {
+        auto block_age = omq_server_.oxend_top_block_age(keep_going);
+        std::lock_guard lock{sn_mutex_};
+        syncing_ = block_age > MAX_SYNCED_BLOCK_AGE;
+        if (syncing_)
+            log::warning(
+                    logcat,
+                    "oxend's top block is {} old; treating oxend as still syncing",
+                    util::friendly_duration(block_age));
+    }
 
-        while (update_swarms_result.wait_for(5s) != std::future_status::ready)
-            log::warning(logcat, "Still waiting for initial block update from oxend...");
-
-        success = update_swarms_result.get();
-    } while (!success);
+    while (true) {
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
+        update_swarms(prom);
+        if (await_startup(fut, keep_going, "the initial block update from oxend"))
+            break;
+        std::this_thread::sleep_for(1s);
+    }
 
     log::info(
             logcat,
@@ -205,7 +259,10 @@ static std::optional<block_update> parse_swarm_update(
 }
 
 void ServiceNode::register_mq_server(server::MQBase* server) {
+    if (quic_server_)
+        throw std::logic_error{"register_mq_server called more than once"};
     mq_servers_.push_back(server);
+    quic_server_ = server;
 }
 
 void ServiceNode::bootstrap_fallback() {
@@ -246,7 +303,7 @@ void ServiceNode::bootstrap_fallback() {
     } else {
         seed_nodes.emplace_back(
                 "curve://storage.seed2.loki.network:38161/"
-                "80adaead94db3b0402a6057869bdbe63204a28e93589fd95a035480ed6c03b45");
+                "9c5201e30957cd44e3dcc8ad7f94f48e6914deef77390f77a439a2d7e7f4cb5c");
     }
 
     auto req_counter = std::make_shared<std::atomic<int>>(0);
@@ -313,19 +370,19 @@ void ServiceNode::bootstrap_fallback() {
 
                     if (++(*req_counter) == node_count) {
                         log::info(logcat, "Bootstrapping done");
-                        if (target_height_ > 0)
-                            update_swarms();
-                        else {
-                            // If target height is still 0 after having contacted
-                            // (successfully or not) all seed nodes, just assume we have
-                            // finished syncing. (Otherwise we will never get a chance
-                            // to update syncing status.)
+                        if (target_height_ == 0) {
+                            // No seed answered, so nothing can tell us whether our oxend is
+                            // behind; assume it is not, or we would never leave the syncing
+                            // state.
                             log::warning(
                                     logcat,
                                     "Could not contact any bootstrap nodes to get target "
                                     "height. Assuming our local height is correct.");
                             syncing_ = false;
                         }
+                        // The initial oxend response was discarded as "still syncing", so ask
+                        // again now rather than knowing no service nodes until the next block.
+                        update_swarms();
                     }
                 },
                 params,
@@ -362,25 +419,21 @@ bool ServiceNode::snode_ready(std::string* reason) {
     return problems.empty() || force_start_;
 }
 
-bool ServiceNode::is_swarm_peer(const crypto::x25519_pubkey& xpk) {
-    return swarm_.is_member(xpk);
-}
-
 void ServiceNode::send_onion_to_sn(
         const contact& ct,
         std::string_view payload,
         rpc::OnionRequestMetadata&& data,
-        std::function<void(bool success, std::vector<std::string> data)> cb) const {
+        std::function<void(bool success, std::vector<std::string> data)> cb) {
     // Since HF18 we bencode everything (which is a bit more compact than sending the eph_key in
     // hex, plus flexible enough to allow other metadata such as the hop number and the
     // encryption type).
     data.hop_no++;
-    omq_server_->request(
-            ct.pubkey_x25519.view(),
-            "sn.onion_request",
+    sn_request(
+            ct,
+            "onion_request",
+            {server::OMQ::encode_onion_data(payload, data)},
             std::move(cb),
-            oxenmq::send_option::request_timeout{30s},
-            omq_server_.encode_onion_data(payload, data));
+            30s);
 }
 
 void ServiceNode::record_proxy_request() {
@@ -396,7 +449,7 @@ void ServiceNode::record_retrieve_request() {
 }
 
 void ServiceNode::check_new_members() {
-    for (const auto& pk : swarm_.extract_pending_members()) {
+    for (const auto& pk : swarm_.extract_contact_pending_members()) {
         auto c = network_.contacts.find(pk);
         if (!c || !*c) {
             // We don't have contact info, so don't do anything right now and this will get
@@ -416,46 +469,102 @@ void ServiceNode::check_new_members() {
                     pk,
                     fmt::join(NEW_SWARM_MEMBER_HANDSHAKE_VERSION, "."),
                     fmt::join(c->version, "."));
-            swarm_.set_member_ready(pk);
+
+            std::lock_guard network_lock{network().mut_};
+            if (SwarmMemberState* member = swarm_.is_member_locked(pk); member)
+                member->status = SwarmMemberStatus::Ready;
             continue;
         }
 
-        log::debug(logcat, "Initiating contact with new swarm member {}", pk);
-        omq_server_->request(
-                c->pubkey_x25519.view(),
-                "sn.data_ready",
-                [this, pk](bool success, std::vector<std::string> data) {
-                    if (data.empty()) {
-                        success = false;
-                        data.push_back("Empty reply"s);
-                    } else if (data[0] != "OK"sv) {
-                        success = false;
-                    }
-                    if (!success) {
-                        log::info(
-                                logcat,
-                                "Failed to connect to remote SS {} to initiate new "
-                                "data transfer ({}); will retry soon",
-                                pk,
-                                fmt::join(data, ", "));
-                        return;
-                    }
-                    log::debug(
-                            logcat,
-                            "Successful contact made with swarm member {}, queuing a message push",
-                            pk);
-                    swarm_.set_member_ready(pk);
-                });
-    }
+        auto on_sn_data_ready_response = [this, pk](bool success, std::vector<std::string> data) {
+            if (data.empty()) {
+                success = false;
+                data.push_back("Empty reply"s);
+            } else if (data[0] != "OK"sv) {
+                success = false;
+            }
 
-    if (auto send_now = swarm_.extract_ready_members(); !send_now.empty()) {
-        auto msgs = db_->retrieve_all();
+            // A 2.12+ node answers with its version after the "OK" (see data_ready_handshake); a
+            // pre-2.12 one answers with the "OK" alone.
+            const bool legacy = success && data.size() < 2;
+            if (success) {
+                std::string version;
+                if (!legacy)
+                    try {
+                        version = format_handshake_version(
+                                oxenc::bt_dict_consumer{data[1]}.require<uint32_t>("#"));
+                    } catch (const std::exception& e) {
+                        version = "?"s;
+                    }
+                log::debug(
+                        logcat,
+                        "Successful contact made with swarm member {} (v{}), marking as ready",
+                        pk,
+                        legacy ? "<2.12" : version);
+            } else {
+                log::info(
+                        logcat,
+                        "Failed to connect to remote SS {} to initiate new "
+                        "data transfer ({}); will retry soon",
+                        pk,
+                        fmt::join(data, ", "));
+            }
+
+            // The 'pk' member might not be in the swarm anymore if the request elapsed over a
+            // period of time where the swarm composition changed.
+            bool push = false;
+            {
+                std::lock_guard network_lock{network().mut_};
+                if (SwarmMemberState* member = swarm_.is_member_locked(pk); member) {
+                    // Update the requested DB dump state machine if necessary.
+                    SwarmRequestedDBDump& status = member->our_ss_requested_db_dump;
+                    if (status == SwarmRequestedDBDump::RequestUnderway)
+                        status = success ? SwarmRequestedDBDump::Nil
+                                         : SwarmRequestedDBDump::NeedsToRequest;
+
+                    if (success) {
+                        member->status = SwarmMemberStatus::Ready;
+                        // A node that joined our swarm needs its messages.  A 2.12+ one asks for
+                        // them in its own handshake with us; a pre-2.12 one never asks, and
+                        // expects them to follow this handshake, as 2.11.x sends them.
+                        if (member->joined_our_swarm) {
+                            member->joined_our_swarm = false;
+                            push = legacy;
+                        }
+                    }
+                }
+            }
+            // Outside the lock: queueing the dump starts it, which reads the swarm list.
+            if (push) {
+                log::info(logcat, "Pushing swarm messages to pre-2.12 swarm member {}", pk);
+                queue_swarm_dump(pk);
+            }
+        };
+
+        bool needs_db_dump{false};
+        {
+            std::lock_guard network_lock{network().mut_};
+            if (SwarmMemberState* member = swarm_.is_member_locked(pk); member) {
+                SwarmRequestedDBDump& status = member->our_ss_requested_db_dump;
+                if (status == SwarmRequestedDBDump::NeedsToRequest) {
+                    status = SwarmRequestedDBDump::RequestUnderway;
+                    needs_db_dump = true;
+                }
+            }
+        }
+
+        // Request payload: "#" is our version, so that the receiver can gate on it without going
+        // through oxend's lagging view; "t" is whether we want the peer to send us its copy of the
+        // swarm's messages.  It goes to every peer: a pre-2.12 one ignores it.
+        oxenc::bt_dict_producer d;
+        d.append("#", handshake_version());
+        d.append("t", needs_db_dump);
         log::debug(
                 logcat,
-                "Initiating swarm message dump ({} message) to new swarm member(s): {}",
-                msgs.size(),
-                fmt::join(send_now, ", "));
-        relay_messages(std::move(msgs), send_now);
+                "Initiating contact with new swarm member {}{}",
+                pk,
+                needs_db_dump ? " (requesting DB dump)" : "");
+        sn_request(*c, "data_ready", {std::move(d).str()}, on_sn_data_ready_response, 15s);
     }
 }
 
@@ -516,7 +625,9 @@ void ServiceNode::send_notifies(message msg) {
 
 bool ServiceNode::process_store(
         message msg, bool* new_msg, std::chrono::system_clock::time_point* expiry) {
-    std::lock_guard guard{sn_mutex_};
+    // No sn_mutex_ here: nothing below needs it (the swarm, stats, and notification lookups lock
+    // internally, and the database has its own connection pool), and holding it across the store
+    // would make everything else that takes it wait on sqlite's write lock.
 
     /// only accept a message if we are in a swarm
     if (!swarm_.is_valid()) {
@@ -528,7 +639,7 @@ bool ServiceNode::process_store(
     all_stats_.bump_store_requests();
 
     /// store in the database (if not already present)
-    const auto result = db_->store(msg, expiry);
+    const auto result = db->store(msg, expiry);
     if (new_msg)
         *new_msg = result == StoreResult::New;
 
@@ -538,19 +649,20 @@ bool ServiceNode::process_store(
     return result != StoreResult::Full;
 }
 
-void ServiceNode::save_bulk(const std::vector<message>& msgs) {
+bool ServiceNode::save_bulk(std::span<const message> msgs) {
     try {
-        db_->bulk_store(msgs);
+        db->bulk_store(msgs);
     } catch (const std::exception& e) {
         log::error(logcat, "failed to save batch to the database: {}", e.what());
-        return;
+        return false;
     }
 
     log::trace(logcat, "saved messages count: {}", msgs.size());
+    return true;
 }
 
 void ServiceNode::on_bootstrap_update(block_update&& bu) {
-    swarm_.update_swarms(std::move(bu.swarms), bu.contacts);
+    swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
     target_height_ = std::max(target_height_, bu.height);
 }
 
@@ -592,7 +704,16 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
         active_ = true;
     }
 
-    auto events = swarm_.update_swarms(std::move(bu.swarms), bu.contacts);
+    auto events = swarm_.update_swarms(bu.height, std::move(bu.swarms), bu.contacts);
+
+    // The new swarm state is in effect as of the call above, so any monitor subscription for an
+    // account we would now answer with a 421 has to be terminated.  This must not be skipped when
+    // we are not `ready` (e.g. we just got decommissioned): those are exactly the cases where the
+    // subscription has become useless.
+    for (auto* s : mq_servers_) {
+        s->drop_foreign_monitors();
+        s->sweep_sn_connections();
+    }
 
     if (const SnodeStatus status = events.our_swarm_id != INVALID_SWARM_ID ? SnodeStatus::ACTIVE
                                  : bu.decommed ? SnodeStatus::DECOMMISSIONED
@@ -614,7 +735,7 @@ void ServiceNode::on_snodes_update(block_update&& bu) {
         bootstrap_swarms();
 }
 
-void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
+void ServiceNode::update_swarms(std::shared_ptr<std::promise<bool>> on_finish) {
     if (updating_swarms_.exchange(true)) {
         log::debug(logcat, "Swarm update already in progress, not sending another update request");
         return;
@@ -673,50 +794,371 @@ void ServiceNode::update_swarms(std::promise<bool>* on_finish) {
             params.dump());
 }
 
+void ServiceNode::sn_request(
+        const contact& ct,
+        std::string_view cmd,
+        std::vector<std::string> parts,
+        std::function<void(bool success, std::vector<std::string> parts)> cb,
+        std::chrono::milliseconds timeout) {
+    auto via_omq = [this, ct, cmd = std::string{cmd}, cb, timeout](std::vector<std::string> parts) {
+        omq_server_.sn_request(ct, cmd, std::move(parts), cb, timeout, nullptr);
+    };
+    if (quic_server_)
+        quic_server_->sn_request(
+                ct, cmd, std::move(parts), std::move(cb), timeout, std::move(via_omq));
+    else
+        via_omq(std::move(parts));
+}
+
+bool ServiceNode::peer_is_current(const contact& ct) {
+    if (ct.version >= SN_QUIC_VERSION)
+        return true;
+    for (auto* s : mq_servers_)
+        if (s->sn_connected(ct))
+            return true;
+    return false;
+}
+
+std::vector<std::string> ServiceNode::data_ready_handshake(
+        const crypto::legacy_pubkey& pk, std::string_view payload) {
+    if (!swarm_.is_member(pk))
+        return {"Swarm mismatch"s};
+
+    // Storage servers before 2.12 send a bare request: they are just checking that we are
+    // reachable before pushing their messages to us, and never ask for ours.  (One that joined our
+    // swarm gets our copy of its messages after our own handshake with it; see
+    // check_new_members.)
+    bool needs_db_dump = false;
+    if (!payload.empty()) {
+        try {
+            oxenc::bt_dict_consumer d{payload};
+            // Nothing is gated on the sender's version yet, but it is required so that it is
+            // there to gate on.
+            auto version = d.require<uint32_t>("#");
+            needs_db_dump = d.require<bool>("t");
+            log::debug(logcat, "data_ready from {} (v{})", pk, format_handshake_version(version));
+        } catch (const std::exception& e) {
+            log::info(logcat, "Malformed data_ready request from {}: {}", pk, e.what());
+            return {"Request payload malformed"s};
+        }
+    }
+
+    if (needs_db_dump)
+        queue_swarm_dump(pk);
+
+    log::debug(logcat, "data_ready from {} processed (needs db dump: {})", pk, needs_db_dump);
+
+    // The sender tells a pre-2.12 node, which replies with the "OK" alone, from us by this second
+    // part, so it must be present whatever else it may carry someday.
+    oxenc::bt_dict_producer info;
+    info.append("#", handshake_version());
+    return {"OK"s, std::move(info).str()};
+}
+
+void ServiceNode::queue_swarm_dump(const crypto::legacy_pubkey& pk) {
+    auto swarm = swarm_.our_swarm_id();
+    if (swarm == INVALID_SWARM_ID)
+        return;
+    queue_dump(pk, swarm);
+}
+
+void ServiceNode::queue_dump(const crypto::legacy_pubkey& pk, swarm_id_t swarm) {
+    // Anything stored after this point reaches the node through the normal store relay, so the
+    // dump stops here.
+    auto end_id = db->max_message_id();
+
+    std::lock_guard lock{dumps_mutex_};
+    db->queue_dump(pk, swarm, end_id);
+    dump_windows_.erase({pk, swarm});
+    log::info(logcat, "Queued dump of swarm {:x} messages (ids up to {}) to {}", swarm, end_id, pk);
+    check_dumps_locked();
+}
+
+void ServiceNode::check_dumps() {
+    std::lock_guard lock{dumps_mutex_};
+    check_dumps_locked();
+    check_deliveries_locked();
+    db->clean_pending_recipients();
+}
+
+void ServiceNode::queue_delivery(const crypto::legacy_pubkey& pk, const std::string& hash) {
+    db->queue_delivery(pk, hash);
+    std::lock_guard lock{dumps_mutex_};
+    send_deliveries(pk);
+}
+
+void ServiceNode::check_deliveries_locked() {
+    for (const auto& pk : db->delivery_peers())
+        send_deliveries(pk);
+}
+
+void ServiceNode::send_deliveries(const crypto::legacy_pubkey& pk) {
+    if (deliveries_in_flight_.count(pk))
+        return;
+
+    auto now = std::chrono::system_clock::now();
+    if (auto it = delivery_retry_after_.find(pk); it != delivery_retry_after_.end()) {
+        if (it->second > now)
+            return;
+        delivery_retry_after_.erase(it);
+    }
+
+    if (!swarm_.is_member(pk)) {
+        log::debug(logcat, "Dropping pending deliveries to {}: no longer in our swarm", pk);
+        db->remove_deliveries(pk);
+        return;
+    }
+
+    auto ct = network_.contacts.find(pk);
+    if (!ct || !*ct) {
+        delivery_retry_after_[pk] = now + DUMP_RETRY_DELAY;
+        return;
+    }
+
+    auto [msgs, ids] = db->next_delivery_batch(pk, DUMP_BATCH_BYTES);
+    if (msgs.empty())
+        return;
+
+    auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
+    log::debug(logcat, "Delivering {} messages whose store forward failed to {}", msgs.size(), pk);
+    deliveries_in_flight_[pk] = {static_cast<int>(parts.size()), false};
+    for (auto& part : parts)
+        sn_request(
+                *ct,
+                "data",
+                {std::move(part)},
+                [this, pk, ids](bool success, std::vector<std::string> data) {
+                    // Pre-2.12 nodes acknowledge with an empty reply.
+                    on_delivery_reply(pk, ids, success && (data.empty() || data[0] == "OK"sv));
+                },
+                DUMP_REQUEST_TIMEOUT);
+}
+
+void ServiceNode::on_delivery_reply(
+        const crypto::legacy_pubkey& pk, std::span<const int64_t> ids, bool ok) {
+    std::lock_guard lock{dumps_mutex_};
+    auto it = deliveries_in_flight_.find(pk);
+    if (it == deliveries_in_flight_.end())
+        return;
+    auto& [parts, failed] = it->second;
+    failed = failed || !ok;
+    if (--parts > 0)
+        return;
+    const bool delivered = !failed;
+    deliveries_in_flight_.erase(it);
+
+    if (delivered) {
+        db->remove_deliveries(pk, ids);
+        send_deliveries(pk);
+    } else {
+        log::info(
+                logcat,
+                "Delivery of {} messages to {} failed; retrying in {}",
+                ids.size(),
+                pk,
+                DUMP_RETRY_DELAY);
+        delivery_retry_after_[pk] = std::chrono::system_clock::now() + DUMP_RETRY_DELAY;
+    }
+}
+
+void ServiceNode::check_dumps_locked() {
+    auto now = std::chrono::system_clock::now();
+    for (const auto& d : db->pending_dumps()) {
+        dump_key key{d.pubkey, d.swarm};
+        auto it = dump_windows_.find(key);
+        if (it == dump_windows_.end()) {
+            if (d.next_attempt > now)
+                continue;
+            it = dump_windows_
+                         .emplace(
+                                 key,
+                                 dump_window{
+                                         .next_id = d.next_id,
+                                         .end_id = d.end_id,
+                                         .sent_next_id = d.next_id,
+                                         .generation = ++dump_generation_})
+                         .first;
+        }
+        advance_dump(it->first, it->second);
+    }
+}
+
+void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
+    // Copies: erasing the window below invalidates the references.
+    const auto key = key_ref;
+    const auto& [pk, swarm] = key;
+
+    auto finish = [&] {
+        log::info(
+                logcat,
+                "Finished dump of {} swarm {:x} messages to {}",
+                w.sent_messages,
+                swarm,
+                pk);
+        db->remove_dump(pk, swarm);
+        dump_windows_.erase(key);
+    };
+
+    auto members = network_.get_swarm(swarm);
+    if (!members || !members->count(pk)) {
+        log::info(logcat, "Dropping dump to {}: no longer a member of swarm {:x}", pk, swarm);
+        db->remove_dump(pk, swarm);
+        dump_windows_.erase(key);
+        return;
+    }
+
+    if (w.exhausted) {
+        if (w.in_flight == 0)
+            finish();
+        return;
+    }
+    if (w.in_flight >= DUMP_WINDOW)
+        return;
+
+    auto ct = network_.contacts.find(pk);
+    if (!ct || !*ct) {
+        log::debug(logcat, "Pausing dump to {}: node is not currently contactable", pk);
+        db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
+        dump_windows_.erase(key);
+        return;
+    }
+
+    std::pair<uint64_t, uint64_t> bounds;
+    try {
+        bounds = network_.get_swarm_boundaries(swarm);
+    } catch (const std::logic_error&) {
+        // The swarm list changed between the membership check above and here; the next check will
+        // sort out whether the dump still applies.
+        return;
+    }
+
+    while (w.in_flight < DUMP_WINDOW) {
+        auto [msgs, last_id] = db->next_dump_batch(
+                w.sent_next_id, w.end_id, bounds.first, bounds.second, DUMP_BATCH_BYTES);
+        if (msgs.empty()) {
+            w.exhausted = true;
+            if (w.in_flight == 0)
+                finish();
+            return;
+        }
+
+        auto parts = serialize_messages(msgs, SERIALIZATION_VERSION_BT);
+        w.batches[last_id] = parts.size();
+        w.in_flight++;
+        w.sent_next_id = last_id + 1;
+        w.sent_messages += msgs.size();
+        log::debug(
+                logcat,
+                "Sending {} messages (through id {}) of swarm {:x} dump to {}",
+                msgs.size(),
+                last_id,
+                swarm,
+                pk);
+
+        for (auto& part : parts)
+            sn_request(
+                    *ct,
+                    "data",
+                    {std::move(part)},
+                    [this, key, last_id, generation = w.generation](
+                            bool success, std::vector<std::string> data) {
+                        // Pre-2.12 nodes acknowledge with an empty reply.
+                        on_dump_batch_reply(
+                                key,
+                                last_id,
+                                generation,
+                                success && (data.empty() || data[0] == "OK"sv));
+                    },
+                    DUMP_REQUEST_TIMEOUT);
+    }
+}
+
+void ServiceNode::on_dump_batch_reply(
+        const dump_key& key, int64_t last_id, uint64_t generation, bool ok) {
+    std::lock_guard lock{dumps_mutex_};
+    auto it = dump_windows_.find(key);
+    if (it == dump_windows_.end() || it->second.generation != generation)
+        return;
+    auto& w = it->second;
+    const auto& [pk, swarm] = key;
+
+    if (!ok) {
+        log::info(
+                logcat,
+                "Dump batch to {} failed; resuming from message id {} in {}",
+                pk,
+                w.next_id,
+                DUMP_RETRY_DELAY);
+        db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
+        dump_windows_.erase(it);
+        return;
+    }
+
+    auto b = w.batches.find(last_id);
+    if (b == w.batches.end() || --b->second > 0)
+        return;
+    w.in_flight--;
+
+    while (!w.batches.empty() && w.batches.begin()->second == 0) {
+        w.next_id = w.batches.begin()->first + 1;
+        w.batches.erase(w.batches.begin());
+    }
+    db->update_dump(pk, swarm, w.next_id, {});
+
+    advance_dump(it->first, w);
+}
+
 void ServiceNode::process_snodes_update(std::string_view data) {
     auto maybe_bu = parse_swarm_update(data, our_keys_.pub);
 
     std::lock_guard lock{sn_mutex_};
 
+    if (maybe_bu && !got_first_response_.exchange(true)) {
+        log::info(logcat, "Got initial swarm information from local Oxend");
+        const int total = maybe_bu->contacts.size();
+        const int contactable = std::ranges::count_if(
+                maybe_bu->contacts, [](const auto& c) { return c.second.contactable(); });
+        const int missing = total - contactable;
+
+        if (syncing_) {
+            if (skip_bootstrap_) {
+                log::warning(
+                        logcat,
+                        "oxend looks behind but bootstrap nodes are disabled; assuming its data "
+                        "is current");
+                syncing_ = false;
+            } else {
+                log::info(
+                        logcat,
+                        "oxend is still syncing; asking bootstrap nodes for the network's height "
+                        "and node data");
+                bootstrap_fallback();
+            }
+        } else if (
+                !skip_bootstrap_ &&
+                (total < (oxenss::is_mainnet ? 100 : 10) ||
+                 missing > MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den)) {
+            // A synced oxend can still have hardly any contact details: it learns IPs, ports and
+            // pubkeys from uptime proofs, which take up to an hour to reach a fresh oxend.  The
+            // list is used as it is, and the bootstrap nodes fill in what it lacks.
+            log::info(
+                    logcat,
+                    "Initialized from oxend, but only {}/{} service nodes are contactable; asking "
+                    "bootstrap nodes for contact info",
+                    contactable,
+                    total);
+            bootstrap_fallback();
+        } else
+            log::info(
+                    logcat,
+                    "Initialized from oxend with {}/{} contactable service nodes",
+                    contactable,
+                    total);
+    }
+
     if (maybe_bu) {
         log::debug(logcat, "Blockchain updated, rebuilding swarm list");
         on_snodes_update(std::move(*maybe_bu));
-    }
-
-    if (got_first_response_.exchange(true))
-        return;
-
-    log::info(logcat, "Got initial swarm information from local Oxend");
-    // This is our very first response and so we *may* want to try falling back to the bootstrap
-    // node *if* our response looks sparse: this will typically happen for a fresh service node
-    // because IP/port distribution through the network can take up to an hour.  We don't really
-    // want to hit the bootstrap nodes when we don't have to, though, so only do it if our responses
-    // is missing more than 3% of proof data (IPs/ports/ed25519/x25519 pubkeys) or we got back fewer
-    // than 100 SNs (10 on testnet).
-    //
-    // (In the future it would be nice to eliminate this by putting all the required data on chain,
-    // and get rid of needing to consult bootstrap nodes: but currently we still need this to deal
-    // with the lag).
-
-    auto [total, contactable] = network_.contacts.counts();
-    auto missing = total - contactable;
-
-    if (total >= (oxenss::is_mainnet ? 100 : 10) &&
-        missing <= MISSING_PUBKEY_THRESHOLD::num * total / MISSING_PUBKEY_THRESHOLD::den) {
-        log::info(
-                logcat,
-                "Initialized from oxend with {}/{} contactable service nodes",
-                contactable,
-                total);
-        syncing_ = false;
-    } else {
-        log::info(
-                logcat,
-                "Detected some missing SN data ({}/{} contactable); "
-                "falling back to bootstrap nodes for help",
-                contactable,
-                total);
-        bootstrap_fallback();
     }
 }
 
@@ -736,8 +1178,10 @@ void ServiceNode::ping_peers() {
 
     auto now = std::chrono::steady_clock::now();
 
-    // Check if we've been tested (reached) recently ourselves
-    reach_records_.check_incoming_tests(now);
+    // Check if we've been tested (reached) recently ourselves.  Only nodes older than
+    // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an oxenmq
+    // ping is not expected.
+    reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
 
     if (status_ == SnodeStatus::DECOMMISSIONED) {
         log::trace(logcat, "Skipping peer testing (decommissioned)");
@@ -785,15 +1229,21 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
         return;
     }
 
+    // From SN_QUIC_VERSION a node is reached over HTTPS and QUIC only: clients use nothing else,
+    // and node-to-node traffic with it goes over QUIC.  Its oxenmq listener stays up for older
+    // peers but is not tested, so that it can go away once every node is at that version.
+    const bool test_omq = !peer_is_current(*c);
+
     auto test = std::make_shared<sn_test>(
             sn,
-            1 + mq_servers_.size(),
+            1 + mq_servers_.size() - (test_omq ? 0 : 1),
             [this, previous_failures](const crypto::legacy_pubkey& sn, bool passed) {
                 report_reachability(sn, passed, previous_failures);
             });
 
     for (auto* mq : mq_servers_)
-        mq->reachability_test(test);
+        if (test_omq || mq != &omq_server_)
+            mq->reachability_test(test);
 
     auto url = fmt::format("https://{}:{}/ping_test/v1", c->ip, c->https_port);
     std::optional<std::string> host;
@@ -960,79 +1410,25 @@ void ServiceNode::report_reachability(
     }
 }
 
-void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) const {
+void ServiceNode::bootstrap_swarms(const std::set<swarm_id_t>& swarms) {
     std::lock_guard guard(sn_mutex_);
 
+    auto targets = swarms.empty() ? network_.get_all_swarm_ids() : swarms;
     if (swarms.empty())
         log::info(logcat, "Bootstrapping all swarms");
     else if (logcat->level() <= log::Level::info)
         log::info(logcat, "Bootstrapping swarms: [{}]", fmt::join(swarms, ", "));
 
-    std::unordered_map<user_pubkey, swarm_id_t> pk_swarm_cache;
-    std::unordered_map<swarm_id_t, std::vector<message>> to_relay;
-
-    std::vector<message> all_msgs = db_->retrieve_all();
-    log::debug(logcat, "We have {} messages", all_msgs.size());
-    for (auto& entry : all_msgs) {
-        if (!entry.pubkey) {
-            log::error(logcat, "Invalid pubkey in a message while bootstrapping other nodes");
+    for (const auto& swarm_id : targets) {
+        auto members = network_.get_swarm(swarm_id);
+        if (!members)
             continue;
-        }
-
-        auto [it, ins] = pk_swarm_cache.try_emplace(entry.pubkey);
-        if (ins)
-            it->second = network_.get_swarm_id_for(entry.pubkey).value_or(INVALID_SWARM_ID);
-        auto swarm_id = it->second;
-
-        if (swarms.empty() || swarms.count(swarm_id))
-            to_relay[swarm_id].push_back(std::move(entry));
-    }
-
-    log::trace(logcat, "Bootstrapping {} swarms", to_relay.size());
-
-    for (const auto& [swarm_id, items] : to_relay)
-        if (auto swarm = network_.get_swarm(swarm_id))
-            relay_messages(items, *swarm);
-}
-
-void ServiceNode::relay_messages(
-        const std::vector<message>& messages, const std::set<crypto::legacy_pubkey>& snodes) const {
-    std::vector<std::string> batches =
-            serialize_messages(messages.begin(), messages.end(), SERIALIZATION_VERSION_BT);
-
-    if (logcat->level() <= log::Level::debug) {
-        log::debug(logcat, "Relaying messages:");
-        for (auto msg : batches)
-            log::trace(logcat, "    {}", msg);
-        log::debug(logcat, "To Snodes:");
-        for (auto sn : snodes)
-            log::debug(logcat, "    {}", sn);
-
-        log::debug(logcat, "Serialised batches: {}", batches.size());
-    }
-
-    for (const auto& sn : snodes) {
-        auto ct = network_.contacts.find(sn);
-        if (ct && *ct) {
-            for (auto& batch : batches) {
-                log::debug(
-                        logcat, "Relaying data to: {} (x25519 pubkey {})", sn, ct->pubkey_x25519);
-
-                omq_server_->request(
-                        ct->pubkey_x25519.view(),
-                        "sn.data",
-                        [](bool success, auto&& /*data*/) {
-                            if (!success)
-                                log::error(logcat, "Failed to relay batch data: timeout");
-                        },
-                        batch);
-            }
-        } else {
-            log::warning(
-                    logcat,
-                    "Unable to relay messages to {}: node is not currently contactable",
-                    sn);
-        }
+        auto [lower, upper] = network_.get_swarm_boundaries(swarm_id);
+        if (!db->has_owners_in_range(lower, upper))
+            continue;
+        for (const auto& pk : *members)
+            if (pk != our_keys_.pub)
+                queue_dump(pk, swarm_id);
     }
 }
 
@@ -1077,7 +1473,7 @@ std::string ServiceNode::get_stats() const {
     val["height"] = block_height_;
     val["target_height"] = target_height_;
 
-    std::vector<int> counts = db_->get_message_counts();
+    std::vector<int> counts = db->get_message_counts();
     int64_t total = std::accumulate(counts.begin(), counts.end(), int64_t{0});
 
     counts.erase(
@@ -1128,11 +1524,11 @@ std::string ServiceNode::get_stats() const {
         val["account_msg_mean"] = total / (double)counts.size();
 
     auto& ns_stats = (val["namespace_messages"] = nlohmann::json::object());
-    for (auto& [ns, count] : db_->get_namespace_counts())
+    for (auto& [ns, count] : db->get_namespace_counts())
         ns_stats[fmt::format("{}", ns)] = count;
 
-    val["db_used"] = db_->get_used_bytes();
-    val["db_total"] = db_->get_total_bytes();
+    val["db_used"] = db->get_used_bytes();
+    val["db_total"] = db->get_total_bytes();
     val["db_max"] = Database::SIZE_LIMIT;
 
     return val.dump();
@@ -1144,13 +1540,19 @@ std::string ServiceNode::get_status_line() const {
     // status message has to be fairly short: has to fit on one line, and if
     // it's too long systemd just truncates it when displaying it.
 
-    std::lock_guard guard(sn_mutex_);
+    // syncing_ is all that needs sn_mutex_: the swarm and stats accessors lock internally, and the
+    // database has its own connection pool.
+    bool syncing;
+    {
+        std::lock_guard guard(sn_mutex_);
+        syncing = syncing_;
+    }
 
     std::string swarm_disp;
     if (auto our_swid = swarm_.our_swarm_id(); our_swid == INVALID_SWARM_ID)
         swarm_disp = "NONE";
     else {
-        std::string swarm_hex = "{:016x}"_format(swarm_.our_swarm_id());
+        std::string swarm_hex = "{:016x}"_format(our_swid);
         std::string_view sw{swarm_hex};
         swarm_disp = "{}…{}(n={})"_format(sw.substr(0, 4), sw.substr(sw.size() - 3), swarm_.size());
     }
@@ -1161,10 +1563,10 @@ std::string ServiceNode::get_status_line() const {
     return "v{}{}{}; {} msgs ({}) for {} accts; reqs(S/R/O/P): {}/{}/{}/{} (last {})"_format(
             STORAGE_SERVER_VERSION_STRING,
             oxenss::is_mainnet ? "" : " (TESTNET)",
-            syncing_ ? "; SYNCING" : "",
-            db_->get_message_count(),
-            util::get_human_readable_bytes(db_->get_used_bytes()),
-            db_->get_owner_count(),
+            syncing ? "; SYNCING" : "",
+            db->get_message_count(),
+            util::get_human_readable_bytes(db->get_used_bytes()),
+            db->get_owner_count(),
             stats.client_store_requests,
             stats.client_retrieve_requests,
             stats.onion_requests,
@@ -1172,9 +1574,9 @@ std::string ServiceNode::get_status_line() const {
             util::short_duration(window));
 }
 
-void ServiceNode::process_push_batch(std::string_view blob, std::string_view sender) {
+bool ServiceNode::process_push_batch(std::string_view blob, std::string_view sender) {
     if (blob.empty())
-        return;
+        return true;
 
     std::vector<message> items;
     try {
@@ -1185,15 +1587,45 @@ void ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
                 "Failed to deserialize incoming message batch from {}: {}",
                 sender,
                 e.what());
+        return false;
     }
-
-    log::trace(logcat, "Saving all: begin");
 
     log::debug(logcat, "Got {} messages from peers, size: {}", items.size(), blob.size());
 
-    save_bulk(items);
+    return save_bulk(items);
+}
 
-    log::trace(logcat, "Saving all: end");
+void ServiceNode::check_retry_requests() {
+    db->remove_expired_retry_requests();
+
+    db->foreach_ready_retry_request([this](const crypto::legacy_pubkey& key,
+                                           const std::string& cmd,
+                                           const std::string& payload,
+                                           int64_t req_id) {
+        // A node that has left our swarm no longer owns the messages the request is about
+        if (!swarm_.is_member(key)) {
+            db->remove_node_retry_request(req_id);
+            return false;
+        }
+
+        auto ct = contacts().find(key);
+        if (!ct || !*ct)
+            return false;
+
+        auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
+            // We cleanup the request in all situations except timeout (timeout
+            // indicating that the node was non-responsive, maybe offline). In an error
+            // state we don't know what state the recipient's storage server is in and
+            // we default to deleting it and ending the retry attempts.
+            rpc::SNStorageCCResult store_result =
+                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
+            if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+                db->remove_node_retry_request(req_id);
+            }
+        };
+        sn_request(*ct, "storage_cc", {cmd, payload}, on_request_done, RETRY_REQUEST_TIMEOUT);
+        return true;
+    });
 }
 
 }  // namespace oxenss::snode

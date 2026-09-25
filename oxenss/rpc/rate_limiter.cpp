@@ -76,6 +76,9 @@ bool RateLimiter::should_rate_limit_client(
         const oxen::quic::ipv6& ip, steady_clock::time_point now) {
     std::lock_guard lock{mutex_};
 
+    if (!client_limiting_)
+        return false;
+
     if (auto it = client_buckets_.find(ip); it != client_buckets_.end())
         return !remove_token(it->second, now);
 
@@ -89,6 +92,8 @@ bool RateLimiter::should_rate_limit_client(
 }
 
 void RateLimiter::clean_buckets(steady_clock::time_point now) {
+    // Not erase_if: the predicate refills the bucket, and libstdc++ 12 (Debian bookworm) hands
+    // erase_if's predicate a const element.
     for (auto it = client_buckets_.begin(); it != client_buckets_.end();) {
         if (fill_bucket(it->second, now))
             it = client_buckets_.erase(it);

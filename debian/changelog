@@ -1,3 +1,211 @@
+oxen-storage-server (2.12.0~rc1-1) unstable; urgency=medium
+
+  [ doylet ]
+  * Add --skip-bootstrap to avoid contacting of seed nodes on startup (useful for private networks)
+  * Respect the skip_bootstrap_ flag
+  * Get rid of db getter and setter by making it public
+  * WIP: Return more extensive SN data ready payload
+  * Move swarm logs into derivation function, serialise SNDataReady w/ helper function
+  * Timestamps in the DB are stored in millisecond precision
+  * Represent pending/ready members w/ an enum
+  * Remove unused std::optional header
+  * Store network swarm/swarm state to disk to resume from
+  * Update outdated comments
+  * Add tmp work-around for DB swarm dump on migration to DB v1
+  * Infinite retries with exponential fallback
+  * Get rid of duplicate fnv hash, already present in serialize.h
+  * Remove unused TEST_RETRY_INTERVAl/PERIOD constants
+  * Rename BTSerialise to Serialise and prefix SN's SerialiseResult to be SNSerialiseResult
+  * Remove unused MessageTestStatus
+  * Move retryable requests into its own thread and restore pending swarm members routine
+  * Revert SN data ready response, timestamp not needed
+  * Serialise retryable requests to the DB
+  * Match comment w/ code regarding when to add retryable request on failure
+  * Revert NEW_SWARM_MEMBER_INTERVAL to 10s
+  * Update the swarms serialisation to match retryable requests patterns
+  * Remove unused swarm_member_check_deadline, add comments
+  * Simplify swarm member status states by removing ContactDetailsReady
+  * Fix dblocation typo -> db_location
+  * Remove RETRY_BACKOFF_COEFF from retry request on done lambda
+  * Linting
+  * Request a DB dump on data-ready handshake if DB is empty
+  * Add 10GiB message payload to serialise test
+  * Linting
+  * Reduce serialisation test to 5GiB to not OOM on CI
+  * Reduce serialisation test to 100MiB to not OOM on CI
+  * Stop potential infinite bootstrap of DB if swarm ID doesn't change
+
+  [ Thomas Winget ]
+  * Change retryable requests storage format
+  * Add swarm space/id cache to database
+  * remove dead code and C++-ify some C-esque code
+  * format
+  * Do not store public outbox message if newer present
+  * add limit (and order) to query
+  * Add unique index on public namespace and owner
+  * fix unused variable errors
+  * fix unit tests, including broken db queries
+  * unused parameter
+  * new tests and fixes found from them
+  * more thorough swarm id -> space testing
+  * reformat some values and comments
+  * Replace startup_version with had_swarm_state_on_open
+  * Add migration test binary and historical database fixture
+  * clang-format
+  * fix simple query mistakes
+
+  [ Jason Rhinelander ]
+  * Document public namespace retrieval
+  * Fix retry next_retry update clobbering every pending row
+  * Fix data race in batch request result collection
+  * Lock swarm_response when skipping non-contactable peers
+  * Run retry request checks from an OMQ timer instead of a dedicated thread
+  * Re-check unsent retries sooner than sent ones
+  * Give retried swarm requests a 10s reply timeout
+  * Wait 15s before the first retry of a timed-out swarm request
+  * Remove unused in-memory retry request types
+  * Keep sequence lambda alive while sending the final response
+  * Reformatting & formatting tweak
+  * bump sqlitecpp to 3.3.3 to fix compilation errors
+  * Replace debian 11 CI build with debian 12
+  * Drop macos CI jobs
+  * bump focal to jammy for static linux build
+  * Bookworm: add oxen repo for ngtcp2 backport
+  * Fix retry request timestamps on sqlite < 3.42
+  * Tell monitor subscribers when their subscription stops applying
+  * Reserve namespace -3741 for testing
+  * Drop monitor subscriptions when their quic connection closes
+  * Stop parsing a monitor request with an invalid p= pubkey
+  * Report an unloadable monitor pubkey as such, not as a wrong swarm
+  * Distinguish "no swarms known" from a wrong swarm when subscribing
+  * Use gnutls variation of libcurl rather than openssl
+  * Use the session-deps submodule for dependency handling
+  * Make USE_LTO the only LTO switch
+  * Build against the gnutls flavour of libcurl
+  * Add session-sqlite submodule
+  * Use IMMEDIATE transactions for read-then-write paths
+  * Apply retry next_retry updates in one transaction after dispatch
+  * Add a test for foreach_ready_retry_request
+  * Remove the database-wide reader/writer lock
+  * Build sqlite through the session-sqlite submodule
+  * Use session-sqlite for the query helpers and connection pool
+  * Use std::span instead of std::basic_string_view
+  * Bind blobs via to_span rather than a local as_blob
+  * Fix older sqlite compat
+  * Give the logging target the oxenc include path
+  * Update session-deps
+  * Run clang-format
+  * Update session-sqlite
+  * Don't lose reachability test results when the stream is gone
+  * Track libquic dev rather than stable
+  * Generate the HTTPS certificate with gnutls instead of openssl
+  * Stop generating DH parameters for the https listener
+  * Use an ECDSA certificate for the https listener
+  * Remove aes-cbc onion request encryption support
+  * Use gnutls instead of openssl for aes-gcm channel encryption
+  * Split the HTTPS server into a shared core and a uWebSockets backend
+  * Add libmicrohttpd as a dependency
+  * Add a libmicrohttpd HTTPS backend
+  * Test the HTTPS listener end to end, on every compiled backend
+  * CI: build each HTTPS backend on its own; document the backends
+  * Give libmicrohttpd its logger before any other option
+  * Fix the swarm-range message query
+  * libmicrohttpd: hold immediate replies until the request is fully read
+  * Add an HTTPS backend benchmark
+  * libmicrohttpd: hand response bodies over without copying
+  * Make libmicrohttpd the default HTTPS backend
+  * CI: shorter names for the uWebSockets pipelines
+  * CI: build the ARM pipelines at -j4
+  * Bump session-deps for the static libcurl link fix
+  * Update session-deps; uWebSockets backend takes OpenSSL from the system only
+  * Fix sn.data_ready handshake against 2.11.x peers
+  * Silence clang-tidy warning
+  * Bump version to 2.12.0
+  * Send swarm message dumps as paced, acknowledged batches
+  * Don't treat every swarm as new on the first update after startup
+  * Make state_kv a STRICT table with a typed-by-writer value column
+  * Index owners by (swarm_space_hi, swarm_space_lo) instead of each alone
+  * Ask peers for the swarm's messages when entering a swarm or holding none
+  * Delete finished retry rows from the table, not the view
+  * Restore the db_used/db_total/db_max stats keys
+  * Run the swarm sync schema upgrade in one transaction
+  * Drop the owned_messages view
+  * Deliver failed store forwards as messages instead of replaying the request
+  * Retry swarm requests at 15s and 45s, expire them after 15 minutes
+  * QUIC: return after dispatching a non-RPC command
+  * QUIC: authenticated, held connections between storage servers
+  * QUIC: accept data, data_ready and storage_cc on SN connections
+  * Send node-to-node requests over QUIC to nodes that speak it
+  * QUIC: keep our exceptions out of libquic's event loop
+  * QUIC: one stream per kind of node-to-node traffic
+  * Relay onion request hops over QUIC to nodes that speak it
+  * QUIC: use the loop's own queue for our timer and stream stats
+  * QUIC: the SN connection registry belongs to the loop
+  * Remove dead declarations and a write-only state
+  * QUIC: give node-to-node work its own oxenmq category
+  * QUIC: refuse onion hops once every onion stream to a peer is backed up
+  * Keep the newest public-outbox message on upgrade instead of deleting them all
+  * Stop testing the oxenmq port of 2.12+ nodes
+  * Use the first oxend node list instead of always bootstrapping
+  * Fix the testnet bootstrap seed's x25519 key
+  * Decide "syncing" from oxend's top block age at startup
+  * Let a signal interrupt the startup waits on oxend
+  * Move the oxend top-block query next to the other oxend plumbing
+  * Pause a second between failed initial node list requests
+  * Log the QUIC listening address at startup
+  * Let retrieve page off the index, and drop a duplicate index
+  * Accept per-category log levels in --log-level
+  * Keep the retry test off the due-time boundary
+  * network-tests: run over HTTPS or oxenmq, selected by --transport
+  * network-tests: --node to steer a run at one node; fix two monitor tests
+  * network-tests: describe --exclude in --help
+  * Accept comma-separated log levels from the config file
+  * network-tests: add a QUIC transport via the seshquic bindings
+  * network-tests: run the monitor tests over any transport with notifications
+  * Pair the SN keep-alive with an idle timeout that fits two of them
+  * Give designated-initialised aggregates defaults for the fields left out
+  * Run contrib/format.sh
+  * Give dump batches a five-minute reply timeout
+  * Keep ALPN constants together
+  * Modern .count -> .contains
+  * Give incoming message batches their own oxenmq category
+  * Use std::erase_if where the predicate is a pure test
+  * Use string_view::starts_with/ends_with instead of our own helpers
+  * Default the hand-written equality operators
+  * Constrain templates with concepts instead of enable_if
+  * Use std::ranges algorithms where the argument is a whole container
+  * Use auto where the declared type only repeated the initialiser's
+  * Make the compiled-in HTTPS backend list a constexpr array
+  * Serialise messages from a span rather than a generator
+  * Pass key buffers to the byte helpers as spans
+  * Take read-only sequence parameters as std::span
+  * Remove the unused util::find_prefixed_value
+  * Replace std::to_string with fmt
+  * Echo the account in a 421 response
+  * Look up multi-hash expire/delete/get_expiries one hash at a time
+  * Update session-sqlite for string_view prepared-statement queries
+  * Precompute the swarm-range queries and use the statement cache
+  * Only dedupe expiry-update hashes when a repeat could match again
+  * Hash expiry-update dedupe keys by their decoded base64 prefix
+  * Key pending dumps and deliveries by a shared recipients table
+  * Index retry_requests by creation time
+  * Count namespace messages without sorting every message
+  * Don't hold sn_mutex_ while counting messages for the status line
+  * Fix the all-namespace delete_by_timestamp result columns
+  * Track the message count in memory instead of counting on demand
+  * Don't hold sn_mutex_ across stores or expiry cleanup
+  * Make register_mq_server one-shot and document that the server list is fixed
+  * Send QUIC monitor notifications from the QUIC loop
+  * Update oxen-libquic to latest dev
+  * Push swarm messages to pre-2.12 nodes that join our swarm
+  * Queue oxenmq-delivered message batches separately from QUIC ones
+  * Extend startup timeout
+  * Use fmt::print in the serialisation benchmark
+  * Run contrib/format.sh
+  * Compute the serialisation benchmark rate from fractional seconds
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 25 Sep 2026 20:43:02 -0300
+
 oxen-storage-server (2.11.3-1+1) unstable; urgency=medium
 
   * Rebuild

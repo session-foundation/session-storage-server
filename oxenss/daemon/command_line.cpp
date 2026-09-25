@@ -1,11 +1,15 @@
 #include "command_line.h"
 #include <oxenss/logging/oxen_logger.h>
+#include <oxenss/server/https.h>
 #include <oxenss/version.h>
 #include <oxenss/common/format.h>
 #include <oxenss/utils/string_utils.hpp>
 
+#include <fmt/ranges.h>
+
 #include <CLI/CLI.hpp>
 #include <CLI/Error.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 
@@ -137,8 +141,14 @@ parse_result parse_cli_args(int argc, char* argv[]) {
     cli.add_option(
                "--log-level",
                options.log_level,
-               "Log verbosity level, see Log Levels below for accepted values")
-            ->type_name("LEVEL")
+               "Log verbosity: a level (trace, debug, info, warning, error, critical, off) for "
+               "everything, and/or comma-separated CAT=LEVEL entries for individual categories, "
+               "applied in order (e.g. '*=warning,snode=debug').  Storage server categories: "
+               "daemon, server, ssquic, snode, swarm, db, rpc, http, crypto, logging; the quic "
+               "and oxenmq libraries log under those names.")
+            ->type_name("LEVELS")
+            // A config file value is split on commas into several values; put them back together.
+            ->join(',')
             ->capture_default_str();
     cli.add_option(
                "--oxend-rpc",
@@ -158,6 +168,21 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "Public port to listen on for HTTPS (TCP) connections")
             ->capture_default_str()
             ->type_name("PORT");
+    std::vector<std::string> https_backends;
+    for (auto b : server::available_https_backends())
+        https_backends.emplace_back(server::to_string(b));
+    // The compiled-in default is the preferred backend, but a build can leave it out; fall back to
+    // whatever is available rather than shipping a binary that refuses to start without a flag.
+    if (std::ranges::find(https_backends, options.https_backend) == https_backends.end())
+        options.https_backend = https_backends.front();
+    cli.add_option(
+               "--https-backend",
+               options.https_backend,
+               "HTTPS server implementation to use.  Available in this build: " +
+                       fmt::format("{}", fmt::join(https_backends, ", ")))
+            ->capture_default_str()
+            ->type_name("BACKEND")
+            ->check(CLI::IsMember(https_backends));
     cli.add_option(
             "ignored",
             [](auto&&) { return true; },
@@ -175,6 +200,11 @@ parse_result parse_cli_args(int argc, char* argv[]) {
             "--force-start",
             options.force_start,
             "Ignore the initialisation ready check (primarily for debugging).");
+    cli.add_flag(
+            "--skip-bootstrap-nodes",
+            options.skip_bootstrap,
+            "Skip the contacting of bootstrap seed nodes on startup (primarily for private node "
+            "networks)");
     cli.add_option(
                "--stats-access-key",
                options.stats_access_keys,

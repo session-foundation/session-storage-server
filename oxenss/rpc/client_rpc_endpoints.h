@@ -186,7 +186,8 @@ struct store final : recursive {
 ///   compatibility, this can also be specified as `pubKey`
 /// - `namespace` (optional) the integral message namespace from which to retrieve messages.  Each
 ///   namespace forms an independent message storage for the same address.  When specified,
-///   authentication *must* be provided.  Omitting the namespace is equivalent to specifying a
+///   authentication is required for all namespaces except for "public" outbox namespaces (of the
+///   form -(20n+1), e.g. -1, -21, -41, etc.) Omitting the namespace is equivalent to specifying a
 ///   namespace of 0.
 /// - `last_hash` (optional) retrieve messages stored by this storage server since `last_hash` was
 ///   stored.  Can also be specified as `lastHash`.  An empty string (or null) is treated as an
@@ -541,9 +542,9 @@ struct delete_before final : recursive {
 };
 
 /// Updates (shortens) the expiry of all stored messages, and broadcasts the update request to all
-/// other swarm members.  Note that this will not extend existing expiries, it will only shorten the
-/// expiry of any messages that have expiries after the requested value.  (To extend expiries of one
-/// or more individual messages use the `expire` endpoint).
+/// other swarm members. Note that this will not extend existing expiries, it will only shorten the
+/// expiry of any messages that have expiries after the requested value. (To extend expiries of one
+/// or more individual messages use the `expire_msgs` endpoint).
 ///
 /// Takes parameters of:
 /// - pubkey -- the pubkey whose messages shall have their expiries reduced, in hex (66) or bytes
@@ -625,8 +626,8 @@ struct expire_all final : recursive {
 ///       ("expire" || ShortenOrExtend || expiry || messages[0] || ... || messages[N])
 ///   where `expiry` is the expiry timestamp expressed as a string, for a single expiry, or the
 ///   expiries concatenated together (expiry[0] || expiry[1] || ...) for multiple expiries.
-///   `ShortenOrExtend` is string "shorten" if the shorten option is given (and true), "extend" if
-///   `extend` is true, and empty otherwise. The signature must be base64 encoded (json) or bytes
+///   `ShortenOrExtend` is the string "shorten" if the shorten option is given (and true), "extend"
+///   if `extend` is true, and empty otherwise. The signature must be base64 encoded (json) or bytes
 ///   (bt).
 ///
 /// Returns dict of:

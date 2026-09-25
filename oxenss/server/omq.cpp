@@ -11,6 +11,7 @@
 #include <oxenss/snode/service_node.h>
 #include <oxenss/snode/sn_test.h>
 #include <oxenss/utils/string_utils.hpp>
+#include <oxenss/snode/service_node.h>
 
 #include <oxenc/base64.h>
 #include <oxenc/bt_serialize.h>
@@ -45,7 +46,11 @@ std::string OMQ::peer_lookup(std::string_view pubkey_bin) const {
 }
 
 void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
-    log::debug(logcat, "[OMQ] handle sn.data_ready from: {}", message.conn.to_string());
+    log::debug(
+            logcat,
+            "[OMQ] handle sn.data_ready from: {} (parts {})",
+            message.conn.to_string(),
+            message.data.size());
 
     auto& xpk_str = message.conn.pubkey();
     if (xpk_str.size() != sizeof(crypto::x25519_pubkey))
@@ -53,10 +58,13 @@ void OMQ::handle_sn_data_ready(oxenmq::Message& message) {
 
     crypto::x25519_pubkey xpk;
     std::memcpy(xpk.data(), xpk_str.data(), sizeof(crypto::x25519_pubkey));
-    if (!service_node_->is_swarm_peer(xpk))
+    auto pk = service_node_->contacts().lookup(xpk);
+    if (!pk)
         return message.send_reply("Swarm mismatch");
 
-    message.send_reply("OK");
+    auto reply = service_node_->data_ready_handshake(
+            *pk, message.data.empty() ? std::string_view{} : message.data[0]);
+    message.send_reply(oxenmq::send_option::data_parts(reply));
 }
 
 void OMQ::handle_sn_data(oxenmq::Message& message) {
@@ -67,15 +75,20 @@ void OMQ::handle_sn_data(oxenmq::Message& message) {
         return;
     }
 
-    // TODO: process push batch should move to "Request handler"
-    service_node_->process_push_batch(message.data[0], message.conn.to_string());
-
-    log::debug(logcat, "[OMQ] send reply");
-
-    // TODO: Investigate if the above could fail and whether we should report
-    // that to the sending SN
-    message.send_reply();
-};
+    // The body has to be copied because the message does not outlive this handler.
+    omq_.inject_task(
+            "bulkdata_omq",
+            "sn.data",
+            message.remote,
+            [this,
+             body = std::string{message.data[0]},
+             from = message.conn.to_string(),
+             send = message.send_later()] {
+                if (!service_node_->process_push_batch(body, from))
+                    return send.reply("Failed to store messages");
+                send.reply("OK");
+            });
+}
 
 void OMQ::handle_ping(oxenmq::Message& message) {
     log::debug(logcat, "Remote pinged me");
@@ -92,15 +105,16 @@ void OMQ::handle_onion_request(
         log::trace(logcat, "on response: {}...", debug_string(res).substr(0, 100));
 #endif
 
+        auto status = fmt::to_string(res.status.first);
         if (auto* js = std::get_if<nlohmann::json>(&res.body))
-            send.reply(std::to_string(res.status.first), js->dump());
+            send.reply(status, js->dump());
         else if (auto* binary = std::get_if<std::span<const std::byte>>(&res.body))
             send.reply(
-                    std::to_string(res.status.first),
+                    status,
                     std::string_view{
                             reinterpret_cast<const char*>(binary->data()), binary->size()});
         else
-            send.reply(std::to_string(res.status.first), view_body(res));
+            send.reply(status, view_body(res));
     };
 
     if (data.hop_no > rpc::MAX_ONION_HOPS)
@@ -113,13 +127,13 @@ void OMQ::handle_onion_request(oxenmq::Message& message) {
     std::pair<std::string_view, rpc::OnionRequestMetadata> data;
     try {
         if (message.data.size() != 1)
-            throw std::runtime_error{"expected 1 part, got " + std::to_string(message.data.size())};
+            throw std::runtime_error{"expected 1 part, got {}"_format(message.data.size())};
 
         data = decode_onion_data(message.data[0]);
     } catch (const std::exception& e) {
         auto msg = "Invalid internal onion request: "s + e.what();
         log::error(logcat, "{}", msg);
-        message.send_reply(std::to_string(http::BAD_REQUEST.first), msg);
+        message.send_reply(fmt::to_string(http::BAD_REQUEST.first), msg);
         return;
     }
 
@@ -148,7 +162,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
                 method,
                 message.data.size());
         message.send_reply(
-                std::to_string(http::BAD_REQUEST.first),
+                fmt::to_string(http::BAD_REQUEST.first),
                 fmt::format(
                         "Invalid request: expected {} message parts, received {}",
                         full_size,
@@ -168,12 +182,9 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
         } catch (const std::exception& e) {
             log::warning(logcat, "Rejecting non-ipv4 OMQ RPC request from {}", message.remote);
             message.send_reply(
-                    std::to_string(http::BAD_REQUEST.first),
-                    fmt::format(
-                            "Invalid request: non-forwarded OMQ client RPC requests are only "
-                            "permitted via IPv4",
-                            full_size,
-                            message.data.size()));
+                    fmt::to_string(http::BAD_REQUEST.first),
+                    "Invalid request: non-forwarded OMQ client RPC requests are only permitted "
+                    "via IPv4");
             return;
         }
     }
@@ -186,7 +197,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
                 if (status == http::OK)
                     send.reply(body);
                 else
-                    send.reply(std::to_string(status.first), body);
+                    send.reply(fmt::to_string(status.first), body);
             },
             forwarded);
 
@@ -196,7 +207,7 @@ void OMQ::handle_client_request(std::string_view method, oxenmq::Message& messag
 
 OMQ::OMQ(
         const crypto::x25519_keypair& keys,
-        const std::vector<crypto::x25519_pubkey>& stats_access_keys) :
+        std::span<const crypto::x25519_pubkey> stats_access_keys) :
         omq_{std::string{keys.pub.view()},
              std::string{keys.sec.view()},
              /*service_node=*/true,
@@ -217,6 +228,22 @@ OMQ::OMQ(
             log::warning(logcat, "Invalid forwarded client request: incorrect number of message parts ({})",  m.data.size());
         })
         ;
+
+    // Incoming message batches (swarm dumps and deliveries) arriving over QUIC: each is up to a
+    // megabyte and ends in a bulk database write, so they get their own queue rather than holding
+    // up the small, latency-sensitive node-to-node commands, and one thread, since the database
+    // serialises writers and more would only contend.  A full queue drops the task, which the
+    // sender sees as a timeout and answers by resending the window, so the queue is deep enough
+    // for every peer to have a full window in flight at once.  Only injected tasks land here (see
+    // QUIC::handle_request).
+    omq_.add_category("bulkdata", oxenmq::AuthLevel::basic, 1 /*reserved threads*/, 200 /*max queue*/);
+
+    // The same for batches arriving over oxenmq (see handle_sn_data), kept apart so that they
+    // cannot crowd out the paced QUIC ones: a pre-2.12 peer sends its entire database in 9MB
+    // batches all at once, never retries one that fails, and never gets asked again, so a dropped
+    // batch is a permanent gap.  The depth matches what 2.11.x allowed the same blast in its "sn"
+    // category.  This goes away with the oxenmq listener.
+    omq_.add_category("bulkdata_omq", oxenmq::AuthLevel::basic, 1 /*reserved threads*/, 1000 /*max queue*/);
 
     // storage.WHATEVER (e.g. storage.store, storage.retrieve, etc.) endpoints are invokable by
     // anyone (i.e. clients) and have the same WHATEVER endpoints as the "method" values for the
@@ -279,32 +306,33 @@ OMQ::OMQ(
     omq_.EPHEMERAL_ROUTING_ID = false;
 }
 
-void OMQ::connect_oxend(const oxenmq::address& oxend_rpc) {
+void OMQ::connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bool()>& keep_going) {
     // Establish our persistent connection to oxend.
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        std::promise<bool> prom;
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
         log::info(logcat, "Establishing connection to oxend...");
         omq_.connect_remote(
                 oxend_rpc,
-                [this, &prom](auto cid) {
+                [this, prom](auto cid) {
                     oxend_conn_ = cid;
-                    prom.set_value(true);
+                    prom->set_value(true);
                 },
-                [&prom, &oxend_rpc](auto&&, std::string_view reason) {
+                [prom, oxend_rpc](auto&&, std::string_view reason) {
                     log::warning(
                             logcat,
                             "failed to connect to local oxend @ {}: {}; retrying",
                             oxend_rpc.full_address(),
                             reason);
-                    prom.set_value(false);
+                    prom->set_value(false);
                 },
                 // Turn this off since we are using oxenmq's own key and don't want to replace some
                 // existing connection to it that might also be using that pubkey:
                 oxenmq::connect_option::ephemeral_routing_id{},
                 oxenmq::AuthLevel::admin);
 
-        if (prom.get_future().get()) {
+        if (snode::await_startup(fut, keep_going, "the connection to oxend")) {
             log::info(
                     logcat,
                     "Connected to oxend in {}",
@@ -315,11 +343,50 @@ void OMQ::connect_oxend(const oxenmq::address& oxend_rpc) {
     }
 }
 
+std::chrono::seconds OMQ::oxend_top_block_age(const std::function<bool()>& keep_going) {
+    for (int attempt = 1;; attempt++) {
+        auto prom = std::make_shared<std::promise<std::chrono::seconds>>();
+        auto fut = prom->get_future();
+        oxend_request(
+                "rpc.get_last_block_header", [prom](bool success, std::vector<std::string> data) {
+                    try {
+                        if (!success || data.size() < 2 || data[0] != "200")
+                            throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
+                        auto header = nlohmann::json::parse(data[1]).at("block_header");
+                        std::chrono::sys_seconds mined{
+                                std::chrono::seconds{header.at("timestamp").get<int64_t>()}};
+                        auto now = std::chrono::floor<std::chrono::seconds>(
+                                std::chrono::system_clock::now());
+                        auto age = std::max(0s, now - mined);
+                        log::info(
+                                logcat,
+                                "oxend is at height {}; its top block is {} old",
+                                header.at("height").get<uint64_t>(),
+                                util::friendly_duration(age));
+                        prom->set_value(age);
+                    } catch (...) {
+                        prom->set_exception(std::current_exception());
+                    }
+                });
+        try {
+            return snode::await_startup(fut, keep_going, "oxend's top block");
+        } catch (const snode::startup_aborted&) {
+            throw;
+        } catch (const std::exception& e) {
+            if (attempt >= 5)
+                throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
+            log::warning(logcat, "Failed to get the top block from oxend: {}; retrying", e.what());
+        }
+        std::this_thread::sleep_for(1s);
+    }
+}
+
 void OMQ::init(
         snode::ServiceNode* sn,
         rpc::RequestHandler* rh,
         rpc::RateLimiter* rl,
-        oxenmq::address oxend_rpc) {
+        oxenmq::address oxend_rpc,
+        const std::function<bool()>& keep_going) {
     // Initialization happens in 3 steps:
     // - connect to oxend
     // - get initial block update from oxend
@@ -330,10 +397,10 @@ void OMQ::init(
     rate_limiter_ = rl;
     omq_.start();
     // Block until we are connected to oxend:
-    connect_oxend(oxend_rpc);
+    connect_oxend(oxend_rpc, keep_going);
 
     // Block until we get a block update from oxend:
-    service_node_->on_oxend_connected();
+    service_node_->on_oxend_connected(keep_going);
 
     // start omq listener
     const auto port = service_node_->own_address().omq_quic_port;
@@ -343,8 +410,8 @@ void OMQ::init(
     omq_.listen_curve(
             fmt::format("tcp://0.0.0.0:{}", port),
             [this](std::string_view /*addr*/, std::string_view pk, bool /*sn*/) {
-                return stats_access_keys_.count(std::string{pk}) ? oxenmq::AuthLevel::admin
-                                                                 : oxenmq::AuthLevel::none;
+                return stats_access_keys_.contains(std::string{pk}) ? oxenmq::AuthLevel::admin
+                                                                    : oxenmq::AuthLevel::none;
             },
             [prom = std::move(omq_prom)](bool listen_success) {
                 if (listen_success)
@@ -418,10 +485,36 @@ void OMQ::handle_monitor_messages(oxenmq::Message& message) {
             message.conn);
 }
 
-void OMQ::notify(std::vector<connection_id>& conns, std::string_view notification) {
+void OMQ::send_notification(
+        std::vector<connection_id>& conns,
+        std::string_view command,
+        std::string_view notification) {
     for (const auto& c : conns)
         if (auto* id = std::get_if<oxenmq::ConnectionID>(&c))
-            omq_.send(*id, "notify.message", notification);
+            omq_.send(*id, command, notification);
+}
+
+void OMQ::notify(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "notify.message", notification);
+}
+
+void OMQ::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
+    send_notification(conns, "notify.monitor_ended", notification);
+}
+
+void OMQ::sn_request(
+        const snode::contact& ct,
+        std::string_view cmd,
+        std::vector<std::string> parts,
+        sn_reply_callback cb,
+        std::chrono::milliseconds timeout,
+        sn_fallback) {
+    omq_.request(
+            ct.pubkey_x25519.view(),
+            "sn.{}"_format(cmd),
+            std::move(cb),
+            oxenmq::send_option::data_parts(parts),
+            oxenmq::send_option::request_timeout{timeout});
 }
 
 void OMQ::reachability_test(std::shared_ptr<snode::sn_test> test) {

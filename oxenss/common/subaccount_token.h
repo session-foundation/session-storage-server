@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <span>
 #include <string_view>
 #include <type_traits>
 #include <stdexcept>
@@ -106,18 +107,22 @@ struct subaccount_token {
     // The full actual token, in bytes.
     std::array<uint8_t, SUBACCOUNT_TOKEN_LENGTH> token{};
 
-    // Returns a basic_string_view<uint8_t> of the full binary token value.  This is the same as
-    // `token`, just easier when a string view is needed.
-    std::basic_string_view<uint8_t> view() const { return {token.data(), token.size()}; }
+    // Returns a byte span of the full binary token value.  This is the same as `token`, just
+    // easier when a span of bytes is needed.
+    std::span<const std::byte, SUBACCOUNT_TOKEN_LENGTH> view() const {
+        return std::as_bytes(std::span{token});
+    }
 
     // Returns a string_view of the binary token value.
     std::string_view sview() const {
         return {reinterpret_cast<const char*>(token.data()), token.size()};
     }
 
-    // Returns the Ed25519 pubkey of the current token.
-    std::basic_string_view<uint8_t> pubkey() const {
-        return view().substr(SUBACCOUNT_TOKEN_PUBKEY_INDEX, SUBACCOUNT_TOKEN_LEN_PUBKEY);
+    // Returns the Ed25519 pubkey of the current token.  This is `unsigned char` rather than
+    // `std::byte` because its callers hand it straight to libsodium.
+    std::span<const unsigned char, SUBACCOUNT_TOKEN_LEN_PUBKEY> pubkey() const {
+        return std::span<const unsigned char, SUBACCOUNT_TOKEN_LEN_PUBKEY>{
+                token.data() + SUBACCOUNT_TOKEN_PUBKEY_INDEX, SUBACCOUNT_TOKEN_LEN_PUBKEY};
     }
 
     // Returns the network prefix of this token.

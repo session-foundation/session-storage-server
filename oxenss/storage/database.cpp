@@ -1219,17 +1219,30 @@ int64_t Database::retry_request_count() {
 
 namespace {
 
-    // WHERE fragment selecting owners in the (lower, upper] swarm space range, using parameters
-    // ?1-?4 for the high and low 32-bit halves of lower and upper.  Swarm space is unsigned 64-bit
-    // and sqlite integers are signed, so the halves are stored separately and compared as a row
-    // value.
-    std::string swarm_range_sql(uint64_t lower, uint64_t upper) {
-        if (lower == upper)
-            return "1";
-        return "((owners.swarm_space_hi, owners.swarm_space_lo) > (?1, ?2) {}"
-               " (owners.swarm_space_hi, owners.swarm_space_lo) <= (?3, ?4))"_format(
-                       lower < upper ? "AND" : "OR");
-    }
+    // A query over the owners in a (lower, upper] swarm space range, in the three forms such a
+    // range needs: the whole space (lower == upper), a plain range, and one that wraps around the
+    // top of the space (lower > upper).  Parameters ?1-?4 are the high and low 32-bit halves of
+    // lower and upper: swarm space is unsigned 64-bit and sqlite integers are signed, so the halves
+    // are stored separately and compared as a row value.
+    struct swarm_range_query {
+        std::string all, between, wrapped;
+
+        // `query` has a single `{}` where the range condition goes.
+        explicit swarm_range_query(fmt::format_string<std::string> query) :
+                all{fmt::format(query, "1"s)},
+                between{fmt::format(query, "({} AND {})"_format(above_lower, at_most_upper))},
+                wrapped{fmt::format(query, "({} OR {})"_format(above_lower, at_most_upper))} {}
+
+        const std::string& get(uint64_t lower, uint64_t upper) const {
+            return lower == upper ? all : lower < upper ? between : wrapped;
+        }
+
+      private:
+        static constexpr auto above_lower =
+                "(owners.swarm_space_hi, owners.swarm_space_lo) > (?1, ?2)"sv;
+        static constexpr auto at_most_upper =
+                "(owners.swarm_space_hi, owners.swarm_space_lo) <= (?3, ?4)"sv;
+    };
 
     void bind_swarm_range(SQLite::Statement& st, uint64_t lower, uint64_t upper) {
         if (lower == upper)
@@ -1242,14 +1255,15 @@ namespace {
 
 }  // namespace
 
+static const swarm_range_query has_owners_in_range_sql{
+        "SELECT EXISTS(SELECT 1 FROM owners WHERE {})"};
+
 bool Database::has_owners_in_range(uint64_t lower, uint64_t upper) {
     auto conn = db_->conn();
-    SQLite::Statement st{
-            conn.sql,
-            "SELECT EXISTS(SELECT 1 FROM owners WHERE {})"_format(swarm_range_sql(lower, upper))};
-    bind_swarm_range(st, lower, upper);
-    st.executeStep();
-    return get<int64_t>(st) != 0;
+    auto st = conn.prepared_st(has_owners_in_range_sql.get(lower, upper));
+    bind_swarm_range(*st, lower, upper);
+    st->executeStep();
+    return get<int64_t>(*st) != 0;
 }
 
 int64_t Database::max_message_id() {
@@ -1304,25 +1318,25 @@ void Database::remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm) 
             static_cast<int64_t>(swarm));
 }
 
-std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
-        int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget) {
-    auto conn = db_->conn();
-    SQLite::Statement st{
-            conn.sql,
-            R"(
+static const swarm_range_query next_dump_batch_sql{R"(
 SELECT messages.id, owners.type, owners.pubkey, messages.hash, messages.namespace,
        messages.timestamp, messages.expiry, messages.data
 FROM messages JOIN owners ON messages.owner = owners.id
 WHERE messages.id >= ?5 AND messages.id <= ?6 AND {}
-ORDER BY messages.id)"_format(swarm_range_sql(lower, upper))};
-    bind_swarm_range(st, lower, upper);
-    st.bind(5, from_id);
-    st.bind(6, end_id);
+ORDER BY messages.id)"};
+
+std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
+        int64_t from_id, int64_t end_id, uint64_t lower, uint64_t upper, size_t byte_budget) {
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(next_dump_batch_sql.get(lower, upper));
+    bind_swarm_range(*st, lower, upper);
+    st->bind(5, from_id);
+    st->bind(6, end_id);
 
     std::pair<std::vector<message>, int64_t> result{{}, 0};
     auto& [messages, last_id] = result;
     size_t size = 0;
-    while (size < byte_budget && st.executeStep()) {
+    while (size < byte_budget && st->executeStep()) {
         auto [id, type, pubkey, hash, ns, ts, exp, data] =
                 get<int64_t,
                     uint8_t,
@@ -1331,7 +1345,7 @@ ORDER BY messages.id)"_format(swarm_range_sql(lower, upper))};
                     namespace_id,
                     int64_t,
                     int64_t,
-                    std::string>(st);
+                    std::string>(*st);
         // Approximately the serialized size; the constant covers the pubkey, timestamps, namespace
         // and bt framing.
         size += data.size() + hash.size() + 80;

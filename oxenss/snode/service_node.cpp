@@ -1499,13 +1499,19 @@ std::string ServiceNode::get_status_line() const {
     // status message has to be fairly short: has to fit on one line, and if
     // it's too long systemd just truncates it when displaying it.
 
-    std::lock_guard guard(sn_mutex_);
+    // syncing_ is all that needs sn_mutex_; in particular the database counts below must not be
+    // made while holding it, as counting every message takes a noticeable time.
+    bool syncing;
+    {
+        std::lock_guard guard(sn_mutex_);
+        syncing = syncing_;
+    }
 
     std::string swarm_disp;
     if (auto our_swid = swarm_.our_swarm_id(); our_swid == INVALID_SWARM_ID)
         swarm_disp = "NONE";
     else {
-        std::string swarm_hex = "{:016x}"_format(swarm_.our_swarm_id());
+        std::string swarm_hex = "{:016x}"_format(our_swid);
         std::string_view sw{swarm_hex};
         swarm_disp = "{}…{}(n={})"_format(sw.substr(0, 4), sw.substr(sw.size() - 3), swarm_.size());
     }
@@ -1516,7 +1522,7 @@ std::string ServiceNode::get_status_line() const {
     return "v{}{}{}; {} msgs ({}) for {} accts; reqs(S/R/O/P): {}/{}/{}/{} (last {})"_format(
             STORAGE_SERVER_VERSION_STRING,
             oxenss::is_mainnet ? "" : " (TESTNET)",
-            syncing_ ? "; SYNCING" : "",
+            syncing ? "; SYNCING" : "",
             db->get_message_count(),
             util::get_human_readable_bytes(db->get_used_bytes()),
             db->get_owner_count(),

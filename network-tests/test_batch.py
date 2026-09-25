@@ -1,4 +1,4 @@
-from util import sn_address
+import pytest
 import ss
 import time
 import base64
@@ -11,20 +11,20 @@ import nacl.bindings as sodium
 from oxenc import bt_serialize, bt_deserialize
 
 
-def test_batch_json(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_batch_json(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # Store two messages for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.batch',
+        'batch',
         [
             json.dumps(
                 {
@@ -81,20 +81,21 @@ def test_batch_json(omq, random_sn, sk, exclude):
     assert s["results"][1]["body"]["hash"] == hash1
 
 
-def test_batch_bt(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+@pytest.mark.bt
+def test_batch_bt(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # Store two messages for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.batch',
+        'batch',
         [
             bt_serialize(
                 {
@@ -143,20 +144,20 @@ def test_batch_bt(omq, random_sn, sk, exclude):
     assert s[b"results"][1][b"body"][b"hash"] == hash1
 
 
-def test_sequence(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_sequence(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
 
     # Sequence some commands:
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.sequence',
+        'sequence',
         [
             json.dumps(
                 {
@@ -240,11 +241,11 @@ def test_sequence(omq, random_sn, sk, exclude):
     assert s["results"][4]["body"]["messages"] == []
 
 
-def test_failing_sequence(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk, 3)
+def test_failing_sequence(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, 3)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86400000
@@ -276,8 +277,8 @@ def test_failing_sequence(omq, random_sn, sk, exclude):
     }
 
     # Sequence some commands:
-    s_s = omq.request_future(conn, 'storage.sequence', [json.dumps(commands).encode()])
-    s_b = omq.request_future(conn, 'storage.batch', [json.dumps(commands).encode()])
+    s_s = rpc.request(conn, 'sequence', [json.dumps(commands).encode()])
+    s_b = rpc.request(conn, 'batch', [json.dumps(commands).encode()])
 
     s_s = s_s.get()
     s_b = s_b.get()

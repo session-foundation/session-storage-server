@@ -15,9 +15,9 @@ target_link_libraries(snode
     PRIVATE
     crypto
     utils
-    quic
+    oxen::quic
     server
     logging
     rpc
     oxenc::oxenc
-    sodium)
+    sessiondep::libsodium)

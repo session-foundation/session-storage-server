@@ -9,21 +9,18 @@
 namespace oxenss::crypto {
 
 enum class EncryptType {
-    aes_cbc,
     aes_gcm,
     xchacha20,
 };
 
 // Takes the encryption type as a string, returns the EncryptType value (or throws if invalid).
-// Supported values: aes-gcm, aes-cbc, xchacha20.  gcm and cbc are accepted as aliases for the
-// aes- version.
+// Supported values: aes-gcm, xchacha20.  gcm is accepted as an alias for the aes- version.
 EncryptType parse_enc_type(std::string_view enc_type);
 
 inline constexpr std::string_view to_string(EncryptType type) {
     switch (type) {
         case EncryptType::xchacha20: return "xchacha20"sv;
         case EncryptType::aes_gcm: return "aes-gcm"sv;
-        case EncryptType::aes_cbc: return "aes-cbc"sv;
     }
     return ""sv;
 }
@@ -41,10 +38,6 @@ class ChannelEncryption {
             EncryptType type, std::string_view plaintext, const x25519_pubkey& pubkey) const;
     std::string decrypt(
             EncryptType type, std::string_view ciphertext, const x25519_pubkey& pubkey) const;
-
-    // AES-CBC encryption.
-    std::string encrypt_cbc(std::string_view plainText, const x25519_pubkey& pubKey) const;
-    std::string decrypt_cbc(std::string_view cipherText, const x25519_pubkey& pubKey) const;
 
     // AES-GCM encryption.
     std::string encrypt_gcm(std::string_view plainText, const x25519_pubkey& pubKey) const;

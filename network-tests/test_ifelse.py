@@ -1,4 +1,3 @@
-from util import sn_address
 import json
 import ss
 import time
@@ -11,11 +10,11 @@ m_no = b'\x36\x8a\x5e'
 b64_m_no = 'Nope'
 
 
-def test_ifelse(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_ifelse(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     ts = int(time.time() * 1000)
     ttl = 86_400_000
@@ -30,9 +29,9 @@ def test_ifelse(omq, random_sn, sk, exclude):
 
     r = []
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [
                 json.dumps(
                     {
@@ -46,9 +45,9 @@ def test_ifelse(omq, random_sn, sk, exclude):
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [
                 json.dumps(
                     {
@@ -62,9 +61,9 @@ def test_ifelse(omq, random_sn, sk, exclude):
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [
                 json.dumps(
                     {
@@ -78,9 +77,9 @@ def test_ifelse(omq, random_sn, sk, exclude):
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [
                 json.dumps(
                     {
@@ -94,41 +93,41 @@ def test_ifelse(omq, random_sn, sk, exclude):
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [json.dumps({'if': {'hf_at_least': [19, 1]}, 'then': store_action(b64_m_yes, ts + 4)})],
         )
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [json.dumps({'if': {'hf_before': [19]}, 'then': store_action(b64_m_yes, ts + 5)})],
         )
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [json.dumps({'if': {'hf_at_least': [19]}, 'else': store_action(b64_m_yes, ts + 6)})],
         )
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [json.dumps({'if': {'hf_before': [19]}, 'else': store_action(b64_m_no, ts + 7)})],
         )
     )
 
     r.append(
-        omq.request_future(
+        rpc.request(
             conn,
-            'storage.ifelse',
+            'ifelse',
             [
                 json.dumps(
                     {
@@ -175,9 +174,9 @@ def test_ifelse(omq, random_sn, sk, exclude):
         )
     )
 
-    bad = omq.request_future(
+    bad = rpc.request(
         conn,
-        'storage.batch',
+        'batch',
         [
             json.dumps(
                 {

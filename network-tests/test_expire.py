@@ -1,5 +1,5 @@
 import ss
-from util import sn_address, random_time_delta_ms
+from util import random_time_delta_ms
 import time
 import base64
 import json
@@ -8,12 +8,12 @@ from nacl.signing import VerifyKey
 import nacl.exceptions
 
 
-def test_expire_all(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire_all(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 5)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -22,7 +22,7 @@ def test_expire_all(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = json.dumps({"pubkey": my_ss_id, "expiry": ts, "signature": sig}).encode()
 
-    resp = omq.request_future(conns[1], 'storage.expire_all', [params]).get()
+    resp = rpc.request(conns[1], 'expire_all', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -40,9 +40,9 @@ def test_expire_all(omq, random_sn, sk, exclude):
         edpk = VerifyKey(k, encoder=HexEncoder)
         edpk.verify(expected_signed, base64.b64decode(v['signature']))
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -66,12 +66,12 @@ def test_expire_all(omq, random_sn, sk, exclude):
     assert r['messages'][4]['expiration'] == msgs[4]['req']['expiry']
 
 
-def test_stale_expire_all(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_stale_expire_all(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sn = ss.random_swarm_members(swarm, 2, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    msgs = ss.store_n(omq, conn, sk, b"omg123", 5)
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 5)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -80,16 +80,16 @@ def test_stale_expire_all(omq, random_sn, sk, exclude):
     sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
     params = {"pubkey": my_ss_id, "expiry": ts, "signature": sig}
 
-    resp = omq.request_future(conn, 'storage.expire_all', [json.dumps(params).encode()]).get()
+    resp = rpc.request(conn, 'expire_all', [json.dumps(params).encode()]).get()
     assert resp == [b'406', b'expire_all timestamp should be >= current time']
 
 
-def test_expire(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 10)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 10)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -110,7 +110,7 @@ def test_expire(omq, random_sn, sk, exclude):
         {"pubkey": my_ss_id, "messages": hashes, "expiry": ts, "signature": sig}
     ).encode()
 
-    resp = omq.request_future(conns[1], 'storage.expire', [params]).get()
+    resp = rpc.request(conns[1], 'expire', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -128,9 +128,9 @@ def test_expire(omq, random_sn, sk, exclude):
             print("Bad signature from swarm member {}".format(k))
             raise e
 
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {
@@ -160,7 +160,7 @@ def test_expire(omq, random_sn, sk, exclude):
         {"pubkey": my_ss_id, "messages": hashes, "expiry": ts, "signature": sig}
     ).encode()
 
-    resp = omq.request_future(conns[1], 'storage.expire', [params]).get()
+    resp = rpc.request(conns[1], 'expire', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -179,13 +179,13 @@ def test_expire(omq, random_sn, sk, exclude):
             raise e
 
 
-def test_expire_extend(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire_extend(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    msgs = ss.store_n(omq, conn, sk, b"omg123", 10)
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 10)
 
     now = int(time.time() * 1000)
 
@@ -198,9 +198,9 @@ def test_expire_extend(omq, random_sn, sk, exclude):
     exp_long = (
         now + 31 * 24 * 60 * 60 * 1000
     )  # Beyond max TTL, should get shortened to now + max TTL
-    e = omq.request_future(
+    e = rpc.request(
         conn,
-        'storage.sequence',
+        'sequence',
         [
             json.dumps(
                 {
@@ -273,16 +273,16 @@ def test_expire_extend(omq, random_sn, sk, exclude):
         assert abs(exps[m['hash']] - 1000 * (time.time() + 30 * 24 * 60 * 60)) <= 5000
 
 
-def test_expire_shorten_extend(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire_shorten_extend(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
     now_s = time.time()
     now = int(now_s * 1000)
 
-    msgs = ss.store_n(omq, conn, sk, b"omg123", 10, now=now_s, ttl=60)
+    msgs = ss.store_n(rpc, conn, sk, b"omg123", 10, now=now_s, ttl=60)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -299,9 +299,9 @@ def test_expire_shorten_extend(omq, random_sn, sk, exclude):
     exp_30s = now + 30 * 1000
     exp_45s = now + 45 * 1000
     exp_10m = now + 10 * 60 * 1000
-    e = omq.request_future(
+    e = rpc.request(
         conn,
-        'storage.sequence',
+        'sequence',
         [
             json.dumps(
                 {
@@ -590,16 +590,18 @@ def test_expire_shorten_extend(omq, random_sn, sk, exclude):
         "more": False,
     }
 
-    # Test bug: get_expiries was not working properly when given just one hash
-    assert e[10] == {"expiries": {msgs[0]["hash"]: exp_30s}}
+    # Test bug: get_expiries was not working properly when given just one hash.  (msgs[0] was
+    # shortened to 30s in the first step, then extended to 45s along with everything else in the
+    # extend-only step above.)
+    assert e[10] == {"expiries": {msgs[0]["hash"]: exp_45s}}
 
 
-def test_expire_multi(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_expire_multi(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     sns = ss.random_swarm_members(swarm, 2, exclude)
-    conns = [omq.connect_remote(sn_address(sn)) for sn in sns]
+    conns = [rpc.connect(sn) for sn in sns]
 
-    msgs = ss.store_n(omq, conns[0], sk, b"omg123", 10)
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 10)
 
     my_ss_id = '05' + sk.verify_key.encode().hex()
 
@@ -633,7 +635,7 @@ def test_expire_multi(omq, random_sn, sk, exclude):
         {"pubkey": my_ss_id, "messages": hashes, "expiry": ts, "signature": sig}
     ).encode()
 
-    resp = omq.request_future(conns[1], 'storage.expire', [params]).get()
+    resp = rpc.request(conns[1], 'expire', [params]).get()
 
     assert len(resp) == 1
     r = json.loads(resp[0])
@@ -657,9 +659,9 @@ def test_expire_multi(omq, random_sn, sk, exclude):
             raise e
 
     now = int(time.time() * 1000)
-    r = omq.request_future(
+    r = rpc.request(
         conns[0],
-        'storage.retrieve',
+        'retrieve',
         [
             json.dumps(
                 {

@@ -11,17 +11,27 @@ find_package(Threads)
 
 target_link_libraries(server
     PUBLIC
-    uWebSockets
-    quic    # public so it gets to /daemon
+    oxen::quic    # public so it gets to /daemon
     PRIVATE
     common
     utils
     rpc
     snode
     logging
-    OpenSSL::SSL
+    sessiondep::gnutls
     oxenmq::oxenmq
-    sodium
+    sessiondep::libsodium
     Threads::Threads)
 
-set_source_files_properties(server_certificates.cpp PROPERTIES COMPILE_FLAGS -Wno-error=deprecated-declarations)
+# The OXENSS_HTTPS_* definitions are public so that anything (e.g. tests) can tell which backends
+# were built in.
+if(HTTPS_BACKEND_UWEBSOCKETS)
+    target_sources(server PRIVATE https_uws.cpp)
+    target_link_libraries(server PRIVATE uWebSockets)
+    target_compile_definitions(server PUBLIC OXENSS_HTTPS_UWEBSOCKETS)
+endif()
+if(HTTPS_BACKEND_MICROHTTPD)
+    target_sources(server PRIVATE https_mhd.cpp)
+    target_link_libraries(server PRIVATE sessiondep::libmicrohttpd)
+    target_compile_definitions(server PUBLIC OXENSS_HTTPS_MICROHTTPD)
+endif()

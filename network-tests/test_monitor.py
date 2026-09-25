@@ -1,8 +1,7 @@
-from util import sn_address
+import pytest
 import ss
 import subaccount
 import time
-import datetime
 from nacl.hash import blake2b
 from nacl.encoding import RawEncoder, Base64Encoder
 from nacl.signing import SigningKey, VerifyKey
@@ -11,8 +10,11 @@ import nacl.bindings as sodium
 import json
 import base64
 
-import oxenmq
 from oxenc import bt_serialize, bt_deserialize
+
+# Message monitoring needs the node to push notifications back down the connection, which HTTPS
+# cannot do.
+pytestmark = pytest.mark.monitor
 
 
 def notify_request(
@@ -57,87 +59,38 @@ def notify_request(
     return req
 
 
-def test_monitor_reg_ed(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def register_all(rpc, swarm, make_request):
+    """Connects to every member of `swarm` and subscribes with `make_request()` on each; returns
+    the connections (in swarm order) once every node has accepted."""
+    conns = [rpc.connect(snode) for snode in swarm['snodes']]
+    registered = [rpc.monitor(c, bt_serialize(make_request())) for c in conns]
+    assert [r.get() for r in registered] == [[b'd7:successi1ee']] * len(conns)
+    return conns
 
-    o = oxenmq.OxenMQ()
-    o.start()
+
+def test_monitor_reg_ed(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     ts = int(time.time())
-    registered = []
-    for snode in swarm['snodes']:
-        snode['addr'] = oxenmq.Address(
-            f"curve://{snode['ip']}:{snode['port_omq']}/{snode['pubkey_x25519']}"
-        )
-        c = o.connect_remote(
-            snode['addr'],
-            on_success=lambda conn: None,
-            on_failure=lambda _, msg: print(f"Connection failed: {msg}"),
-            timeout=datetime.timedelta(seconds=3),
-        )
-        req = notify_request(sk, ts, True, [-5, 0, 23], netid=3)
-        registered.append(
-            o.request_future(
-                c,
-                "monitor.messages",
-                bt_serialize(req),
-                request_timeout=datetime.timedelta(seconds=7),
-            )
-        )
-
-    registered = [r.get() for r in registered]
-    assert registered == [[b'd7:successi1ee']] * len(registered)
+    register_all(rpc, swarm, lambda: notify_request(sk, ts, True, [-5, 0, 23], netid=3))
 
 
-def test_monitor_reg_session(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
-
-    o = oxenmq.OxenMQ()
-    o.start()
+def test_monitor_reg_session(rpc, random_sn, sk, exclude):
+    # A Session ID is 05 + the x25519 key derived from sk, so that is the account whose swarm we
+    # need; the nodes check that the account is theirs before accepting the subscription.
+    swarm = ss.get_swarm(rpc, random_sn, sk.to_curve25519_private_key())
     ts = int(time.time())
-    registered = []
-    for snode in swarm['snodes']:
-        snode['addr'] = oxenmq.Address(
-            f"curve://{snode['ip']}:{snode['port_omq']}/{snode['pubkey_x25519']}"
-        )
-        c = o.connect_remote(
-            snode['addr'],
-            on_success=lambda conn: None,
-            on_failure=lambda _, msg: print(f"Connection failed: {msg}"),
-            timeout=datetime.timedelta(seconds=3),
-        )
-        req = notify_request(sk, ts, True, [-5, 0, 23], netid=5, sessionid=True)
-        registered.append(
-            o.request_future(
-                c,
-                "monitor.messages",
-                bt_serialize(req),
-                request_timeout=datetime.timedelta(seconds=7),
-            )
-        )
-
-    registered = [r.get() for r in registered]
-    assert registered == [[b'd7:successi1ee']] * len(registered)
+    register_all(
+        rpc, swarm, lambda: notify_request(sk, ts, True, [-5, 0, 23], netid=5, sessionid=True)
+    )
 
 
-def test_monitor_reg_subaccount(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
-
-    o = oxenmq.OxenMQ()
-    o.start()
+def test_monitor_reg_subaccount(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
     ts = int(time.time())
-    registered = []
-    for snode in swarm['snodes']:
-        snode['addr'] = oxenmq.Address(
-            f"curve://{snode['ip']}:{snode['port_omq']}/{snode['pubkey_x25519']}"
-        )
-        c = o.connect_remote(
-            snode['addr'],
-            on_success=lambda conn: None,
-            on_failure=lambda _, msg: print(f"Connection failed: {msg}"),
-            timeout=datetime.timedelta(seconds=3),
-        )
+
+    def make_request():
         sub_sk, sub_token, sub_sig = subaccount.make_subaccount(2, sk)
-        req = notify_request(
+        return notify_request(
             sub_sk,
             ts,
             True,
@@ -148,61 +101,43 @@ def test_monitor_reg_subaccount(omq, random_sn, sk, exclude):
             subacc_sig=sub_sig,
         )
 
-        registered.append(
-            o.request_future(
-                c,
-                "monitor.messages",
-                bt_serialize(req),
-                request_timeout=datetime.timedelta(seconds=7),
-            )
-        )
-
-    registered = [r.get() for r in registered]
-    assert registered == [[b'd7:successi1ee']] * len(registered)
+    register_all(rpc, swarm, make_request)
 
 
-def test_monitor_push(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def collect_notifications(rpc, conns):
+    """Arranges for each connection's pushed notifications to land, decoded, in a list; returns
+    the lists (one per connection)."""
+    responses = [[] for _ in conns]
+    for c, r in zip(conns, responses):
+        rpc.on_notify(c, lambda body, r=r: r.append(bt_deserialize(body)))
+    return responses
 
-    conns = {}
 
-    n_notifies = 0
+def wait_for_notifications(responses, tries=8):
+    # It's pretty rare that the notifications don't beat the store response back to us (they
+    # don't have to be onion-routed), but give them a couple seconds anyway.
+    for _ in range(tries):
+        if all(responses):
+            break
+        time.sleep(0.25)
 
-    def handle_notify_message(m):
-        nonlocal conns, n_notifies
-        snode = conns[m.conn]
-        # print(f"got notify from {snode['pubkey_legacy']} at {time.time()}")
-        conns[m.conn]['response'].append(bt_deserialize(m.data()[0]))
-        n_notifies += 1
 
-    # We need to make our own OMQ because we need to add the cat/command for notifies
-    o = oxenmq.OxenMQ()
-    o.max_message_size = 10 * 1024 * 1024
-    notify = o.add_category('notify', oxenmq.AuthLevel.none)
-    notify.add_command("message", handle_notify_message)
-    o.start()
+def test_monitor_push(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
 
     ts = int(time.time())
-    registered = []
-    for snode in swarm['snodes']:
-        snode['response'] = []
-        c = o.connect_remote(
-            oxenmq.Address(f"curve://{snode['ip']}:{snode['port_omq']}/{snode['pubkey_x25519']}"),
-            on_success=lambda conn: connected.add(conn),
-            on_failure=lambda _, msg: print(f"Connection failed: {msg}"),
-        )
-        snode['conn'] = c
-        conns[c] = snode
+    conns = [rpc.connect(snode) for snode in swarm['snodes']]
+    responses = collect_notifications(rpc, conns)
 
+    registered = []
+    for i, c in enumerate(conns):
         # The first three are set up as full subscriptions; beyond that we use subaccounts:
         req_sk, sub_token, sub_sig = sk, None, None
-        if len(registered) >= 3:
+        if i >= 3:
             req_sk, sub_token, sub_sig = subaccount.make_subaccount(3, sk)
-
         registered.append(
-            o.request_future(
+            rpc.monitor(
                 c,
-                "monitor.messages",
                 bt_serialize(
                     notify_request(
                         req_sk,
@@ -215,58 +150,47 @@ def test_monitor_push(omq, random_sn, sk, exclude):
                         subacc_sig=sub_sig,
                     )
                 ),
-                request_timeout=datetime.timedelta(seconds=5),
             )
         )
-
-    registered = [r.get() for r in registered]
-    assert registered == [[b'd7:successi1ee']] * len(registered)
+    assert [r.get() for r in registered] == [[b'd7:successi1ee']] * len(conns)
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    # print(f"starting store at {time.time()}")
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
-        [
-            json.dumps(
-                {
-                    "pubkey": '03' + sk.verify_key.encode().hex(),
-                    "timestamp": ts,
-                    "ttl": ttl,
-                    "data": base64.b64encode("abc 123".encode()).decode(),
-                }
-            ).encode()
-        ],
+        'store',
+        json.dumps(
+            {
+                "pubkey": '03' + sk.verify_key.encode().hex(),
+                "timestamp": ts,
+                "ttl": ttl,
+                "data": base64.b64encode("abc 123".encode()).decode(),
+            }
+        ).encode(),
     )
 
     # And another, but this one in a non-monitored namespace:
-    s2 = omq.request_future(
+    s2 = rpc.request(
         conn,
-        'storage.store',
-        [
-            json.dumps(
-                {
-                    "pubkey": '03' + sk.verify_key.encode().hex(),
-                    "timestamp": ts,
-                    "namespace": 123,
-                    "ttl": ttl,
-                    "data": base64.b64encode("abc 123".encode()).decode(),
-                }
-            ).encode()
-        ],
+        'store',
+        json.dumps(
+            {
+                "pubkey": '03' + sk.verify_key.encode().hex(),
+                "timestamp": ts,
+                "namespace": 123,
+                "ttl": ttl,
+                "data": base64.b64encode("abc 123".encode()).decode(),
+            }
+        ).encode(),
     )
 
-    # It's pretty rare that we don't get all the responses before the store responses (since they
-    # don't have to be onion-routed back to us), but give it a couple seconds anyway.
     s = s.get()
-    # print(f"got store response at {time.time()}")
     assert len(s) == 1
     s = json.loads(s[0])
     hash = (
@@ -278,10 +202,7 @@ def test_monitor_push(omq, random_sn, sk, exclude):
 
     s2 = s2.get()
 
-    tries = 0
-    while n_notifies < len(swarm['snodes']) and tries < 8:
-        time.sleep(0.25)
-        tries += 1
+    wait_for_notifications(responses)
 
     expected_notify = {
         b'@': b'\x03' + sk.verify_key.encode(),
@@ -292,98 +213,63 @@ def test_monitor_push(omq, random_sn, sk, exclude):
         b'~': b'abc 123',
     }
 
-    assert [s['response'] for s in swarm['snodes']] == [[expected_notify]] * len(swarm['snodes'])
+    assert responses == [[expected_notify]] * len(conns)
 
 
-def test_monitor_multi(omq, random_sn, sk, exclude):
-    swarm = ss.get_swarm(omq, random_sn, sk)
+def test_monitor_multi(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk, netid=3)
 
-    conns = {}
-
-    n_notifies = 0
-
-    sk2 = SigningKey.generate()
-
-    def handle_notify_message(m):
-        nonlocal conns, n_notifies
-        snode = conns[m.conn]
-        # print(f"got notify from {snode['pubkey_legacy']} at {time.time()}")
-        conns[m.conn]['response'].append(bt_deserialize(m.data()[0]))
-        n_notifies += 1
-
-    # We need to make our own OMQ because we need to add the cat/command for notifies
-    o = oxenmq.OxenMQ()
-    o.max_message_size = 10 * 1024 * 1024
-    notify = o.add_category('notify', oxenmq.AuthLevel.none)
-    notify.add_command("message", handle_notify_message)
-    o.start()
+    # Both subscriptions in the combined request go to sk's swarm, and a node only accepts a
+    # subscription for an account it stores, so sk2 has to land in the same swarm.
+    while True:
+        sk2 = SigningKey.generate()
+        if ss.get_swarm(rpc, random_sn, sk2, netid=3)['swarm'] == swarm['swarm']:
+            break
 
     ts = int(time.time())
-    registered = []
-    for snode in swarm['snodes']:
-        snode['response'] = []
-        c = o.connect_remote(
-            oxenmq.Address(f"curve://{snode['ip']}:{snode['port_omq']}/{snode['pubkey_x25519']}"),
-            on_success=lambda conn: connected.add(conn),
-            on_failure=lambda _, msg: print(f"Connection failed: {msg}"),
-        )
-        snode['conn'] = c
-        conns[c] = snode
+    conns = [rpc.connect(snode) for snode in swarm['snodes']]
+    responses = collect_notifications(rpc, conns)
 
-        registered.append(
-            o.request_future(
-                c,
-                "monitor.messages",
-                bt_serialize(
-                    [
-                        notify_request(sk2, ts, True, [0], netid=3),
-                        notify_request(sk, ts, True, [-5, 0, 23], netid=3),
-                    ]
-                ),
-                request_timeout=datetime.timedelta(seconds=5),
-            )
+    registered = [
+        rpc.monitor(
+            c,
+            bt_serialize(
+                [
+                    notify_request(sk2, ts, True, [0], netid=3),
+                    notify_request(sk, ts, True, [-5, 0, 23], netid=3),
+                ]
+            ),
         )
-
-    registered = [r.get() for r in registered]
-    assert registered == [[b'l' + b'd7:successi1ee' * 2 + b'e']] * len(registered)
+        for c in conns
+    ]
+    assert [r.get() for r in registered] == [[b'l' + b'd7:successi1ee' * 2 + b'e']] * len(conns)
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
-    conn = omq.connect_remote(sn_address(sn))
+    conn = rpc.connect(sn)
 
-    # print(f"starting store at {time.time()}")
     ts = int(time.time() * 1000)
     ttl = 86400000
     exp = ts + ttl
     # Store a message for myself
-    s = omq.request_future(
+    s = rpc.request(
         conn,
-        'storage.store',
-        [
-            json.dumps(
-                {
-                    "pubkey": '03' + sk.verify_key.encode().hex(),
-                    "timestamp": ts,
-                    "ttl": ttl,
-                    "data": base64.b64encode("xyz 123".encode()).decode(),
-                }
-            ).encode()
-        ],
-    )
-
-    s = s.get()
-    # print(f"got store response at {time.time()}")
+        'store',
+        json.dumps(
+            {
+                "pubkey": '03' + sk.verify_key.encode().hex(),
+                "timestamp": ts,
+                "ttl": ttl,
+                "data": base64.b64encode("xyz 123".encode()).decode(),
+            }
+        ).encode(),
+    ).get()
     assert len(s) == 1
     s = json.loads(s[0])
 
-    tries = 0
-    while n_notifies < len(swarm['snodes']) and tries < 8:
-        time.sleep(0.25)
-        tries += 1
+    wait_for_notifications(responses)
 
-    for sn in s['swarm'].values():
-        hash = sn['hash']
-        break
+    hash = next(iter(s['swarm'].values()))['hash']
 
     expected_notify = {
         b'@': b'\x03' + sk.verify_key.encode(),
@@ -394,4 +280,4 @@ def test_monitor_multi(omq, random_sn, sk, exclude):
         b'~': b'xyz 123',
     }
 
-    assert [s['response'] for s in swarm['snodes']] == [[expected_notify]] * len(swarm['snodes'])
+    assert responses == [[expected_notify]] * len(conns)

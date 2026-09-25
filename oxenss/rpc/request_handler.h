@@ -15,19 +15,12 @@
 #include <chrono>
 #include <string>
 #include <string_view>
-#include <type_traits>
+#include <concepts>
 #include <variant>
 
 #include <nlohmann/json_fwd.hpp>
 
 namespace oxenss::rpc {
-
-// When a storage test returns a "retry" response, we retry again after this interval:
-inline constexpr auto TEST_RETRY_INTERVAL = 50ms;
-
-// If a storage test is still returning "retry" after this long since the initial request then
-// we give up and send an error response back to the requestor:
-inline constexpr auto TEST_RETRY_PERIOD = 55s;
 
 // Minimum and maximum TTL permitted for storing a new, public message
 inline constexpr auto TTL_MINIMUM = 10s;
@@ -84,6 +77,21 @@ struct Response {
             status{status}, body{binary_response}, keepalive{keepalive} {}
 };
 
+enum class SNStorageCCResultStatus {
+    Good,
+    Timeout,
+    ErrorCodeReason,
+    BadPeerResponse,
+};
+
+// Helper struct that stores the decoded response of a 'sn.storage_cc' request to a storage server
+// and consequently the possible replies/states that can be returned from this operation.
+struct SNStorageCCResult {
+    SNStorageCCResultStatus status = {};
+    std::string_view error_code;
+    std::string_view error_reason;
+};
+
 // Views the string or string_view body inside a Response.  Should only be called when the body
 // has already been verified to not contain a json object or binary blob.
 inline std::string_view view_body(const Response& r) {
@@ -105,7 +113,7 @@ namespace detail {
     // into the written buffer space.  For strings/string_views the string_view is returned
     // directly from the argument. system_clock::time_points are converted into integral
     // milliseconds since epoch then treated as an integer value.
-    template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+    template <std::integral T>
     std::string_view to_hashable(const T& val, char*& buffer) {
         auto [p, ec] = std::to_chars(buffer, buffer + 20, val);
         std::string_view s(buffer, p - buffer);
@@ -116,7 +124,7 @@ namespace detail {
             const std::chrono::system_clock::time_point& val, char*& buffer) {
         return to_hashable(to_epoch_ms(val), buffer);
     }
-    template <typename T, std::enable_if_t<std::is_convertible_v<T, std::string_view>, int> = 0>
+    template <std::convertible_to<std::string_view> T>
     std::string_view to_hashable(const T& value, char*&) {
         return value;
     }
@@ -147,6 +155,11 @@ std::string compute_hash(Func hasher, const T&... args) {
 
 /// Computes a message hash using blake2b hash of various messages attributes.
 std::string computeMessageHash(const user_pubkey& pubkey, namespace_id ns, std::string_view data);
+
+/// Interpret the result an OMQ request to the 'sn.storage_cc' endpoint, typically for recursive
+/// swarm requests.
+SNStorageCCResult interpret_sn_storage_cc_response_parts(
+        bool success, std::span<std::string> parts);
 
 struct OnionRequestMetadata {
     crypto::x25519_pubkey ephem_key;

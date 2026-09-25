@@ -25,9 +25,9 @@ struct RelayToNodeInfo {
     crypto::EncryptType enc_type;
     // Next node's ed25519 key
     crypto::ed25519_pubkey next_node;
-};
 
-bool operator==(const RelayToNodeInfo& lhs, const RelayToNodeInfo& rhs);
+    bool operator==(const RelayToNodeInfo&) const = default;
+};
 
 /// The request is to be forwarded to some non-SS server
 /// that supports our protocol (e.g. Session File Server)
@@ -42,9 +42,9 @@ struct RelayToServerInfo {
     std::string protocol;
     // Request's target
     std::string target;
-};
 
-bool operator==(const RelayToServerInfo& lhs, const RelayToServerInfo& rhs);
+    bool operator==(const RelayToServerInfo&) const = default;
+};
 
 /// We are the final destination for this request
 struct FinalDestinationInfo {
@@ -66,9 +66,9 @@ struct FinalDestinationInfo {
     // If true (which is the default for backwards compatibility) then encode the encrypted
     // response as base64; if false return the encrypted response as-is.
     bool base64 = true;
-};
 
-bool operator==(const FinalDestinationInfo& lhs, const FinalDestinationInfo& rhs);
+    bool operator==(const FinalDestinationInfo&) const = default;
+};
 
 enum class ProcessCiphertextError {
     INVALID_CIPHERTEXT,

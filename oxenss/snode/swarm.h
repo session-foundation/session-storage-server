@@ -1,11 +1,15 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 #include <set>
-#include <unordered_map>
+
+#include <nlohmann/json_fwd.hpp>
+#include <oxenc/bt_producer.h>
 
 #include "network.h"
 #include "oxenss/crypto/keys.h"
+#include "oxenss/storage/database.hpp"
 
 namespace oxenss::snode {
 
@@ -14,6 +18,23 @@ using namespace std::literals;
 class ServiceNode;
 
 enum class SnodeStatus { UNKNOWN, UNSTAKED, DECOMMISSIONED, ACTIVE };
+
+/// The id and membership of some swarm, as returned by `Network::get_swarm_for`; nullopt when no
+/// swarms are known at all.
+using swarm_membership = std::optional<std::pair<swarm_id_t, std::set<crypto::legacy_pubkey>>>;
+
+/// Describes a swarm for a client: a `snodes` list of one dict per contactable member, plus the
+/// hex-encoded `swarm` id.  This is what clients get in a 421 wrong-swarm response body and from
+/// the `get_swarm` endpoint.
+nlohmann::json swarm_to_json(const swarm_membership& swarm, const Contacts& contacts);
+
+/// Appends the same `snodes` and `swarm` keys that `swarm_to_json` produces to a bt-encoded dict,
+/// for the notification channels, which are bt- rather than json-encoded.
+///
+/// bt dict keys must be appended in ascending order, so `out` must not yet contain any key sorting
+/// at or after "snodes".
+void swarm_to_bt(
+        oxenc::bt_dict_producer& out, const swarm_membership& swarm, const Contacts& contacts);
 
 struct SwarmEvents {
     /// our (potentially new) swarm id
@@ -28,66 +49,99 @@ struct SwarmEvents {
     std::set<crypto::legacy_pubkey> our_swarm_members;
 };
 
+enum struct SwarmMemberStatus {
+    // A member we have not yet completed an sn.data_ready handshake with.
+    ContactDetailsPending,
+    Ready,
+};
+
+enum struct SwarmRequestedDBDump {
+    Nil,
+    NeedsToRequest,
+    RequestUnderway,
+};
+
+struct SwarmMemberState {
+    SwarmMemberStatus status;
+
+    // Whether we need to ask this member for a dump of the swarm's messages: the request goes out
+    // with the data_ready handshake, moving this from NeedsToRequest to RequestUnderway, and back
+    // to Nil once acknowledged (or to NeedsToRequest to try again if it fails).
+    SwarmRequestedDBDump our_ss_requested_db_dump;
+
+    // Whether this member joined a swarm we were already in (as opposed to us entering its swarm,
+    // or it merely being unknown after a restart).  Such a member needs our copy of the swarm's
+    // messages: a 2.12+ node asks for it in its own handshake with us, but an older one never
+    // handshakes with a swarm it joins and expects the messages to follow our handshake with it,
+    // so we push them when it acknowledges that.  Cleared once that decision is made.
+    bool joined_our_swarm;
+
+    // The earliest timestamp at which the swarm will check if they have received contact
+    // information for this member yet and can send them data. Only utilised when status is
+    // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact
+    // detail has been confirmed.
+    std::chrono::steady_clock::time_point check_contact_info_next_retry;
+};
+
 // How often we wait, after returning a pending new member, before we return the member again from
 // `extract_new_members()`.
 constexpr auto NEW_SWARM_MEMBER_RETRY = 30s;
 
 class Swarm {
+    // Extract relevant information from incoming swarm composition.
+    SwarmEvents derive_swarm_events(uint64_t height, const swarms_t& swarms) const;
+
+    friend class ServiceNode;
+
+    std::map<crypto::legacy_pubkey, SwarmMemberState>
+            members_;  // includes `our_pk`, when we are in a swarm.
+
     swarm_id_t cur_swarm_id_ = INVALID_SWARM_ID;
 
-    std::set<crypto::legacy_pubkey> members_;  // includes `our_pk`, when we are in a swarm.
-
-    // Pubkeys of new members into our swarm who we haven't yet established communications with;
-    // once we do, we push all our swarm's messages to them.  The value is the earliest timestamp at
-    // which we should next try contacting them, or nullopt if we have confirmed contact and can now
-    // send the data.
-    std::unordered_map<crypto::legacy_pubkey, std::optional<std::chrono::steady_clock::time_point>>
-            pending_new_members_;
-
-    // Extract relevant information from incoming swarm composition.
-    SwarmEvents derive_swarm_events(const swarms_t& swarms) const;
+    Database& _db;
 
   public:
-    Network& network;
-    const crypto::legacy_pubkey our_pk;
-
-    Swarm(Network& network, const crypto::legacy_pubkey& our_pk) :
-            network{network}, our_pk{our_pk} {}
+    Swarm(Network& network, const crypto::legacy_pubkey& our_pk, Database& db) :
+            _db(db), network{network}, our_pk{our_pk} {}
 
     ~Swarm();
+
+    Network& network;
+
+    const crypto::legacy_pubkey our_pk;
 
     /// Update swarm state; this takes care of updating both this swarm itself, and propagates the
     /// general network swarm changes to the Network object (including contacts) as well.
     SwarmEvents update_swarms(
-            swarms_t&& swarms, const std::map<crypto::legacy_pubkey, contact>& new_contacts);
+            uint64_t height,
+            swarms_t&& swarms,
+            const std::map<crypto::legacy_pubkey, contact>& new_contacts);
 
     bool is_pubkey_for_us(const user_pubkey& pk) const;
 
     // Returns a copy of all the members of this swarm, including this node.
-    std::set<crypto::legacy_pubkey> members() const;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> members() const;
 
     // Returns a copy of all the other members of this swarm, not including this node.
-    std::set<crypto::legacy_pubkey> peers() const;
+    std::map<crypto::legacy_pubkey, SwarmMemberState> peers() const;
 
-    // Returns true if the given pubkey is recognized as a member of this swarm.
-    bool is_member(const crypto::legacy_pubkey& pk) const;
-    bool is_member(const crypto::x25519_pubkey& pk) const;
-    bool is_member(const crypto::ed25519_pubkey& pk) const;
+    // Returns the swarm member's state if the given pubkey is recognized as a member of this swarm.
+    std::optional<SwarmMemberState> is_member(const crypto::legacy_pubkey& pk) const;
+    std::optional<SwarmMemberState> is_member(const crypto::x25519_pubkey& pk) const;
+    std::optional<SwarmMemberState> is_member(const crypto::ed25519_pubkey& pk) const;
+
+    // Returns the underlying swarm member's state. Returns a null pointer if 'pk' is not a member
+    // in your swarm. Caller must hold a lock on the network mutex to call this and the pointer is
+    // only valid whilst that lock remains held.
+    SwarmMemberState* is_member_locked(const crypto::legacy_pubkey& pk);
 
     // Returns the size of this swarm (including this node).
     size_t size() const;
 
     // Resets the timer and returns the pubkeys of any new swarm members that are due to be
-    // contacted to push swarm messages to.
-    std::set<crypto::legacy_pubkey> extract_pending_members();
-
-    // Marks a pending member as ready, so that it is returned by the next call to
-    // `extract_ready_members()`, and is no longer returned by `extract_pending_members()`.
-    void set_member_ready(const crypto::legacy_pubkey& pk);
-
-    // Extracts any "ready" members (that is, those that were pending and then marked ready with
-    // `set_member_ready`), returning them and removing them from the pending members list.
-    std::set<crypto::legacy_pubkey> extract_ready_members();
+    // contacted to establish liveness in prep for transitioning to a contact that we can push swarm
+    // messages to.
+    std::set<crypto::legacy_pubkey> extract_contact_pending_members();
 
     swarm_id_t our_swarm_id() const {
         std::shared_lock lock{network.mut_};

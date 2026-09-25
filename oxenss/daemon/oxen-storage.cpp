@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -57,19 +58,14 @@ int main(int argc, char* argv[]) {
     if (!fs::exists(options.data_dir))
         fs::create_directories(options.data_dir);
 
-    log::Level log_level;
-    try {
-        log_level = log::level_from_string(options.log_level);
-    } catch (const std::invalid_argument& e) {
+    if (!logging::init(options.data_dir, options.log_level)) {
         log::critical(
                 logcat,
-                "{}; supported levels: trace, debug, info, warn, error, critical, off",
-                e.what(),
+                "Invalid --log-level '{}': expected a level (trace, debug, info, warning, error, "
+                "critical, off) and/or CAT=LEVEL entries",
                 options.log_level);
         return EXIT_FAILURE;
     }
-
-    logging::init(options.data_dir, log_level);
 
     if (options.testnet) {
         is_mainnet = false;
@@ -79,7 +75,7 @@ int main(int argc, char* argv[]) {
     // Always print version for the logs
     log::info(logcat, "{}", STORAGE_SERVER_VERSION_INFO);
 
-    log::info(logcat, "Setting log level to {}", options.log_level);
+    log::info(logcat, "Log levels: {}", options.log_level);
     log::info(logcat, "Setting database location to {}", util::to_sv(options.data_dir.u8string()));
     log::info(logcat, "Connecting to oxend @ {}", options.oxend_omq_rpc);
 
@@ -139,13 +135,14 @@ int main(int argc, char* argv[]) {
 
         crypto::ChannelEncryption channel_encryption{x_keys};
 
-        auto ssl_cert = options.data_dir / "cert.pem";
-        auto ssl_key = options.data_dir / "key.pem";
-        auto ssl_dh = options.data_dir / "dh.pem";
+        // Deliberately not cert.pem/key.pem: those hold the RSA certificate earlier releases
+        // issued, and a node upgrading would otherwise go on serving it forever, since we only
+        // generate when the file is absent.  Using a new name abandons the old pair instead;
+        // cert.pem, key.pem and dh.pem are left on disk but no longer read.
+        auto ssl_cert = options.data_dir / "cert_ecdsa.pem";
+        auto ssl_key = options.data_dir / "key_ecdsa.pem";
         if (!exists(ssl_cert) || !exists(ssl_key))
             generate_cert(ssl_cert, ssl_key);
-        if (!exists(ssl_dh))
-            generate_dh_pem(ssl_dh);
 
         // Set up oxenmq now, but don't actually start it until after we set up the ServiceNode
         // instance (because ServiceNode and OxenmqServer reference each other).
@@ -153,7 +150,12 @@ int main(int argc, char* argv[]) {
         auto& oxenmq_server = *oxenmq_server_ptr;
 
         snode::ServiceNode service_node{
-                l_keys, me, oxenmq_server, options.data_dir, options.force_start};
+                l_keys,
+                me,
+                oxenmq_server,
+                options.data_dir,
+                options.force_start,
+                options.skip_bootstrap};
 
         rpc::RequestHandler request_handler{service_node, channel_encryption, ed_keys.sec};
 
@@ -176,15 +178,18 @@ int main(int argc, char* argv[]) {
         quic_bind.back().dual_stack = false;
 #endif
 
-        server::HTTPS https_server{
+        // Validated by the command-line parser, so this cannot fail to parse.
+        auto https_backend = *server::parse_https_backend(options.https_backend);
+        log::info(logcat, "Using HTTPS backend: {}", https_backend);
+        auto https_server = server::make_https(
+                https_backend,
                 service_node,
                 request_handler,
                 rate_limiter,
                 std::move(https_bind),
                 ssl_cert,
                 ssl_key,
-                ssl_dh,
-                l_keys};
+                l_keys);
 
         auto quic = std::make_unique<server::QUIC>(
                 service_node, request_handler, rate_limiter, std::move(quic_bind), ed_keys.sec);
@@ -198,11 +203,12 @@ int main(int argc, char* argv[]) {
                 &service_node,
                 &request_handler,
                 &rate_limiter,
-                oxenmq::address{options.oxend_omq_rpc});
+                oxenmq::address{options.oxend_omq_rpc},
+                [] { return signalled == 0; });
 
         quic->startup_endpoint();
 
-        https_server.start();
+        https_server->start();
 
 #ifdef ENABLE_SYSTEMD
         sd_notify(0, "READY=1");
@@ -226,12 +232,15 @@ int main(int argc, char* argv[]) {
                               // `quic`'s event loop so *must* be destroyed before `quic`.
         service_node.shutdown();
         log::info(logcat, "Stopping https server");
-        https_server.shutdown(true);
+        https_server->shutdown(true);
         log::info(logcat, "Stopping quic server");
         quic.reset();
         log::info(logcat, "Stopping omq server");
         oxenmq_server_ptr.reset();
         log::info(logcat, "Shutting down");
+    } catch (const snode::startup_aborted&) {
+        log::error(logcat, "Received signal {}, aborting startup", signalled.load());
+        return EXIT_FAILURE;
     } catch (const std::exception& e) {
         // It seems possible for logging to throw its own exception,
         // in which case it will be propagated to libc...

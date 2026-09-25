@@ -8,12 +8,14 @@
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 #include <oxenss/common/format.h>
+#include <oxenc/base64.h>
 #include <oxenc/hex.h>
 
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -1025,6 +1027,30 @@ std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey
     return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
+namespace {
+    // Message hashes are base64-encoded digests, so decoding just enough of the text to fill a
+    // size_t gives uniformly random hash bits without hashing the whole string.  (The text itself
+    // is not uniform: each byte is one of only 64 characters.)  Characters that aren't base64
+    // decode as 0, which only makes collisions for such (invalid) hashes more likely.
+    //
+    // Deliberately not noexcept: libstdc++ stores each node's hash code only for a hash that may
+    // throw, and otherwise recomputes neighbouring nodes' hashes while walking a bucket, which would
+    // repeat this decode.
+    struct b64_prefix_hash {
+        static constexpr size_t chars = (std::numeric_limits<size_t>::digits + 5) / 6;
+
+        size_t operator()(std::string_view s) const {
+            if (s.size() < chars)
+                return std::hash<std::string_view>{}(s);
+            size_t h = 0;
+            for (size_t i = 0; i < chars; i++)
+                h = (h << 6) | static_cast<unsigned char>(oxenc::detail::b64_lut.from_b64(
+                                       static_cast<unsigned char>(s[i])));
+            return h;
+        }
+    };
+}  // namespace
+
 static constexpr auto update_expiry_any =
         "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3"sv;
 static constexpr auto update_expiry_extend =
@@ -1068,7 +1094,9 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
     // extend/shorten constraint a repeat can't match again (the row's expiry now equals the one
     // being set), but with neither constraint it would.
     const bool dedupe = new_exp.size() == 1 && !extend_only && !shorten_only;
-    std::unordered_set<std::string_view> seen;
+    std::unordered_set<std::string_view, b64_prefix_hash> seen;
+    if (dedupe)
+        seen.reserve(msg_hashes.size());
     for (size_t i = 0; i < msg_hashes.size(); i++) {
         if (dedupe && !seen.insert(msg_hashes[i]).second)
             continue;

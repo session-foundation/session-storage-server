@@ -246,6 +246,16 @@ TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]
     CHECK(storage.delete_by_hash(nobody, hashes{"h2", "other"}).empty());
     CHECK(storage.get_message_count() == 3);
     CHECK(storage.get_expiries(pk2, hashes{"other", "h2"}) == expiries{{"other", exp1h}});
+
+    // Distinct hashes sharing a long prefix are not mistaken for repeats
+    const std::string long1 = "0123456789abcdef-one", long2 = "0123456789abcdef-two";
+    REQUIRE(storage.store({pk1, long1, namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk1, long2, namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+    updated = storage.update_expiry(pk1, hashes{long1, long2, long1}, std::array{now + 2h});
+    std::ranges::sort(updated);
+    CHECK(updated == updates{{long1, now + 2h}, {long2, now + 2h}});
 }
 
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {

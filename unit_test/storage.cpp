@@ -12,6 +12,7 @@
 #include <thread>
 #include <future>
 
+#include <SQLiteCpp/SQLiteCpp.h>
 #include <catch2/catch.hpp>
 #include "oxenss/common/format.h"
 #include "oxenss/utils/time.hpp"
@@ -175,6 +176,211 @@ TEST_CASE("storage - only return entries for specified pubkey", "[storage]") {
         REQUIRE(items.size() == 1);
         CHECK(items[0].hash == "hash1");
     }
+}
+
+TEST_CASE("storage - tracked message count", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    const auto now = std::chrono::system_clock::now();
+    const auto def = namespace_id::Default;
+    const auto outbox = static_cast<namespace_id>(-1);
+    using hashes = std::vector<std::string>;
+
+    // Checks the tracked count against one actually counted from the database
+    auto check = [](Database& storage, int64_t expected) {
+        int64_t actual = 0;
+        for (auto& [ns, count] : storage.get_namespace_counts())
+            actual += count;
+        CHECK(actual == expected);
+        CHECK(storage.get_message_count() == expected);
+    };
+
+    {
+        Database storage{"."};
+        for (int i = 0; i < 5; i++)
+            REQUIRE(storage.store({pk1, "a{}"_format(i), def, now, now + 1h, "data"}) ==
+                    StoreResult::New);
+        check(storage, 5);
+        REQUIRE(storage.store({pk1, "a0", def, now, now + 1h, "data"}) == StoreResult::Exists);
+        REQUIRE(storage.store({pk1, "a0", def, now, now + 2h, "data"}) == StoreResult::Extended);
+        check(storage, 5);
+
+        // A public outbox holds one message: a newer one replaces it, an older one is refused
+        REQUIRE(storage.store({pk1, "o1", outbox, now, now + 1h, "data"}) == StoreResult::New);
+        REQUIRE(storage.store({pk1, "o2", outbox, now + 1s, now + 1h, "data"}) == StoreResult::New);
+        REQUIRE(storage.store({pk1, "o0", outbox, now - 1s, now + 1h, "data"}) ==
+                StoreResult::Obsolete);
+        check(storage, 6);
+
+        // Two new messages, one already stored, and another outbox replacement
+        storage.bulk_store(std::vector<message>{
+                {pk2, "b0", def, now - 10s, now + 1h, "data"},
+                {pk2, "b1", def, now, now + 1h, "data"},
+                {pk1, "a1", def, now, now + 3h, "data"},
+                {pk1, "o3", outbox, now + 2s, now + 1h, "data"}});
+        check(storage, 8);
+
+        CHECK(storage.delete_by_hash(pk1, hashes{"a1", "a2", "nope"}).size() == 2);
+        check(storage, 6);
+        CHECK(storage.delete_all(pk1, def).size() == 3);
+        check(storage, 3);
+        CHECK(storage.delete_by_timestamp(pk2, def, now - 5s).size() == 1);
+        check(storage, 2);
+        CHECK(storage.delete_by_timestamp(pk2, now).size() == 1);
+        check(storage, 1);
+
+        REQUIRE(storage.store({pk2, "gone", def, now - 2h, now - 1h, "data"}) == StoreResult::New);
+        check(storage, 2);
+        storage.clean_expired();
+        check(storage, 1);
+        REQUIRE(storage.store({pk2, "c0", def, now, now + 1h, "data"}) == StoreResult::New);
+        CHECK(storage.delete_all(pk1).size() == 1);
+        check(storage, 1);
+    }
+
+    // Counted afresh on startup
+    Database storage{"."};
+    check(storage, 1);
+}
+
+TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+
+    const auto now = std::chrono::system_clock::now();
+    int n = 0;
+    for (auto [pk, ns, count] : {std::tuple{&pk1, 0, 3}, {&pk1, 2, 1}, {&pk2, 0, 2}, {&pk2, 5, 4}})
+        for (int i = 0; i < count; i++)
+            REQUIRE(storage.store(
+                            {*pk,
+                             "h{}"_format(n++),
+                             static_cast<namespace_id>(ns),
+                             now,
+                             now + 1h,
+                             "data"}) == StoreResult::New);
+
+    auto counts = storage.get_namespace_counts();
+    std::ranges::sort(counts);
+    CHECK(counts == std::vector<std::pair<namespace_id, int64_t>>{
+                            {static_cast<namespace_id>(0), 5},
+                            {static_cast<namespace_id>(2), 1},
+                            {static_cast<namespace_id>(5), 4}});
+}
+
+TEST_CASE("storage - delete by timestamp", "[storage][namespace]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+    const auto ns2 = static_cast<namespace_id>(2);
+    for (auto [hash, ns, ts] :
+         {std::tuple{"old0", namespace_id::Default, now - 1h},
+          {"old2", ns2, now - 1h},
+          {"new0", namespace_id::Default, now},
+          {"new2", ns2, now}})
+        REQUIRE(storage.store({pk, hash, ns, ts, now + 1h, "data"}) == StoreResult::New);
+
+    CHECK(storage.delete_by_timestamp(pk, ns2, now - 30min) == std::vector<std::string>{"old2"});
+
+    auto deleted = storage.delete_by_timestamp(pk, now);
+    std::ranges::sort(deleted);
+    CHECK(deleted ==
+          std::vector<std::pair<namespace_id, std::string>>{
+                  {namespace_id::Default, "new0"}, {namespace_id::Default, "old0"}, {ns2, "new2"}});
+    CHECK(storage.get_namespace_counts().empty());
+}
+
+TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    const auto now = std::chrono::system_clock::now();
+    for (int i = 1; i <= 4; i++)
+        REQUIRE(storage.store(
+                        {pk1, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
+                StoreResult::New);
+    REQUIRE(storage.store({pk2, "other", namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+
+    using hashes = std::vector<std::string>;
+    using expiries = std::map<std::string, int64_t>;
+    using updates = std::vector<std::pair<std::string, std::chrono::system_clock::time_point>>;
+    const auto exp1h = to_epoch_ms(now + 1h);
+
+    // Another owner's hashes, and hashes that don't exist, are ignored
+    CHECK(storage.get_expiries(pk1, hashes{"h1", "other", "h2", "nope"}) ==
+          expiries{{"h1", exp1h}, {"h2", exp1h}});
+    CHECK(storage.get_expiries(pk2, hashes{"h1", "other"}) == expiries{{"other", exp1h}});
+    CHECK(storage.get_expiries(nobody, hashes{"h1", "other"}).empty());
+
+    // A repeated hash is updated, and reported, once
+    auto updated =
+            storage.update_expiry(pk1, hashes{"h1", "h2", "h1", "other"}, std::array{now + 2h});
+    std::ranges::sort(updated);
+    CHECK(updated == updates{{"h1", now + 2h}, {"h2", now + 2h}});
+
+    // h1 is already past the requested expiry, so extend-only leaves it alone
+    updated = storage.update_expiry(
+            pk1, hashes{"h1", "h3"}, std::array{now + 90min}, /*extend_only=*/true);
+    CHECK(updated == updates{{"h3", now + 90min}});
+
+    updated = storage.update_expiry(pk1, hashes{"h3", "h4"}, std::array{now + 3h, now + 4h});
+    CHECK(updated == updates{{"h3", now + 3h}, {"h4", now + 4h}});
+
+    CHECK(storage.get_expiries(pk1, hashes{"h1", "h2", "h3", "h4"}) ==
+          expiries{
+                  {"h1", to_epoch_ms(now + 2h)},
+                  {"h2", to_epoch_ms(now + 2h)},
+                  {"h3", to_epoch_ms(now + 3h)},
+                  {"h4", to_epoch_ms(now + 4h)}});
+    CHECK(storage.get_expiries(pk2, hashes{"other", "h1"}) == expiries{{"other", exp1h}});
+    CHECK(storage.update_expiry(nobody, hashes{"h1", "h2"}, std::array{now + 5h}).empty());
+
+    // A repeat can't match a second time under an extend or shorten constraint either
+    updated = storage.update_expiry(
+            pk1, hashes{"h2", "h2"}, std::array{now + 150min}, /*extend_only=*/true);
+    CHECK(updated == updates{{"h2", now + 150min}});
+    updated = storage.update_expiry(
+            pk1,
+            hashes{"h2", "h2"},
+            std::array{now + 140min},
+            /*extend_only=*/false,
+            /*shorten_only=*/true);
+    CHECK(updated == updates{{"h2", now + 140min}});
+
+    auto deleted = storage.delete_by_hash(pk1, hashes{"h4", "h1", "other", "nope", "h1"});
+    std::ranges::sort(deleted);
+    CHECK(deleted == hashes{"h1", "h4"});
+    CHECK(storage.delete_by_hash(nobody, hashes{"h2", "other"}).empty());
+    CHECK(storage.get_message_count() == 3);
+    CHECK(storage.get_expiries(pk2, hashes{"other", "h2"}) == expiries{{"other", exp1h}});
+
+    // Distinct hashes sharing a long prefix are not mistaken for repeats
+    const std::string long1 = "0123456789abcdef-one", long2 = "0123456789abcdef-two";
+    REQUIRE(storage.store({pk1, long1, namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk1, long2, namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+    updated = storage.update_expiry(pk1, hashes{long1, long2, long1}, std::array{now + 2h});
+    std::ranges::sort(updated);
+    CHECK(updated == updates{{long1, now + 2h}, {long2, now + 2h}});
 }
 
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {
@@ -657,6 +863,89 @@ TEST_CASE("storage - pending deliveries", "[storage][swarm]") {
 
     storage.remove_deliveries(peer2);
     CHECK(storage.delivery_peers().empty());
+
+    // A recipient with only a dump pending isn't a delivery peer
+    storage.queue_dump(peer1, 123, 5);
+    CHECK(storage.delivery_peers().empty());
+
+    // Cleaning up recipients keeps the ones still referred to, and a removed one comes back when
+    // something is queued for it again
+    storage.clean_pending_recipients();
+    CHECK(storage.pending_dumps().size() == 1);
+    storage.queue_delivery(peer1, "h2");
+    storage.queue_delivery(peer2, "h2");
+    storage.clean_pending_recipients();
+    CHECK(storage.delivery_peers().size() == 2);
+    CHECK(storage.next_delivery_batch(peer2, 1 << 20).first.size() == 1);
+}
+
+TEST_CASE("storage - upgrading pubkey-keyed pending tables", "[storage][swarm]") {
+    StorageDeleter fixture;
+
+    user_pubkey pk;
+    REQUIRE(pk.load("0500112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"));
+    const auto now = std::chrono::system_clock::now();
+    const auto peer1 = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    const auto peer2 = crypto::legacy_pubkey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222");
+    {
+        Database storage{"."};
+        for (int i = 1; i <= 2; i++)
+            REQUIRE(storage.store(
+                            {pk, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
+                    StoreResult::New);
+    }
+    {
+        // Put the tables back as unreleased development builds created them
+        SQLite::Database db{"storage.db", SQLite::OPEN_READWRITE};
+        db.exec(R"(
+DROP TABLE pending_dumps;
+DROP TABLE pending_deliveries;
+DROP TABLE pending_recipients;
+CREATE TABLE pending_dumps (
+    pubkey BLOB NOT NULL,
+    swarm INTEGER NOT NULL,
+    next_id INTEGER NOT NULL,
+    end_id INTEGER NOT NULL,
+    next_attempt DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY(pubkey, swarm)
+);
+CREATE TABLE pending_deliveries (
+    pubkey BLOB NOT NULL,
+    message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY(pubkey, message)
+) WITHOUT ROWID;
+CREATE INDEX pending_deliveries_message ON pending_deliveries(message);
+        )");
+        SQLite::Statement dump{db, "INSERT INTO pending_dumps VALUES (?, 123, 2, 5, 0)"};
+        dump.bind(1, std::string{peer1.str()});
+        dump.exec();
+        SQLite::Statement delivery{
+                db, "INSERT INTO pending_deliveries SELECT ?, id FROM messages WHERE hash = ?"};
+        for (auto [peer, hash] : {std::pair{&peer1, "h1"}, {&peer1, "h2"}, {&peer2, "h2"}}) {
+            delivery.bind(1, std::string{peer->str()});
+            delivery.bind(2, hash);
+            delivery.exec();
+            delivery.reset();
+        }
+    }
+
+    Database storage{"."};
+
+    auto dumps = storage.pending_dumps();
+    REQUIRE(dumps.size() == 1);
+    CHECK(dumps[0].pubkey == peer1);
+    CHECK(dumps[0].swarm == 123);
+    CHECK(dumps[0].next_id == 2);
+    CHECK(dumps[0].end_id == 5);
+
+    CHECK(storage.delivery_peers().size() == 2);
+    auto [msgs, ids] = storage.next_delivery_batch(peer1, 1 << 20);
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0].hash == "h1");
+    CHECK(msgs[1].hash == "h2");
+    CHECK(storage.next_delivery_batch(peer2, 1 << 20).first.size() == 1);
 }
 
 TEST_CASE("storage - swarm space range queries", "[storage][swarm]") {

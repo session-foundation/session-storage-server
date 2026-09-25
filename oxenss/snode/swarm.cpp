@@ -155,8 +155,9 @@ SwarmEvents Swarm::update_swarms(
         std::erase_if(members_, [&](const auto& m) {
             return !events.our_swarm_members.contains(m.first);
         });
+        const bool joined_us = !entered_swarm && !first_update;
         for (const auto& pk : events.new_swarm_members)
-            members_[pk];
+            members_[pk].joined_our_swarm = joined_us;
 
         // We ask our peers for the swarm's messages when we have just entered the swarm, and on
         // the first update after startup if we hold none of them: a fresh, wiped or copied

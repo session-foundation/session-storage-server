@@ -96,12 +96,7 @@ ServiceNode::ServiceNode(
     if (auto id = db->get_current_swarm())
         swarm_.cur_swarm_id_ = *id;
 
-    omq_server->add_timer(
-            [this] {
-                std::lock_guard l{sn_mutex_};
-                db->clean_expired();
-            },
-            Database::CLEANUP_PERIOD);
+    omq_server->add_timer([this] { db->clean_expired(); }, Database::CLEANUP_PERIOD);
 
     omq_server->add_timer([this] { check_new_members(); }, NEW_SWARM_MEMBER_INTERVAL);
 
@@ -595,7 +590,9 @@ void ServiceNode::send_notifies(message msg) {
 
 bool ServiceNode::process_store(
         message msg, bool* new_msg, std::chrono::system_clock::time_point* expiry) {
-    std::lock_guard guard{sn_mutex_};
+    // No sn_mutex_ here: nothing below needs it (the swarm, stats, and notification lookups lock
+    // internally, and the database has its own connection pool), and holding it across the store
+    // would make everything else that takes it wait on sqlite's write lock.
 
     /// only accept a message if we are in a swarm
     if (!swarm_.is_valid()) {

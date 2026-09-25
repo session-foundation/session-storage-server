@@ -177,6 +177,65 @@ TEST_CASE("storage - only return entries for specified pubkey", "[storage]") {
     }
 }
 
+TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    const auto now = std::chrono::system_clock::now();
+    for (int i = 1; i <= 4; i++)
+        REQUIRE(storage.store({pk1, "h{}"_format(i), namespace_id::Default, now, now + 1h, "data"}) ==
+                StoreResult::New);
+    REQUIRE(storage.store({pk2, "other", namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+
+    using hashes = std::vector<std::string>;
+    using expiries = std::map<std::string, int64_t>;
+    using updates = std::vector<std::pair<std::string, std::chrono::system_clock::time_point>>;
+    const auto exp1h = to_epoch_ms(now + 1h);
+
+    // Another owner's hashes, and hashes that don't exist, are ignored
+    CHECK(storage.get_expiries(pk1, hashes{"h1", "other", "h2", "nope"}) ==
+          expiries{{"h1", exp1h}, {"h2", exp1h}});
+    CHECK(storage.get_expiries(pk2, hashes{"h1", "other"}) == expiries{{"other", exp1h}});
+    CHECK(storage.get_expiries(nobody, hashes{"h1", "other"}).empty());
+
+    // A repeated hash is updated, and reported, once
+    auto updated =
+            storage.update_expiry(pk1, hashes{"h1", "h2", "h1", "other"}, std::array{now + 2h});
+    std::ranges::sort(updated);
+    CHECK(updated == updates{{"h1", now + 2h}, {"h2", now + 2h}});
+
+    // h1 is already past the requested expiry, so extend-only leaves it alone
+    updated = storage.update_expiry(
+            pk1, hashes{"h1", "h3"}, std::array{now + 90min}, /*extend_only=*/true);
+    CHECK(updated == updates{{"h3", now + 90min}});
+
+    updated = storage.update_expiry(pk1, hashes{"h3", "h4"}, std::array{now + 3h, now + 4h});
+    CHECK(updated == updates{{"h3", now + 3h}, {"h4", now + 4h}});
+
+    CHECK(storage.get_expiries(pk1, hashes{"h1", "h2", "h3", "h4"}) ==
+          expiries{
+                  {"h1", to_epoch_ms(now + 2h)},
+                  {"h2", to_epoch_ms(now + 2h)},
+                  {"h3", to_epoch_ms(now + 3h)},
+                  {"h4", to_epoch_ms(now + 4h)}});
+    CHECK(storage.get_expiries(pk2, hashes{"other", "h1"}) == expiries{{"other", exp1h}});
+    CHECK(storage.update_expiry(nobody, hashes{"h1", "h2"}, std::array{now + 5h}).empty());
+
+    auto deleted = storage.delete_by_hash(pk1, hashes{"h4", "h1", "other", "nope", "h1"});
+    std::ranges::sort(deleted);
+    CHECK(deleted == hashes{"h1", "h4"});
+    CHECK(storage.delete_by_hash(nobody, hashes{"h2", "other"}).empty());
+    CHECK(storage.get_message_count() == 3);
+    CHECK(storage.get_expiries(pk2, hashes{"other", "h2"}) == expiries{{"other", exp1h}});
+}
+
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     StorageDeleter fixture;
 

@@ -43,18 +43,6 @@ namespace {
         return results;
     }
 
-    // session-sqlite has no map-producing counterpart to get_all.
-    template <typename K, typename V, typename... Bind>
-    std::map<K, V> get_map(SQLite::Statement& st, const Bind&... bind) {
-        bind_oneshot(st, bind...);
-        std::map<K, V> results;
-        while (st.executeStep()) {
-            auto [k, v] = get<K, V>(st);
-            results.emplace(std::move(k), std::move(v));
-        }
-        return results;
-    }
-
 }  // namespace
 
 user_pubkey load_pubkey(uint8_t type, std::string pk) {
@@ -893,26 +881,30 @@ std::vector<std::string> Database::delete_by_hash(
 
     auto conn = db_->conn();
 
-    if (msg_hashes.size() == 1) {
-        // Use an optimized prepared statement for very common single-hash deletions
-        auto st = conn.prepared_st(
-                "DELETE FROM messages"
-                " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
-                " AND hash = ?"
-                " RETURNING hash");
-        return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), msg_hashes[0]);
+    // One statement per hash, never `owner = ? AND hash IN (...)`: without ANALYZE statistics the
+    // planner serves that from messages_owner, scanning every message the owner has (some owners
+    // have 100k+), rather than looking each hash up in the unique hash index.  update_expiry and
+    // get_expiries do the same.
+    std::vector<std::string> deleted;
+
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return deleted;
+
+    auto st = conn.prepared_st("DELETE FROM messages WHERE hash = ? AND owner = ?");
+    for (const auto& hash : msg_hashes) {
+        if (exec_query(st, hash, *owner) > 0)
+            deleted.push_back(hash);
+        st->reset();
     }
 
-    SQLite::Statement st{
-            conn.sql,
-            multi_in_query(
-                    "DELETE FROM messages"
-                    " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
-                    " AND hash IN ("sv,  // ?,?,?,...,?
-                    msg_hashes.size(),
-                    ") RETURNING hash"sv)};
-
-    return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), bind_each{msg_hashes});
+    transaction.commit();
+    return deleted;
 }
 
 std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
@@ -1033,6 +1025,13 @@ std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey
     return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
+static const auto update_expiry_any =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3"s;
+static const auto update_expiry_extend =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry < ?1"s;
+static const auto update_expiry_shorten =
+        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry > ?1"s;
+
 std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Database::update_expiry(
         const user_pubkey& pubkey,
         std::span<const std::string> msg_hashes,
@@ -1048,63 +1047,36 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
     if (msg_hashes.empty())
         return result;
 
-    auto expiry_constraint = extend_only  ? " AND expiry < ?1"s
-                           : shorten_only ? " AND expiry > ?1"s
-                                          : ""s;
-
     auto conn = db_->conn();
 
-    if (msg_hashes.size() == 1) {
-        // Pre-prepared version for the common single hash case
-        if (conn.prepared_exec(
-                    "UPDATE messages SET expiry = ? WHERE hash = ?"s + expiry_constraint +
-                            " AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)",
-                    to_epoch_ms(new_exp[0]),
-                    msg_hashes[0],
-                    pubkey.raw_bytes(),
-                    pubkey.type()) > 0)
-            result.emplace_back(msg_hashes[0], new_exp[0]);
+    // One statement per hash; see delete_by_hash.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
 
-    } else if (new_exp.size() == 1) {
-        SQLite::Statement st{
-                conn.sql,
-                multi_in_query(
-                        "UPDATE messages SET expiry = ?"
-                        " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"s +
-                                expiry_constraint + " AND hash IN (",  // ?,?,?,...,?
-                        msg_hashes.size(),
-                        ") RETURNING hash"sv)};
-        for (auto& hash : get_all<std::string>(
-                     st,
-                     to_epoch_ms(new_exp[0]),
-                     pubkey.raw_bytes(),
-                     pubkey.type(),
-                     bind_each{msg_hashes}))
-            result.emplace_back(hash, new_exp[0]);
-    } else {
-        SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return result;
 
-        int64_t owner;
-        if (auto maybe = exec_and_maybe_get<int64_t>(
-                    conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
-                    pubkey.raw_bytes(),
-                    pubkey.type()))
-            owner = *maybe;
-        else
-            return result;
+    auto st = conn.prepared_st(
+            extend_only    ? update_expiry_extend
+            : shorten_only ? update_expiry_shorten
+                           : update_expiry_any);
 
-        auto st = conn.prepared_st(
-                "UPDATE messages SET expiry = ? WHERE hash = ?"s + expiry_constraint +
-                " AND owner = ?");
-        for (size_t i = 0; i < msg_hashes.size(); i++) {
-            if (i > 0)
-                st->tryReset();
-            if (exec_query(st, to_epoch_ms(new_exp[i]), msg_hashes[i], owner) > 0)
-                result.emplace_back(msg_hashes[i], new_exp[i]);
-        }
-
-        transaction.commit();
+    // With a single expiry a repeated hash has to be reported updated only once, but with no
+    // extend/shorten constraint the repeat would match (and so count as updated) again.
+    std::unordered_set<std::string_view> seen;
+    for (size_t i = 0; i < msg_hashes.size(); i++) {
+        if (new_exp.size() == 1 && !seen.insert(msg_hashes[i]).second)
+            continue;
+        auto exp = new_exp.size() == 1 ? new_exp[0] : new_exp[i];
+        if (exec_query(st, to_epoch_ms(exp), msg_hashes[i], *owner) > 0)
+            result.emplace_back(msg_hashes[i], exp);
+        st->reset();
     }
+
+    transaction.commit();
     return result;
 }
 
@@ -1112,24 +1084,28 @@ std::map<std::string, int64_t> Database::get_expiries(
         const user_pubkey& pubkey, std::span<const std::string> msg_hashes) {
     auto conn = db_->conn();
 
-    if (msg_hashes.size() == 1) {
-        // Pre-prepared version for the common single hash case
-        auto st = conn.prepared_st(
-                "SELECT hash, expiry FROM messages WHERE hash = ?"
-                " AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)");
-        return get_map<std::string, int64_t>(st, msg_hashes[0], pubkey.raw_bytes(), pubkey.type());
+    // One statement per hash; see delete_by_hash.  The transaction only gives the lookups a single
+    // consistent snapshot.
+    std::map<std::string, int64_t> result;
+
+    SQLite::Transaction transaction{conn.sql};
+
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return result;
+
+    auto st = conn.prepared_st("SELECT expiry FROM messages WHERE hash = ? AND owner = ?");
+    for (const auto& hash : msg_hashes) {
+        if (auto exp = exec_and_maybe_get<int64_t>(st, hash, *owner))
+            result.emplace(hash, *exp);
+        st->reset();
     }
 
-    SQLite::Statement st{
-            conn.sql,
-            multi_in_query(
-                    "SELECT hash, expiry FROM messages"
-                    " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
-                    " AND hash IN ("sv,  // ?,?,?,...,?
-                    msg_hashes.size(),
-                    ")"sv)};
-    return get_map<std::string, int64_t>(
-            st, pubkey.raw_bytes(), pubkey.type(), bind_each{msg_hashes});
+    transaction.commit();
+    return result;
 }
 
 std::vector<std::pair<namespace_id, std::string>> Database::update_all_expiries(

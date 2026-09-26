@@ -1,49 +1,7 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Custom
-build
-deps
-__pycache__
-
-# Vscode settings
-.vscode
-
-# Submodules
-vendors/spdlog
-
-# Swapfiles
-**/*.swp
-
-# clangd cache
-.cache
+/build*/
+# debhelper's out-of-tree cmake build directory
+/obj-*/
+compile_commands.json
+.cache/
+__pycache__/
+.vscode/

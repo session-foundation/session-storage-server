@@ -8,7 +8,7 @@ local repo_suffix = '/staging';  // can be /beta or /staging for non-primary rep
 
 // Entries of skip_submodules (below) that this distro needs cloned after all, because its system
 // package is missing or too old.
-local keep_submodules = [];
+local keep_submodules = ['vendors/CLI11'];
 
 // Submodules (by *name*, which can differ from the path) that the recursive clone skips.  The
 // setting applies at every nesting level, so the names must not collide with a submodule we do

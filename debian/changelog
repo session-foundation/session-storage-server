@@ -1,3 +1,17 @@
+oxen-storage-server (2.12.0~rc3-1~ubuntu2604) resolute; urgency=medium
+
+  * Clone uWebSockets again; skip submodules the build doesn't use
+  * Update uWebSockets to v20.80.0
+  * Make uWebSockets the default HTTPS backend again
+  * Update oxen-libquic and oxen-mq to their stable branches
+  * Update session-deps
+  * Take the uWebSockets backend's OpenSSL from session-deps
+  * Replace the stock C++ .gitignore with one for this project
+  * Update CI for uWebSockets as the default backend
+  * Always build libmicrohttpd from session-deps, and test its handshake fix
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 26 Sep 2026 15:29:17 -0300
+
 oxen-storage-server (2.12.0~rc2-1~ubuntu2604) resolute; urgency=medium
 
   * Bump oxenmq + libquic build-deps to latest versions

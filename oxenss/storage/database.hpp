@@ -109,6 +109,9 @@ class Database {
     // last_hash is empty or not found then returns all messages (up to the limit). Optionally takes
     // a maximum number of messages to return or a maximum aggregate size of messages to return.
     //
+    // With `reverse_direction` the messages are returned newest first, starting just older than
+    // `last_hash`, or from the most recent message if last_hash is empty or not found.
+    //
     // Note that the `pubkey` value of the returned message's will be left default constructed,
     // i.e. *not* filled with the given pubkey.
     //
@@ -120,6 +123,7 @@ class Database {
             const std::string& last_hash,
             std::optional<size_t> num_results = std::nullopt,
             std::optional<size_t> max_size = std::nullopt,
+            bool reverse_direction = false,
             bool size_b64 =
                     true,  // True if the data will get b64-encoded (and thus is 4/3 as large)
             size_t per_message_overhead =

@@ -1792,6 +1792,19 @@ void RequestHandler::process_onion_req(FinalDestinationInfo&& info, OnionRequest
 void RequestHandler::process_onion_req(RelayToNodeInfo&& info, OnionRequestMetadata&& data) {
     auto& [payload, ekey, etype, dest] = info;
 
+    // A client's path or destination can name us as our own next hop.  Over oxenmq that was a
+    // round trip to our own listener; the node-to-node QUIC listener refuses a connection carrying
+    // our own key, so the hop is taken here instead: the payload is encrypted to our key exactly
+    // as it would be on arrival.  The hop count advances and is limited as the transports do it,
+    // so a payload nested with us as every hop cannot recurse without bound.
+    if (dest == service_node_.own_address().pubkey_ed25519) {
+        if (++data.hop_no > MAX_ONION_HOPS)
+            return data.cb({http::BAD_REQUEST, "onion request max path length exceeded"sv});
+        data.ephem_key = ekey;
+        data.enc_type = etype;
+        return process_onion_req(std::string_view{payload}, std::move(data));
+    }
+
     auto dest_ct = contacts_.find(dest);
     if (!dest_ct || !*dest_ct) {
         auto msg = fmt::format(

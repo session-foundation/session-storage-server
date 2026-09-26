@@ -25,12 +25,13 @@ session_dep(libcurl 7.68)
 # it directly for certificate generation.
 session_dep(gnutls 3.6)
 
-# 1.0.8 is a security floor, not an API one: the code needs nothing newer than 0.9.75, but
+# Always built from session-deps rather than taken from the system: every release through 1.0.10
+# busy-waits for the whole of each TLS handshake in epoll mode, and session-deps carries the patch
+# for it (see deps/libmicrohttpd.cmake there).  The version is a security floor, not an API one:
 # 1.0.7/1.0.8 fixed crashes and out-of-bounds writes in the request parser that anyone able to
-# reach the HTTPS port can trigger.  No current Debian/Ubuntu stable ships that, so this is a
-# static build nearly everywhere for now; lower the floor for a distro only once its package has
-# those fixes backported.
+# reach the HTTPS port can trigger.
 if(HTTPS_BACKEND_MICROHTTPD)
+    set(BUILD_STATIC_libmicrohttpd ON)
     session_dep(libmicrohttpd 1.0.8)
 endif()
 

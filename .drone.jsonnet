@@ -11,11 +11,6 @@ local default_deps_base = [
   'libjemalloc-dev',
   'libsodium-dev',
   'libgnutls28-dev',
-  // The libmicrohttpd HTTPS backend needs >= 1.0.8 (see external/CMakeLists.txt), which only sid
-  // and Ubuntu rolling currently ship; elsewhere cmake rejects the distro package as too old and
-  // session-deps builds it statically, so installing it everywhere just lets the distros that can
-  // use the system library exercise that path.
-  'libmicrohttpd-dev',
   'libsqlite3-dev',
   'libssl-dev',
   'libsystemd-dev',

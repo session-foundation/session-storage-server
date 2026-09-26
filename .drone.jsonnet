@@ -12,9 +12,12 @@ local submodules = {
   commands: [
     'git fetch --tags',
     // uWebSockets (and its huge nested submodules) is only used by the uWebSockets HTTPS backend,
-    // which we don't build.  The update=none key is the submodule's *name*, which differs from its
-    // external/uWebSockets path.
-    'git -c submodule.vendors/uWebSockets.update=none submodule update --init --recursive --depth=1 --jobs=4',
+    // which we don't build.  oxen-mq must always come from the system liboxenmq-dev: leaving the
+    // submodule empty makes a fallback to the bundled copy fail instead of silently building it
+    // (see -DSUBMODULE_CHECK=OFF in debian/rules).  The update=none keys are the submodules'
+    // *names*, which differ from their external/ paths.
+    'git -c submodule.vendors/uWebSockets.update=none -c submodule.vendors/oxen-mq.update=none'
+    + ' submodule update --init --recursive --depth=1 --jobs=4',
   ],
 };
 

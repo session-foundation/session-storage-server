@@ -8,6 +8,7 @@
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 #include <oxenss/common/format.h>
+#include <oxenc/base64.h>
 #include <oxenc/hex.h>
 
 #include <array>
@@ -815,7 +816,7 @@ std::pair<std::vector<message>, bool> Database::retrieve(
         if (max_size) {
             agg_size += per_message_overhead;
             agg_size += hash.size();
-            agg_size += size_b64 ? data.size() * 4 / 3 : data.size();
+            agg_size += size_b64 ? oxenc::to_base64_size(data.size()) : data.size();
             if (!results.empty() && agg_size > *max_size) {
                 more = true;
                 break;

@@ -49,7 +49,15 @@ SwarmEvents Swarm::derive_swarm_events(uint64_t height, const swarms_t& swarms) 
     }
 
     if (old_swarm == INVALID_SWARM_ID) {
-        log::info(logcat, "Joined swarm {:#18x} (blk {})", new_swarm, height);
+        // With no previous swarm list this is the first update after a start, and a swarm id that
+        // did not survive the restart (the database predates its being stored) is the likely
+        // reason we know no swarm, rather than our having just been assigned one.
+        log::info(
+                logcat,
+                "{} swarm {:#18x} (blk {})",
+                network.swarms_.empty() ? "Starting in" : "Joined",
+                new_swarm,
+                height);
         // Every member of the swarm is new to us
         events.new_swarm_members = events.our_swarm_members;
         events.new_swarm_members.erase(our_pk);
@@ -146,8 +154,15 @@ SwarmEvents Swarm::update_swarms(
             events.our_swarm_id != INVALID_SWARM_ID && events.our_swarm_id != cur_swarm_id_;
 
     if (events.our_swarm_id != INVALID_SWARM_ID) {
-        for (const auto& pk : events.new_swarm_members)
-            log::info(logswarm, "New SN joining our swarm: {}", pk);
+        if (first_update)
+            log::info(
+                    logswarm,
+                    "Swarm {:#18x} has {} other members",
+                    events.our_swarm_id,
+                    events.new_swarm_members.size());
+        else
+            for (const auto& pk : events.new_swarm_members)
+                log::info(logswarm, "New SN joining our swarm: {}", pk);
 
         for (auto swarm : events.new_swarms)
             log::info(logswarm, "New network swarm: {}", swarm);
@@ -155,9 +170,16 @@ SwarmEvents Swarm::update_swarms(
         std::erase_if(members_, [&](const auto& m) {
             return !events.our_swarm_members.contains(m.first);
         });
+        // Every member looks new on the first update after a start, but none of them joined
+        // anything, and the handshake only has a purpose when we are about to ask for the swarm's
+        // messages (below), so they start out ready.
         const bool joined_us = !entered_swarm && !first_update;
-        for (const auto& pk : events.new_swarm_members)
-            members_[pk].joined_our_swarm = joined_us;
+        for (const auto& pk : events.new_swarm_members) {
+            auto& state = members_[pk];
+            state.joined_our_swarm = joined_us;
+            if (first_update)
+                state.status = SwarmMemberStatus::Ready;
+        }
 
         // We ask our peers for the swarm's messages when we have just entered the swarm, and on
         // the first update after startup if we hold none of them: a fresh, wiped or copied

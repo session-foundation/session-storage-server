@@ -25,12 +25,13 @@ target_link_libraries(Test
     SQLiteCpp  # storage.cpp recreates old table layouts directly
     Catch2::Catch2)
 
-# certificates.cpp drives each backend's TLS setup directly.
+# certificates.cpp drives each backend's TLS setup directly; https_backends.cpp also speaks raw TLS
+# to the libmicrohttpd backend through gnutls.
 if(HTTPS_BACKEND_UWEBSOCKETS)
     target_link_libraries(Test PRIVATE uWebSockets)
 endif()
 if(HTTPS_BACKEND_MICROHTTPD)
-    target_link_libraries(Test PRIVATE sessiondep::libmicrohttpd)
+    target_link_libraries(Test PRIVATE sessiondep::libmicrohttpd sessiondep::gnutls)
 endif()
 
 target_include_directories(Test PRIVATE ..)

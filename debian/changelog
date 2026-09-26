@@ -1,3 +1,9 @@
+oxen-storage-server (2.12.0~rc5-1~deb12) bookworm; urgency=medium
+
+  * Serve an onion hop addressed to ourselves in-process
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 26 Sep 2026 17:47:07 -0300
+
 oxen-storage-server (2.12.0~rc4-1~deb12) bookworm; urgency=medium
 
   * Keep pre-release tags (e.g. ~rc3) in the reported version

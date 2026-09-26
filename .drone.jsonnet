@@ -6,25 +6,15 @@ local apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -q';
 
 local repo_suffix = '/staging';  // can be /beta or /staging for non-primary repo deps
 
-local submodule_update(submodules, chdir=null) =
-  'git' + (if chdir == null then '' else ' -C ' + chdir)
-  + ' submodule update --init --depth=1 --jobs=4 '
-  + std.join(' ', submodules);
-
-local submodules_top = ['external/cpr', 'external/uWebSockets', 'external/oxen-logging', 'external/SQLiteCpp', 'external/CLI11', 'external/nlohmann_json'];
-local submodules_nested = [
-  { path: 'external/uWebSockets', submodules: ['uSockets'] },
-  { path: 'external/oxen-logging', submodules: ['fmt', 'spdlog'] },
-];
 local submodules = {
   name: 'submodules',
   image: 'drone/git',
   commands: [
     'git fetch --tags',
-    submodule_update(submodules_top),
-  ] + [
-    submodule_update(chdir=x.path, submodules=x.submodules)
-    for x in submodules_nested
+    // uWebSockets (and its huge nested submodules) is only used by the uWebSockets HTTPS backend,
+    // which we don't build.  The update=none key is the submodule's *name*, which differs from its
+    // external/uWebSockets path.
+    'git -c submodule.vendors/uWebSockets.update=none submodule update --init --recursive --depth=1 --jobs=4',
   ],
 };
 

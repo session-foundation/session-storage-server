@@ -1,3 +1,10 @@
+oxen-storage-server (2.12.0~rc4-1~ubuntu2404) noble; urgency=medium
+
+  * Keep pre-release tags (e.g. ~rc3) in the reported version
+  * Keep systemd's start timeout extended while starting up
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 26 Sep 2026 17:14:13 -0300
+
 oxen-storage-server (2.12.0~rc3-1~ubuntu2404) noble; urgency=medium
 
   * Clone uWebSockets again; skip submodules the build doesn't use

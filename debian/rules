@@ -25,7 +25,7 @@ override_dh_auto_configure:
 		-DSUBMODULE_CHECK=OFF \
 		$(DEB_CMAKE_ARCH_OPTIONS) \
 		-DOXEN_LOGGING_FORCE_SUBMODULES=ON -DOXEN_LOGGING_FMT_HEADER_ONLY=ON -DOXEN_LOGGING_SPDLOG_HEADER_ONLY=ON \
-		-DOXENSS_VERSIONTAG=$(call dpkg_late_eval,OXENSS_VERSIONTAG,echo '$(DEB_VERSION)' | sed -e 's/.*-/-/')
+		-DOXENSS_VERSIONTAG=$(call dpkg_late_eval,OXENSS_VERSIONTAG,echo '$(DEB_VERSION)' | sed -e 's/^[0-9.]*//')
 
 override_dh_strip:
 	dh_strip --no-ddebs

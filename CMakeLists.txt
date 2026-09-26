@@ -40,10 +40,10 @@ endif()
 option(BUILD_TESTS "build storage server unit tests" OFF)
 
 # HTTPS server implementations.  Any that are enabled get compiled in; which one is used is chosen
-# at runtime with --https-backend.  At least one must be enabled.  uWebSockets is the previous
-# implementation, kept for comparison; it is the only thing that brings OpenSSL into the build.
-option(HTTPS_BACKEND_UWEBSOCKETS "Build the uWebSockets (OpenSSL) HTTPS server backend" OFF)
-option(HTTPS_BACKEND_MICROHTTPD "Build the libmicrohttpd (GnuTLS) HTTPS server backend" ON)
+# at runtime with --https-backend.  At least one must be enabled.  uWebSockets is the only thing
+# that brings OpenSSL into the build; libmicrohttpd is kept building for comparison.
+option(HTTPS_BACKEND_UWEBSOCKETS "Build the uWebSockets (OpenSSL) HTTPS server backend" ON)
+option(HTTPS_BACKEND_MICROHTTPD "Build the libmicrohttpd (GnuTLS) HTTPS server backend" OFF)
 if(NOT HTTPS_BACKEND_UWEBSOCKETS AND NOT HTTPS_BACKEND_MICROHTTPD)
     message(FATAL_ERROR "At least one HTTPS_BACKEND_* option must be enabled")
 endif()

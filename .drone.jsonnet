@@ -6,17 +6,47 @@ local apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -q';
 
 local repo_suffix = '/staging';  // can be /beta or /staging for non-primary repo deps
 
+// Entries of skip_submodules (below) that this distro needs cloned after all, because its system
+// package is missing or too old.
+local keep_submodules = [];
+
+// Submodules (by *name*, which can differ from the path) that the recursive clone skips.  The
+// setting applies at every nesting level, so the names must not collide with a submodule we do
+// need anywhere in the tree.
+local skip_submodules = [
+  // Must come from the system packages: leaving the submodule empty makes a fallback to the bundled
+  // copy fail instead of silently building it (see -DSUBMODULE_CHECK=OFF in debian/rules).
+  'vendors/oxen-mq',
+  'external/oxen-encoding',  // inside oxen-libquic
+  'vendors/nlohmann_json',
+  'vendors/CLI11',
+  'fmt',  // inside oxen-libquic's oxen-logging
+  'spdlog',
+  // uWebSockets' and uSockets' test data, fuzzers, and alternative TLS/QUIC/zlib stacks, none of
+  // which the build uses, and which are most of the download.
+  'fuzzing/libEpollFuzzer',
+  'fuzzing/seed-corpus',
+  'h1spec',
+  'libdeflate',
+  'boringssl',
+  'lsquic',
+  // Test suites (BUILD_TESTS is off) and session-deps' iOS toolchain.
+  'unit_test/Catch2',
+  'tests/Catch2',
+  'tests/CLI11',
+  'googletest',
+  'external/ios-cmake',
+];
 local submodules = {
   name: 'submodules',
   image: 'drone/git',
   commands: [
     'git fetch --tags',
-    // uWebSockets (and its huge nested submodules) is only used by the uWebSockets HTTPS backend,
-    // which we don't build.  oxen-mq must always come from the system liboxenmq-dev: leaving the
-    // submodule empty makes a fallback to the bundled copy fail instead of silently building it
-    // (see -DSUBMODULE_CHECK=OFF in debian/rules).  The update=none keys are the submodules'
-    // *names*, which differ from their external/ paths.
-    'git -c submodule.vendors/uWebSockets.update=none -c submodule.vendors/oxen-mq.update=none'
+    'git ' + std.join(' ', [
+      '-c submodule.' + s + '.update=none'
+      for s in skip_submodules
+      if std.count(keep_submodules, s) == 0
+    ])
     + ' submodule update --init --recursive --depth=1 --jobs=4',
   ],
 };

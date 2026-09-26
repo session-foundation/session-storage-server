@@ -504,8 +504,7 @@ void ServiceNode::check_new_members() {
             } else {
                 log::info(
                         logcat,
-                        "Failed to connect to remote SS {} to initiate new "
-                        "data transfer ({}); will retry soon",
+                        "Handshake with swarm member {} failed ({}); will retry soon",
                         pk,
                         fmt::join(data, ", "));
             }

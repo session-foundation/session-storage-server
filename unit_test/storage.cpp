@@ -210,6 +210,73 @@ TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     }
 }
 
+TEST_CASE("storage - retrieve in reverse direction", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+
+    auto now = std::chrono::system_clock::now();
+    const size_t num_entries = 100;
+    for (size_t i = 0; i < num_entries; i++) {
+        const auto hash = "hash{}"_format(i);
+        storage.store({pubkey, hash, namespace_id::Default, now, now + 100s, "bytesasstring"});
+    }
+
+    using hashes = std::vector<std::string>;
+    auto hashes_of = [](const std::vector<message>& items) {
+        hashes h;
+        for (const auto& m : items)
+            h.push_back(m.hash);
+        return h;
+    };
+    constexpr bool reverse = true;
+
+    {
+        auto [items, more] =
+                storage.retrieve(pubkey, namespace_id::Default, "", 3, std::nullopt, reverse);
+        CHECK(hashes_of(items) == hashes{"hash99", "hash98", "hash97"});
+        CHECK(more);
+    }
+
+    // An unknown last_hash starts from the newest message, as an empty one does
+    {
+        auto [items, more] = storage.retrieve(
+                pubkey, namespace_id::Default, "nosuchhash", 3, std::nullopt, reverse);
+        CHECK(hashes_of(items) == hashes{"hash99", "hash98", "hash97"});
+        CHECK(more);
+    }
+
+    // Two pages back from hash10: only older messages, no repeats, no `more` on the oldest page
+    {
+        auto [page1, more1] =
+                storage.retrieve(pubkey, namespace_id::Default, "hash10", 6, std::nullopt, reverse);
+        CHECK(hashes_of(page1) == hashes{"hash9", "hash8", "hash7", "hash6", "hash5", "hash4"});
+        CHECK(more1);
+
+        auto [page2, more2] = storage.retrieve(
+                pubkey, namespace_id::Default, page1.back().hash, 6, std::nullopt, reverse);
+        CHECK(hashes_of(page2) == hashes{"hash3", "hash2", "hash1", "hash0"});
+        CHECK_FALSE(more2);
+    }
+
+    {
+        auto [items, more] =
+                storage.retrieve(pubkey, namespace_id::Default, "hash0", 6, std::nullopt, reverse);
+        CHECK(items.empty());
+        CHECK_FALSE(more);
+    }
+
+    {
+        auto [items, more] = storage.retrieve(
+                pubkey, namespace_id::Default, "hash10", 3, std::nullopt, !reverse);
+        CHECK(hashes_of(items) == hashes{"hash11", "hash12", "hash13"});
+        CHECK(more);
+    }
+}
+
 TEST_CASE("storage - remove expired entries", "[storage]") {
     StorageDeleter fixture;
 

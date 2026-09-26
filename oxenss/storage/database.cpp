@@ -769,6 +769,7 @@ std::pair<std::vector<message>, bool> Database::retrieve(
         const std::string& last_hash,
         std::optional<size_t> max_results,
         std::optional<size_t> max_size,
+        const bool reverse_direction,
         const bool size_b64,
         const size_t per_message_overhead) {
 
@@ -789,10 +790,10 @@ std::pair<std::vector<message>, bool> Database::retrieve(
     }
 
     auto st = conn.prepared_st(
-            last_id ? "SELECT hash, namespace, timestamp, expiry, data FROM messages "
-                      "WHERE owner = ? AND namespace = ? AND id > ? ORDER BY id LIMIT ?"
-                    : "SELECT hash, namespace, timestamp, expiry, data FROM messages "
-                      "WHERE owner = ? AND namespace = ? ORDER BY id LIMIT ?");
+            "SELECT hash, namespace, timestamp, expiry, data FROM messages "
+            "WHERE owner = ? AND namespace = ?{} ORDER BY id{} LIMIT ?"_format(
+                    last_id ? (reverse_direction ? " AND id < ?" : " AND id > ?") : "",
+                    reverse_direction ? " DESC" : ""));
     int pos = 1;
     st->bind(pos++, *ownerid);
     st->bind(pos++, to_int(ns));

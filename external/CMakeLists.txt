@@ -12,7 +12,15 @@ endif()
 
 
 session_dep(libsodium 1.0.18)
-session_dep(libzmq 4.3)
+
+# oxen-mq takes libzmq through session-deps itself when built from the submodule below, and by
+# default gets the static copy: every libzmq release through 4.3.5 can abort on a heartbeat timer
+# firing for a connection that died while its receive pipe was full, and only session-deps' copy
+# carries the fix (see deps/libzmq.cmake there).  oxenmq enables heartbeats on every connection, so
+# a busy node hits this in production.  A system liboxenmq (1.3.2 and later, the floor below) bundles
+# a copy of its own.  This is a default rather than forced so that a system libzmq known to carry
+# the fix can be chosen with -DBUILD_STATIC_libzmq=OFF.
+option(BUILD_STATIC_libzmq "Build oxen-mq against session-deps' static libzmq rather than a system one" ON)
 if(HTTPS_BACKEND_UWEBSOCKETS)
     # Only uSockets wants OpenSSL; everything else TLS-related here is gnutls.  A static build gets
     # session-deps' OpenSSL, whose archives have everything but the public API hidden so that its
@@ -39,13 +47,6 @@ endif()
 # inheriting it from libquic (which isn't built at all when a system liboxenquic is used).
 session_dep(libevent_core 2.1)
 
-# oxen-mq looks for plain `sodium` and `libzmq` targets set up by the parent project and links to
-# those in preference to going looking for system libraries of its own.
-add_library(sodium INTERFACE)
-target_link_libraries(sodium INTERFACE sessiondep::libsodium)
-add_library(libzmq INTERFACE)
-target_link_libraries(libzmq INTERFACE sessiondep::libzmq)
-
 
 # oxenc and oxen-logging come from libquic's submodules: libquic pulls them in anyway, and a second
 # copy here would only be a second thing to keep in sync.
@@ -66,7 +67,8 @@ include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
 sessiondep_or_submodule(liboxenquic 1.9.0 oxen-libquic oxen::quic)
 
-sessiondep_or_submodule(liboxenmq 1.3.0 oxen-mq oxenmq::oxenmq)
+# 1.3.2 is the first release carrying the fixed libzmq and the proxy deadlock fix.
+sessiondep_or_submodule(liboxenmq 1.3.2 oxen-mq oxenmq::oxenmq)
 
 set(JSON_MultipleHeaders ON CACHE BOOL "") # Allows multi-header nlohmann use
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

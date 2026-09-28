@@ -1,3 +1,12 @@
+oxen-storage-server (2.12.0~rc7-1~deb12) bookworm; urgency=medium
+
+  * require fixed liboxenmq dev build
+  * update submodule to oxen-mq tagged release
+  * Defer expiry refreshes of messages already at the maximum expiry
+  * Keep a rendered json body where its view can find it
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 28 Sep 2026 17:22:21 -0300
+
 oxen-storage-server (2.12.0~rc6-3~deb12) bookworm; urgency=medium
 
   * Rebuild

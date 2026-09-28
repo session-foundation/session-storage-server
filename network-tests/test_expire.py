@@ -687,3 +687,155 @@ def test_expire_multi(rpc, random_sn, sk, exclude):
     assert len(r) == 1
     r = json.loads(r[0])
     assert r['messages'] == expected_msgs
+
+
+def test_expire_max_refresh(rpc, random_sn, sk, exclude):
+    """Repeated extensions to the maximum expiry, as clients make on every poll.  A 2.12 node
+    holds these in memory rather than writing each one; from outside that must be invisible: every
+    node applies the refresh, and a node's get_expiries and retrieve return exactly the expiry it
+    signed.  A shorten after a refresh takes effect, and a delete followed by a re-store of the
+    same hash does not bring the refreshed expiry back."""
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+    sns = ss.random_swarm_members(swarm, 2, exclude)
+    conns = [rpc.connect(sn) for sn in sns]
+    node1 = sns[1]['pubkey_ed25519']
+
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+    day = 24 * 60 * 60
+
+    # The default namespace allows 14 days on a store; an expire may then take it to 30.
+    msgs = ss.store_n(rpc, conns[0], sk, b"omg123", 3, ttl=14 * day - 60)
+    hashes = [m['hash'] for m in msgs]
+    hashes_str = ''.join(hashes)
+
+    def extend(conn, exp):
+        params = {
+            "pubkey": my_ss_id,
+            "messages": hashes,
+            "expiry": exp,
+            "extend": True,
+            "signature": sk.sign(
+                f"expireextend{exp}{hashes_str}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        r = rpc.request(conn, 'expire', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        r = json.loads(r[0])
+        assert set(r['swarm'].keys()) == {x['pubkey_ed25519'] for x in swarm['snodes']}
+        return r['swarm']
+
+    def shorten(conn, exp):
+        params = {
+            "pubkey": my_ss_id,
+            "messages": hashes,
+            "expiry": exp,
+            "shorten": True,
+            "signature": sk.sign(
+                f"expireshorten{exp}{hashes_str}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        r = rpc.request(conn, 'expire', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        return json.loads(r[0])['swarm']
+
+    def expiries(conn):
+        now = int(time.time() * 1000)
+        params = {
+            "pubkey": my_ss_id,
+            "messages": hashes,
+            "timestamp": now,
+            "signature": sk.sign(
+                f"get_expiries{now}{hashes_str}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        r = rpc.request(conn, 'get_expiries', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        return json.loads(r[0])['expiries']
+
+    def retrieved_expiries(conn):
+        now = int(time.time() * 1000)
+        params = {
+            "pubkey": my_ss_id,
+            "timestamp": now,
+            "signature": sk.sign(
+                f"retrieve{now}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        r = rpc.request(conn, 'retrieve', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        return {m['hash']: m['expiration'] for m in json.loads(r[0])['messages']}
+
+    def check_applied(res, near):
+        """Every node applied the extension to all three, at its own clamp of the maximum."""
+        for v in res.values():
+            assert v['updated'] == sorted(hashes)
+            assert v['unchanged'] == {}
+            assert abs(v['expiry'] - near) <= 5000
+
+    # A big extension, from 14 days to the maximum: written straight away.
+    now = int(time.time() * 1000)
+    first = extend(conns[0], now + 31 * day * 1000)
+    check_applied(first, now + 30 * day * 1000)
+
+    # Now the refreshes: a client re-extending to the maximum a little later each time.
+    time.sleep(2)
+    now = int(time.time() * 1000)
+    second = extend(conns[0], now + 31 * day * 1000)
+    check_applied(second, now + 30 * day * 1000)
+    for k in second:
+        assert second[k]['expiry'] > first[k]['expiry']
+
+    # What a node reports is exactly what it signed, whether or not it has written it yet.
+    assert expiries(conns[1]) == {h: second[node1]['expiry'] for h in hashes}
+    assert retrieved_expiries(conns[1]) == {h: second[node1]['expiry'] for h in hashes}
+
+    time.sleep(2)
+    now = int(time.time() * 1000)
+    third = extend(conns[1], now + 31 * day * 1000)
+    check_applied(third, now + 30 * day * 1000)
+    for k in third:
+        assert third[k]['expiry'] > second[k]['expiry']
+    assert expiries(conns[1]) == {h: third[node1]['expiry'] for h in hashes}
+
+    # An extension to less than the current expiry does nothing
+    res = extend(conns[0], now + 29 * day * 1000)
+    for k, v in res.items():
+        assert v['updated'] == []
+        assert v['unchanged'] == {h: third[k]['expiry'] for h in hashes}
+    assert expiries(conns[1]) == {h: third[node1]['expiry'] for h in hashes}
+
+    # Shortening to below a refreshed value takes effect exactly
+    shorter = now + 30 * day * 1000 - 10 * 60 * 1000
+    res = shorten(conns[0], shorter)
+    for v in res.values():
+        assert v['updated'] == sorted(hashes)
+        assert v['expiry'] == shorter
+    assert expiries(conns[1]) == {h: shorter for h in hashes}
+    assert retrieved_expiries(conns[1]) == {h: shorter for h in hashes}
+
+    # and can be refreshed again afterwards
+    now = int(time.time() * 1000)
+    fourth = extend(conns[1], now + 31 * day * 1000)
+    check_applied(fourth, now + 30 * day * 1000)
+    assert expiries(conns[1]) == {h: fourth[node1]['expiry'] for h in hashes}
+
+    # Delete, then store the same message again (same data, so the same hash): its expiry is the
+    # fresh store's, not the deleted message's refreshed one.
+    del_hashes = sorted(hashes)
+    params = {
+        "pubkey": my_ss_id,
+        "messages": del_hashes,
+        "signature": sk.sign(
+            ("delete" + ''.join(del_hashes)).encode(), encoder=Base64Encoder
+        ).signature.decode(),
+    }
+    r = rpc.request(conns[1], 'delete', [json.dumps(params).encode()]).get()
+    assert len(r) == 1
+    for v in json.loads(r[0])['swarm'].values():
+        assert v['deleted'] == del_hashes
+    assert expiries(conns[1]) == {}
+
+    again = ss.store_n(rpc, conns[1], sk, b"omg123", 1)
+    assert again[0]['hash'] == msgs[0]['hash']
+    assert expiries(conns[1]) == {msgs[0]['hash']: again[0]['req']['expiry']}
+    assert retrieved_expiries(conns[1]) == {msgs[0]['hash']: again[0]['req']['expiry']}

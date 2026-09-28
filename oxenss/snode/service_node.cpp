@@ -108,6 +108,8 @@ ServiceNode::ServiceNode(
         swarm_.cur_swarm_id_ = *id;
 
     omq_server->add_timer([this] { db->clean_expired(); }, Database::CLEANUP_PERIOD);
+    omq_server->add_timer(
+            [this] { db->commit_deferred_expiries(); }, Database::EXPIRY_COMMIT_PERIOD);
 
     omq_server->add_timer([this] { check_new_members(); }, NEW_SWARM_MEMBER_INTERVAL);
 

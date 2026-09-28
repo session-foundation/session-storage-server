@@ -1,6 +1,7 @@
 #include <array>
 #include <limits>
 #include <oxenss/storage/database.hpp>
+#include <oxenss/common/ttl.h>
 
 #include <oxenss/logging/oxen_logger.h>
 
@@ -591,8 +592,220 @@ class TestSuiteHacks {
     static void db_backdate_retries(Database& db, std::chrono::seconds age) {
         db.test_suite_backdate_retries(age);
     }
+    static void db_backdate_deferred_expiries(Database& db, std::chrono::seconds age) {
+        db.test_suite_backdate_deferred_expiries(age);
+    }
+    static std::optional<int64_t> db_stored_expiry(Database& db, const std::string& hash) {
+        return db.test_suite_stored_expiry(hash);
+    }
 };
 }  // namespace oxenss
+
+TEST_CASE("storage - deferred expiry extensions", "[storage][expiry]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk, other;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(other.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+
+    using hashes = std::vector<std::string>;
+    using expiries = std::map<std::string, int64_t>;
+    using updates = std::vector<std::pair<std::string, std::chrono::system_clock::time_point>>;
+    const auto ns = namespace_id::Default;
+    const auto now = std::chrono::system_clock::now();
+    // Inside the window below the maximum expiry, which is where a message refreshed on every poll
+    // sits; the extensions below stay under the maximum.
+    const auto base = now + TTL_MAXIMUM_PRIVATE - 20min;
+    auto stored = [&](const std::string& hash) {
+        return TestSuiteHacks::db_stored_expiry(storage, hash);
+    };
+    auto exp_ms = [](auto tp) { return to_epoch_ms(tp); };
+
+    for (auto h : {"h1", "h2", "h3"})
+        REQUIRE(storage.store({pk, h, ns, now, base, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({other, "o1", ns, now, base, "data"}) == StoreResult::New);
+
+    SECTION("a refresh near the maximum expiry is visible everywhere but not written") {
+        auto updated =
+                storage.update_expiry(pk, hashes{"h1"}, std::array{base + 5min}, /*extend=*/true);
+        CHECK(updated == updates{{"h1", base + 5min}});
+        CHECK(stored("h1") == exp_ms(base));
+        CHECK(storage.get_expiries(pk, hashes{"h1", "h2"}) ==
+              expiries{{"h1", exp_ms(base + 5min)}, {"h2", exp_ms(base)}});
+
+        // Repeats go into the same entry
+        updated = storage.update_expiry(pk, hashes{"h1"}, std::array{base + 10min}, true);
+        CHECK(updated == updates{{"h1", base + 10min}});
+        CHECK(stored("h1") == exp_ms(base));
+
+        // An extension that isn't one, measured against the deferred value, is unchanged
+        CHECK(storage.update_expiry(pk, hashes{"h1"}, std::array{base + 8min}, true).empty());
+        // A shorten-only that isn't a shortening likewise
+        CHECK(storage.update_expiry(pk, hashes{"h1"}, std::array{base + 12min}, false, true)
+                      .empty());
+
+        auto [msgs, more] = storage.retrieve(pk, ns, "");
+        REQUIRE(msgs.size() == 3);
+        CHECK(msgs[0].hash == "h1");
+        CHECK(exp_ms(msgs[0].expiry) == exp_ms(base + 10min));
+        CHECK(exp_ms(msgs[1].expiry) == exp_ms(base));
+        auto by_hash = storage.retrieve_by_hash("h1");
+        REQUIRE(by_hash);
+        CHECK(exp_ms(by_hash->expiry) == exp_ms(base + 10min));
+        auto all = storage.retrieve_all();
+        REQUIRE(all.size() == 4);
+        CHECK(exp_ms(all[0].expiry) == exp_ms(base + 10min));
+        auto [dump, last_id] = storage.next_dump_batch(1, 100, 0, 0, 1'000'000);
+        REQUIRE(dump.size() == 4);
+        CHECK(exp_ms(dump[0].expiry) == exp_ms(base + 10min));
+
+        // Another owner can't see or change it
+        CHECK(storage.get_expiries(other, hashes{"h1"}).empty());
+        CHECK(storage.update_expiry(other, hashes{"h1"}, std::array{base + 20min}, true).empty());
+
+        // Not due yet
+        storage.commit_deferred_expiries();
+        CHECK(stored("h1") == exp_ms(base));
+
+        TestSuiteHacks::db_backdate_deferred_expiries(storage, 31min);
+        storage.commit_deferred_expiries();
+        CHECK(stored("h1") == exp_ms(base + 10min));
+        CHECK(storage.get_expiries(pk, hashes{"h1"}) == expiries{{"h1", exp_ms(base + 10min)}});
+
+        // Once written, the next small extension starts a new deferral
+        updated = storage.update_expiry(pk, hashes{"h1"}, std::array{base + 15min}, true);
+        CHECK(updated == updates{{"h1", base + 15min}});
+        CHECK(stored("h1") == exp_ms(base + 10min));
+        storage.commit_deferred_expiries(/*all=*/true);
+        CHECK(stored("h1") == exp_ms(base + 15min));
+    }
+
+    SECTION("shortenings and exact settings are written immediately") {
+        // Deferred, then shortened to between the stored and deferred values
+        auto updated = storage.update_expiry(pk, hashes{"h3"}, std::array{base + 5min}, true);
+        updated = storage.update_expiry(pk, hashes{"h3"}, std::array{base + 2min}, false, true);
+        CHECK(updated == updates{{"h3", base + 2min}});
+        CHECK(stored("h3") == exp_ms(base + 2min));
+        CHECK(storage.get_expiries(pk, hashes{"h3"}) == expiries{{"h3", exp_ms(base + 2min)}});
+        storage.commit_deferred_expiries(true);
+        CHECK(stored("h3") == exp_ms(base + 2min));
+
+        // Deferred, then set exactly to something lower
+        updated = storage.update_expiry(pk, hashes{"h3"}, std::array{base + 7min}, true);
+        CHECK(stored("h3") == exp_ms(base + 2min));
+        updated = storage.update_expiry(pk, hashes{"h3"}, std::array{base + 1min});
+        CHECK(updated == updates{{"h3", base + 1min}});
+        CHECK(stored("h3") == exp_ms(base + 1min));
+        // and set exactly to something slightly higher, which is deferred like an extension
+        updated = storage.update_expiry(pk, hashes{"h3"}, std::array{base + 3min});
+        CHECK(updated == updates{{"h3", base + 3min}});
+        CHECK(stored("h3") == exp_ms(base + 1min));
+        CHECK(storage.get_expiries(pk, hashes{"h3"}) == expiries{{"h3", exp_ms(base + 3min)}});
+    }
+
+    SECTION("a message not already near the maximum expiry is never deferred") {
+        // Just outside the window
+        REQUIRE(storage.store({pk, "near", ns, now, now + TTL_MAXIMUM_PRIVATE - 31min, "data"}) ==
+                StoreResult::New);
+        auto updated = storage.update_expiry(
+                pk, hashes{"near"}, std::array{now + TTL_MAXIMUM_PRIVATE - 25min}, true);
+        CHECK(updated == updates{{"near", now + TTL_MAXIMUM_PRIVATE - 25min}});
+        CHECK(stored("near") == exp_ms(now + TTL_MAXIMUM_PRIVATE - 25min));
+
+        // Small extensions of anything sooner are one-offs the client won't repeat
+        REQUIRE(storage.store({pk, "far", ns, now, now + 10 * 24h, "data"}) == StoreResult::New);
+        updated = storage.update_expiry(pk, hashes{"far"}, std::array{now + 10 * 24h + 5min}, true);
+        CHECK(updated == updates{{"far", now + 10 * 24h + 5min}});
+        CHECK(stored("far") == exp_ms(now + 10 * 24h + 5min));
+
+        REQUIRE(storage.store({pk, "soon", ns, now, now + 10min, "data"}) == StoreResult::New);
+        updated = storage.update_expiry(pk, hashes{"soon"}, std::array{now + 20min}, true);
+        CHECK(updated == updates{{"soon", now + 20min}});
+        CHECK(stored("soon") == exp_ms(now + 20min));
+
+        // Nothing is left in memory for the flush to write either
+        storage.commit_deferred_expiries(true);
+        CHECK(stored("near") == exp_ms(now + TTL_MAXIMUM_PRIVATE - 25min));
+        CHECK(stored("far") == exp_ms(now + 10 * 24h + 5min));
+        CHECK(stored("soon") == exp_ms(now + 20min));
+    }
+
+    SECTION("owner-wide shortening sees deferred extensions") {
+        storage.update_expiry(pk, hashes{"h1", "h2"}, std::array{base + 5min}, true);
+        storage.update_expiry(other, hashes{"o1"}, std::array{base + 5min}, true);
+        CHECK(stored("h1") == exp_ms(base));
+
+        // h1 and h2 are only past base + 2min by their deferred extensions
+        auto shortened = storage.update_all_expiries(pk, base + 2min);
+        std::ranges::sort(shortened);
+        CHECK(shortened ==
+              std::vector<std::pair<namespace_id, std::string>>{{ns, "h1"}, {ns, "h2"}});
+        CHECK(stored("h1") == exp_ms(base + 2min));
+        CHECK(stored("h2") == exp_ms(base + 2min));
+        CHECK(storage.get_expiries(pk, hashes{"h1", "h2", "h3"}) ==
+              expiries{
+                      {"h1", exp_ms(base + 2min)},
+                      {"h2", exp_ms(base + 2min)},
+                      {"h3", exp_ms(base)}});
+        // The other owner's deferral is untouched
+        CHECK(stored("o1") == exp_ms(base));
+        CHECK(storage.get_expiries(other, hashes{"o1"}) == expiries{{"o1", exp_ms(base + 5min)}});
+
+        storage.update_expiry(pk, hashes{"h3"}, std::array{base + 5min}, true);
+        auto shortened_ns = storage.update_all_expiries(pk, ns, base + 1min);
+        std::ranges::sort(shortened_ns);
+        CHECK(shortened_ns == hashes{"h1", "h2", "h3"});
+        CHECK(stored("h3") == exp_ms(base + 1min));
+        CHECK(storage.get_expiries(pk, hashes{"h3"}) == expiries{{"h3", exp_ms(base + 1min)}});
+    }
+
+    SECTION("deleting a message drops its deferred extension") {
+        storage.update_expiry(pk, hashes{"h1", "h2", "h3"}, std::array{base + 5min}, true);
+        CHECK(storage.delete_by_hash(pk, hashes{"h1"}) == hashes{"h1"});
+        REQUIRE(storage.store({pk, "h1", ns, now, base - 1h, "data"}) == StoreResult::New);
+        CHECK(storage.get_expiries(pk, hashes{"h1"}) == expiries{{"h1", exp_ms(base - 1h)}});
+
+        CHECK(storage.delete_by_timestamp(pk, ns, now).size() == 3);
+        REQUIRE(storage.store({pk, "h2", ns, now, base - 1h, "data"}) == StoreResult::New);
+        CHECK(storage.get_expiries(pk, hashes{"h2"}) == expiries{{"h2", exp_ms(base - 1h)}});
+        storage.commit_deferred_expiries(true);
+        CHECK(stored("h2") == exp_ms(base - 1h));
+    }
+
+    SECTION("re-storing a message sees its deferred extension") {
+        storage.update_expiry(pk, hashes{"h1"}, std::array{base + 5min}, true);
+        std::chrono::system_clock::time_point exp;
+        CHECK(storage.store({pk, "h1", ns, now, base + 2min, "data"}, &exp) == StoreResult::Exists);
+        CHECK(exp_ms(exp) == exp_ms(base + 5min));
+        CHECK(stored("h1") == exp_ms(base));
+        CHECK(storage.store({pk, "h1", ns, now, base + 15min, "data"}, &exp) ==
+              StoreResult::Extended);
+        CHECK(exp_ms(exp) == exp_ms(base + 15min));
+        CHECK(stored("h1") == exp_ms(base + 15min));
+        storage.commit_deferred_expiries(true);
+        CHECK(stored("h1") == exp_ms(base + 15min));
+    }
+}
+
+TEST_CASE("storage - deferred expiry extensions are written at shutdown", "[storage][expiry]") {
+    StorageDeleter fixture;
+
+    user_pubkey pk;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+    const auto base = now + TTL_MAXIMUM_PRIVATE - 20min;
+    {
+        Database storage{"."};
+        REQUIRE(storage.store({pk, "h1", namespace_id::Default, now, base, "data"}) ==
+                StoreResult::New);
+        storage.update_expiry(
+                pk, std::vector<std::string>{"h1"}, std::array{base + 5min}, /*extend=*/true);
+        CHECK(TestSuiteHacks::db_stored_expiry(storage, "h1") == to_epoch_ms(base));
+    }
+    Database storage{"."};
+    CHECK(TestSuiteHacks::db_stored_expiry(storage, "h1") == to_epoch_ms(base + 5min));
+}
 
 // The connection pool belongs to session-sqlite now, so rather than asserting on its internals this
 // checks what we actually depend on: that concurrent readers and writers all get through without

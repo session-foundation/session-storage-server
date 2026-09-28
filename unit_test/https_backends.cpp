@@ -17,6 +17,7 @@
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <oxenc/base64.h>
+#include <oxenc/hex.h>
 #include <sodium.h>
 
 #include <oxenss/common/format.h>
@@ -194,6 +195,23 @@ TEST_CASE("https backends", "[https]") {
                 CHECK(r.header["Content-Type"] == "application/json");
                 auto j = nlohmann::json::parse(r.text);
                 CHECK(j.count("version"));
+            }
+
+            SECTION("short json body survives moving the rendered response") {
+                // A body of 15 bytes or fewer fits inside the std::string object itself, so a
+                // view of it does not survive the string being moved; longer bodies live in a
+                // separate buffer that moves with the string and so never showed the problem.
+                // Both backends move what render() returns before writing it.  (No round trip:
+                // a client request whose reply is that short needs the swarm, which this node
+                // doesn't have.)
+                rpc::Response resp{
+                        http::OK, nlohmann::json{{"expiries", nlohmann::json::object()}}};
+                auto rendered = node.https->render(resp);
+                server::RenderedResponse moved = std::move(rendered);
+                CHECK(moved.body == R"({"expiries":{}})");
+                server::RenderedResponse assigned;
+                assigned = node.https->render(resp);
+                CHECK(assigned.body == R"({"expiries":{}})");
             }
 
             SECTION("obsolete long-poll header") {

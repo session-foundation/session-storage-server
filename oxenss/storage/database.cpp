@@ -8,6 +8,7 @@
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 #include <oxenss/common/format.h>
+#include <oxenss/common/ttl.h>
 #include <oxenc/base64.h>
 #include <oxenc/hex.h>
 
@@ -605,7 +606,13 @@ Database::Database(std::filesystem::path db_path) : db_path_{std::move(db_path)}
     clean_expired();
 }
 
-Database::~Database() = default;
+Database::~Database() {
+    try {
+        commit_deferred_expiries(/*all=*/true);
+    } catch (const std::exception& e) {
+        log::error(logcat, "Failed to write deferred expiry extensions at shutdown: {}", e.what());
+    }
+}
 
 /// Database methods obtain a connection from the pool for the duration of their work:
 ///
@@ -680,6 +687,8 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
                 from_epoch_ms(exp),
                 std::move(data));
     }
+    if (msg)
+        apply_deferred({&*msg, 1});
     return msg;
 }
 
@@ -714,8 +723,11 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
         if (auto existing = exec_and_maybe_get<int64_t, int64_t>(
                     conn.prepared_st("SELECT id, expiry FROM messages WHERE hash = ?"), msg.hash)) {
             auto& [id, exp] = *existing;
+            if (auto deferred = deferred_expiry_of(msg.hash, owner_id))
+                exp = std::max(exp, *deferred);
             if (exp < new_exp) {
                 conn.prepared_exec("UPDATE messages SET expiry = ? WHERE id = ?", new_exp, id);
+                forget_deferred(msg.hash);
                 ret = StoreResult::Extended;
                 exp = new_exp;
             } else {
@@ -900,6 +912,7 @@ std::pair<std::vector<message>, bool> Database::retrieve(
                 std::move(hash), ns, from_epoch_ms(ts), from_epoch_ms(exp), std::move(data));
     }
 
+    apply_deferred(results);
     return result;
 }
 
@@ -924,6 +937,7 @@ std::vector<message> Database::retrieve_all() {
                 std::move(data));
     }
 
+    apply_deferred(results);
     return results;
 }
 
@@ -936,6 +950,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_all(const use
             " RETURNING namespace, hash");
     auto deleted = get_all_pairs<namespace_id, std::string>(st, pubkey.raw_bytes(), pubkey.type());
     message_count_ -= static_cast<int64_t>(deleted.size());
+    forget_deferred(deleted);
     return deleted;
 }
 
@@ -949,6 +964,7 @@ std::vector<std::string> Database::delete_all(const user_pubkey& pubkey, namespa
             " RETURNING hash");
     auto deleted = get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), ns);
     message_count_ -= static_cast<int64_t>(deleted.size());
+    forget_deferred(deleted);
     return deleted;
 }
 
@@ -996,6 +1012,7 @@ std::vector<std::string> Database::delete_by_hash(
 
     transaction.commit();
     message_count_ -= static_cast<int64_t>(deleted.size());
+    forget_deferred(deleted);
     return deleted;
 }
 
@@ -1011,6 +1028,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
     auto deleted = get_all_pairs<namespace_id, std::string>(
             st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp));
     message_count_ -= static_cast<int64_t>(deleted.size());
+    forget_deferred(deleted);
     return deleted;
 }
 
@@ -1028,6 +1046,7 @@ std::vector<std::string> Database::delete_by_timestamp(
     auto deleted =
             get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
     message_count_ -= static_cast<int64_t>(deleted.size());
+    forget_deferred(deleted);
     return deleted;
 }
 
@@ -1122,36 +1141,136 @@ std::vector<std::string> Database::revoked_subaccounts(const user_pubkey& pubkey
     return get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type());
 }
 
-namespace {
-    // Message hashes are base64-encoded digests, so decoding just enough of the text to fill a
-    // size_t gives uniformly random hash bits without hashing the whole string.  (The text itself
-    // is not uniform: each byte is one of only 64 characters.)  Characters that aren't base64
-    // decode as 0, which only makes collisions for such (invalid) hashes more likely.
-    //
-    // Deliberately not noexcept: libstdc++ stores each node's hash code only for a hash that may
-    // throw, and otherwise recomputes neighbouring nodes' hashes while walking a bucket, which
-    // would repeat this decode.
-    struct b64_prefix_hash {
-        static constexpr size_t chars = (std::numeric_limits<size_t>::digits + 5) / 6;
+// Message hashes are base64-encoded digests, so decoding just enough of the text to fill a size_t
+// gives uniformly random hash bits without hashing the whole string.  (The text itself is not
+// uniform: each byte is one of only 64 characters.)  Characters that aren't base64 decode as 0,
+// which only makes collisions for such (invalid) hashes more likely.
+//
+// Deliberately not noexcept: libstdc++ stores each node's hash code only for a hash that may
+// throw, and otherwise recomputes neighbouring nodes' hashes while walking a bucket, which would
+// repeat this decode.
+size_t message_hash_hasher::operator()(std::string_view s) const {
+    constexpr size_t chars = (std::numeric_limits<size_t>::digits + 5) / 6;
+    if (s.size() < chars)
+        return std::hash<std::string_view>{}(s);
+    size_t h = 0;
+    for (size_t i = 0; i < chars; i++)
+        h = (h << 6) | static_cast<unsigned char>(
+                               oxenc::detail::b64_lut.from_b64(static_cast<unsigned char>(s[i])));
+    return h;
+}
 
-        size_t operator()(std::string_view s) const {
-            if (s.size() < chars)
-                return std::hash<std::string_view>{}(s);
-            size_t h = 0;
-            for (size_t i = 0; i < chars; i++)
-                h = (h << 6) | static_cast<unsigned char>(oxenc::detail::b64_lut.from_b64(
-                                       static_cast<unsigned char>(s[i])));
-            return h;
-        }
-    };
-}  // namespace
-
-static constexpr auto update_expiry_any =
+static constexpr auto update_expiry_sql =
         "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3"sv;
-static constexpr auto update_expiry_extend =
+static constexpr auto update_expiry_extend_sql =
         "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry < ?1"sv;
-static constexpr auto update_expiry_shorten =
-        "UPDATE messages SET expiry = ?1 WHERE hash = ?2 AND owner = ?3 AND expiry > ?1"sv;
+
+// The mutex is never held while touching the database: the cache is consulted or changed, the
+// lock dropped, and then the database is read or written.  Methods that write expiries do so
+// inside an IMMEDIATE transaction, so they are serialized with each other by the database's write
+// lock, and any interleaving with commit_deferred_expiries() (which takes entries out before it
+// writes them) or a delete leaves at worst an entry that is behind the stored expiry, which no
+// reader can see because every read takes the later of the two.
+
+std::optional<int64_t> Database::deferred_expiry_of(std::string_view hash, int64_t owner) {
+    std::lock_guard lock{deferred_mutex_};
+    if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == owner)
+        return it->second.expiry;
+    return std::nullopt;
+}
+
+void Database::forget_deferred(std::string_view hash) {
+    std::lock_guard lock{deferred_mutex_};
+    if (auto it = deferred_.find(hash); it != deferred_.end())
+        deferred_.erase(it);
+}
+
+void Database::forget_deferred(std::span<const std::string> hashes) {
+    if (hashes.empty())
+        return;
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return;
+    for (const auto& hash : hashes)
+        if (auto it = deferred_.find(hash); it != deferred_.end())
+            deferred_.erase(it);
+}
+
+void Database::forget_deferred(std::span<const std::pair<namespace_id, std::string>> ns_hashes) {
+    if (ns_hashes.empty())
+        return;
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return;
+    for (const auto& [ns, hash] : ns_hashes)
+        if (auto it = deferred_.find(hash); it != deferred_.end())
+            deferred_.erase(it);
+}
+
+void Database::apply_deferred(std::span<message> msgs) {
+    // One lock for the whole batch: the lookups are a few dozen nanoseconds each, far below the
+    // cost of the query that produced the messages.
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return;
+    for (auto& m : msgs)
+        if (auto it = deferred_.find(m.hash);
+            it != deferred_.end() && it->second.expiry > to_epoch_ms(m.expiry))
+            m.expiry = from_epoch_ms(it->second.expiry);
+}
+
+std::vector<std::pair<std::string, Database::deferred_expiry>> Database::take_deferred(
+        int64_t owner) {
+    // A linear scan, but only owner-wide expiry changes need it, and those are rare.
+    std::vector<std::pair<std::string, deferred_expiry>> taken;
+    std::lock_guard lock{deferred_mutex_};
+    for (auto it = deferred_.begin(); it != deferred_.end();) {
+        if (it->second.owner == owner) {
+            taken.emplace_back(it->first, it->second);
+            it = deferred_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return taken;
+}
+
+void Database::write_deferred(
+        session::sqlite::Connection& conn,
+        std::span<const std::pair<std::string, deferred_expiry>> entries) {
+    if (entries.empty())
+        return;
+    auto st = conn.prepared_st(update_expiry_extend_sql);
+    for (const auto& [hash, e] : entries) {
+        exec_query(st, e.expiry, hash, e.owner);
+        st->reset();
+    }
+}
+
+void Database::commit_deferred_expiries(bool all) {
+    std::vector<std::pair<std::string, deferred_expiry>> due;
+    {
+        std::lock_guard lock{deferred_mutex_};
+        const auto now = std::chrono::system_clock::now();
+        while (!deferred_queue_.empty() && (all || deferred_queue_.front().first <= now)) {
+            auto& hash = deferred_queue_.front().second;
+            if (auto it = deferred_.find(hash);
+                it != deferred_.end() && (all || it->second.commit_at <= now)) {
+                due.emplace_back(std::move(hash), it->second);
+                deferred_.erase(it);
+            }
+            deferred_queue_.pop_front();
+        }
+    }
+    if (due.empty())
+        return;
+
+    auto conn = db_->conn();
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    write_deferred(conn, due);
+    transaction.commit();
+    log::debug(logcat, "Wrote {} deferred expiry extensions", due.size());
+}
 
 std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Database::update_expiry(
         const user_pubkey& pubkey,
@@ -1170,7 +1289,8 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
 
     auto conn = db_->conn();
 
-    // One statement per hash; see delete_by_hash.
+    // One statement per hash; see delete_by_hash.  IMMEDIATE so that the expiry read below is
+    // still the stored one when we decide what to do with it.
     SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
 
     auto owner = exec_and_maybe_get<int64_t>(
@@ -1180,25 +1300,91 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
     if (!owner)
         return result;
 
-    auto st = conn.prepared_st(
-            extend_only    ? update_expiry_extend
-            : shorten_only ? update_expiry_shorten
-                           : update_expiry_any);
+    auto select_st = conn.prepared_st("SELECT expiry FROM messages WHERE hash = ? AND owner = ?");
+    // Unconditional: the decision to write has already been made against the current expiry,
+    // which for a deferred extension is later than the stored one.
+    auto update_st = conn.prepared_st(update_expiry_sql);
+    const auto now = std::chrono::system_clock::now();
+    const auto max_ms = to_epoch_ms(now + TTL_MAXIMUM_PRIVATE);
+    constexpr auto window_ms = std::chrono::milliseconds{EXPIRY_DEFER_WINDOW}.count();
 
-    // A repeated hash has to be reported updated only once.  With a single expiry and an
-    // extend/shorten constraint a repeat can't match again (the row's expiry now equals the one
-    // being set), but with neither constraint it would.
+    // The current expiry of each message this call has looked at: the deferred values, taken
+    // under one lock up front; then stored values as they are read; then whatever this call sets,
+    // so that a repeated hash is judged against the result of its first occurrence.
+    std::unordered_map<std::string_view, int64_t, message_hash_hasher> current_of;
+    current_of.reserve(msg_hashes.size());
+    {
+        std::lock_guard lock{deferred_mutex_};
+        if (!deferred_.empty())
+            for (const auto& hash : msg_hashes)
+                if (auto it = deferred_.find(hash);
+                    it != deferred_.end() && it->second.owner == *owner)
+                    current_of.emplace(hash, it->second.expiry);
+    }
+    // Deferred cache changes to apply at the end, under one lock: a new deferred expiry, or
+    // nullopt to drop the entry after a direct write.  A later change to the same hash replaces
+    // an earlier one.
+    std::unordered_map<std::string_view, std::optional<int64_t>, message_hash_hasher> pending;
+
+    // A repeated hash has to be reported updated only once.  With an extend/shorten constraint a
+    // repeat can't match again (the expiry now equals the one being set), but with neither
+    // constraint every existing message is reported.
     const bool dedupe = new_exp.size() == 1 && !extend_only && !shorten_only;
-    std::unordered_set<std::string_view, b64_prefix_hash> seen;
+    std::unordered_set<std::string_view, message_hash_hasher> seen;
     if (dedupe)
         seen.reserve(msg_hashes.size());
     for (size_t i = 0; i < msg_hashes.size(); i++) {
-        if (dedupe && !seen.insert(msg_hashes[i]).second)
+        const auto& hash = msg_hashes[i];
+        if (dedupe && !seen.insert(hash).second)
             continue;
         auto exp = new_exp.size() == 1 ? new_exp[0] : new_exp[i];
-        if (exec_query(st, to_epoch_ms(exp), msg_hashes[i], *owner) > 0)
-            result.emplace_back(msg_hashes[i], exp);
-        st->reset();
+        const auto exp_ms = to_epoch_ms(exp);
+
+        auto cur = current_of.find(hash);
+        if (cur == current_of.end()) {
+            auto stored = exec_and_maybe_get<int64_t>(select_st, hash, *owner);
+            select_st->reset();
+            if (!stored)
+                continue;
+            cur = current_of.emplace(hash, *stored).first;
+        }
+        auto& current = cur->second;
+
+        if (extend_only ? exp_ms <= current : shorten_only ? exp_ms >= current : false)
+            continue;
+
+        // Only a message already within the window of the maximum expiry is deferred: the
+        // extension is then small *and* a month out, so a crash costs at most a window's worth of
+        // mismatch between swarm members at the end of the month, and the client will almost
+        // always have extended the message again before then.  A small extension of a message
+        // expiring sooner is a one-off the client won't repeat, so it is written.
+        if (exp_ms > current && current > max_ms - window_ms) {
+            pending[hash] = exp_ms;
+        } else if (exp_ms != current) {
+            exec_query(update_st, exp_ms, hash, *owner);
+            update_st->reset();
+            pending[hash] = std::nullopt;
+        }
+        current = exp_ms;
+        result.emplace_back(hash, exp);
+    }
+
+    if (!pending.empty()) {
+        std::lock_guard lock{deferred_mutex_};
+        for (const auto& [hash, deferred] : pending) {
+            auto it = deferred_.find(hash);
+            if (!deferred) {
+                if (it != deferred_.end())
+                    deferred_.erase(it);
+            } else if (it != deferred_.end()) {
+                it->second.owner = *owner;
+                it->second.expiry = *deferred;
+            } else {
+                auto commit_at = now + EXPIRY_DEFER_WINDOW;
+                deferred_.emplace(std::string{hash}, deferred_expiry{*owner, *deferred, commit_at});
+                deferred_queue_.emplace_back(commit_at, std::string{hash});
+            }
+        }
     }
 
     transaction.commit();
@@ -1230,6 +1416,13 @@ std::map<std::string, int64_t> Database::get_expiries(
     }
 
     transaction.commit();
+
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return result;
+    for (auto& [hash, exp] : result)
+        if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == *owner)
+            exp = std::max(exp, it->second.expiry);
     return result;
 }
 
@@ -1237,26 +1430,50 @@ std::vector<std::pair<namespace_id, std::string>> Database::update_all_expiries(
         const user_pubkey& pubkey, std::chrono::system_clock::time_point new_exp) {
     auto conn = db_->conn();
 
+    // Deferred extensions have to be in the table before the shortening can see them; see the
+    // namespace variant.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return {};
+    write_deferred(conn, take_deferred(*owner));
+
     auto new_exp_ms = to_epoch_ms(new_exp);
     auto st = conn.prepared_st(
-            "UPDATE messages SET expiry = ?"
-            " WHERE expiry > ? AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
+            "UPDATE messages SET expiry = ? WHERE expiry > ? AND owner = ?"
             " RETURNING namespace, hash");
-    return get_all_pairs<namespace_id, std::string>(
-            st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type());
+    auto shortened = get_all_pairs<namespace_id, std::string>(st, new_exp_ms, new_exp_ms, *owner);
+    transaction.commit();
+    return shortened;
 }
 
 std::vector<std::string> Database::update_all_expiries(
         const user_pubkey& pubkey, namespace_id ns, std::chrono::system_clock::time_point new_exp) {
     auto conn = db_->conn();
 
+    // Deferred extensions have to be in the table before the shortening can see them: one that
+    // took a message past new_exp when its stored expiry was not would otherwise survive.  All of
+    // the owner's are written, not just this namespace's, because the entries don't record
+    // namespaces; that is merely an early commit for the others.
+    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return {};
+    write_deferred(conn, take_deferred(*owner));
+
     auto new_exp_ms = to_epoch_ms(new_exp);
     auto st = conn.prepared_st(
-            "UPDATE messages SET expiry = ?"
-            " WHERE expiry > ? AND owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
-            " AND namespace = ?"
+            "UPDATE messages SET expiry = ? WHERE expiry > ? AND owner = ? AND namespace = ?"
             " RETURNING hash");
-    return get_all<std::string>(st, new_exp_ms, new_exp_ms, pubkey.raw_bytes(), pubkey.type(), ns);
+    auto shortened = get_all<std::string>(st, new_exp_ms, new_exp_ms, *owner, ns);
+    transaction.commit();
+    return shortened;
 }
 
 void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
@@ -1264,6 +1481,20 @@ void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
     conn.prepared_exec(
             "UPDATE retry_node_requests SET next_retry = next_retry - ?",
             std::chrono::duration<double>{age}.count());
+}
+
+void Database::test_suite_backdate_deferred_expiries(std::chrono::seconds age) {
+    std::lock_guard lock{deferred_mutex_};
+    for (auto& [hash, e] : deferred_)
+        e.commit_at -= age;
+    for (auto& [commit_at, hash] : deferred_queue_)
+        commit_at -= age;
+}
+
+std::optional<int64_t> Database::test_suite_stored_expiry(const std::string& hash) {
+    auto conn = db_->conn();
+    return exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT expiry FROM messages WHERE hash = ?"), hash);
 }
 
 int64_t Database::add_retry_request(
@@ -1497,6 +1728,7 @@ std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
                 from_epoch_ms(exp),
                 std::move(data));
     }
+    apply_deferred(messages);
     return result;
 }
 
@@ -1585,6 +1817,7 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
                 from_epoch_ms(exp),
                 std::move(data));
     }
+    apply_deferred(messages);
     return result;
 }
 

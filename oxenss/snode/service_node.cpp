@@ -1155,6 +1155,7 @@ void ServiceNode::process_snodes_update(std::string_view data) {
 }
 
 void ServiceNode::update_last_ping(ReachType type) {
+    std::lock_guard lock{sn_mutex_};
     reach_records_.incoming_ping(type);
 }
 

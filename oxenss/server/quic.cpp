@@ -113,6 +113,23 @@ QUIC::QUIC(
             "quicsn", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
 }
 
+// A response over the stream's frame size limit would otherwise be dropped with nothing sent,
+// leaving the requester waiting; it gets an error instead.
+static void respond_within_limit(
+        const quic::message& msg, std::string_view body, bool error = false) {
+    try {
+        msg.respond(body, error);
+    } catch (const std::invalid_argument& e) {
+        log::warning(
+                logcat,
+                "Could not send {} response on {}: {}",
+                msg.endpoint(),
+                msg.conn_rid(),
+                e.what());
+        msg.respond("Response too large", true);
+    }
+}
+
 void QUIC::startup_endpoint() {
     size_t ep_idx = 0;
     for (auto& ep : endpoints) {
@@ -125,7 +142,10 @@ void QUIC::startup_endpoint() {
                 // juggling streams.
                 [handler = std::move(handler)](
                         quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
-                    return e.loop.make_shared<quic::BTRequestStream>(c, e, handler);
+                    // Both ends of a stream must agree on the frame size limit, so every node
+                    // uses the one shared by all transports.
+                    return e.loop.make_shared<quic::BTRequestStream>(
+                            c, e, handler, quic::opt::max_request_size{MAX_REQUEST_BODY_SIZE});
                 },
                 quic::connection_established_callback{
                         [this](quic::Connection& c) { on_conn_established(c); }},
@@ -187,10 +207,11 @@ void QUIC::on_conn_established(quic::Connection& c) {
     // A stream costs nothing until its first byte, so the whole set is opened up front.
     auto handler = [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); };
     sn_streams streams;
-    streams.command = conn->open_stream<quic::BTRequestStream>(handler);
-    streams.data = conn->open_stream<quic::BTRequestStream>(handler);
+    const quic::opt::max_request_size frame_size{MAX_REQUEST_BODY_SIZE};
+    streams.command = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
+    streams.data = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     for (auto& s : streams.onion)
-        s = conn->open_stream<quic::BTRequestStream>(handler);
+        s = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     sn_streams_[conn->reference_id()] = std::move(streams);
 
     auto [it, ins] = sn_conns_.try_emplace(
@@ -407,69 +428,88 @@ void QUIC::sn_request(
                         return reply(false, {"TIMEOUT"s});
                     }
 
-                    stream->command(
-                            cmd,
-                            body,
-                            timeout,
-                            [reply, storage_cc, onion, data_ready](quic::message m) {
-                                if (m.timed_out)
-                                    return reply(false, {"TIMEOUT"s});
-                                std::string b{m.body()};
+                    try {
+                        stream->command(
+                                cmd,
+                                body,
+                                timeout,
+                                [reply, storage_cc, onion, data_ready](quic::message m) {
+                                    if (m.timed_out)
+                                        return reply(false, {"TIMEOUT"s});
+                                    std::string b{m.body()};
 
-                                // A handshake reply is the peer's info on success or the refusal
-                                // reason (see handle_sn_data_ready); oxenmq's shape puts the "OK"
-                                // in front of the former.
-                                if (data_ready)
-                                    return m.is_error() ? reply(true, {std::move(b)})
-                                                        : reply(true, {"OK"s, std::move(b)});
+                                    // A handshake reply is the peer's info on success or the
+                                    // refusal reason (see handle_sn_data_ready); oxenmq's shape
+                                    // puts the "OK" in front of the former.
+                                    if (data_ready)
+                                        return m.is_error() ? reply(true, {std::move(b)})
+                                                            : reply(true, {"OK"s, std::move(b)});
 
-                                if (onion) {
-                                    // A hop reply is a bt list of [code, body] (see
-                                    // handle_sn_onion_request); oxenmq sends the same two as
-                                    // separate parts.
-                                    if (m.is_error())
+                                    if (onion) {
+                                        // A hop reply is a bt list of [code, body] (see
+                                        // handle_sn_onion_request); oxenmq sends the same two as
+                                        // separate parts.
+                                        if (m.is_error())
+                                            return reply(
+                                                    true,
+                                                    {fmt::to_string(http::BAD_GATEWAY.first),
+                                                     std::move(b)});
+                                        try {
+                                            oxenc::bt_list_consumer l{b};
+                                            auto code = l.consume_integer<int>();
+                                            return reply(
+                                                    true,
+                                                    {fmt::to_string(code), l.consume_string()});
+                                        } catch (const std::exception&) {
+                                            return reply(
+                                                    true,
+                                                    {fmt::to_string(
+                                                             http::INTERNAL_SERVER_ERROR.first),
+                                                     "Invalid response from snode"s});
+                                        }
+                                    }
+
+                                    if (!storage_cc)
+                                        return reply(true, {std::move(b)});
+
+                                    // A forwarded client request's reply has the QUIC client-RPC
+                                    // framing; reshape it into oxenmq's: [code, reason] for a
+                                    // failure (from "CODE REASON\n\nbody"), the bare result for a
+                                    // success (from the [code, result] list).
+                                    if (m.is_error()) {
+                                        auto code = b.substr(0, b.find(' '));
+                                        auto nl = b.find("\n\n");
                                         return reply(
                                                 true,
-                                                {fmt::to_string(http::BAD_GATEWAY.first),
-                                                 std::move(b)});
+                                                {std::move(code),
+                                                 nl == std::string::npos ? "" : b.substr(nl + 2)});
+                                    }
                                     try {
                                         oxenc::bt_list_consumer l{b};
-                                        auto code = l.consume_integer<int>();
-                                        return reply(
-                                                true, {fmt::to_string(code), l.consume_string()});
+                                        l.consume_integer<int>();
+                                        return reply(true, {std::string{l.consume_dict_data()}});
                                     } catch (const std::exception&) {
-                                        return reply(
-                                                true,
-                                                {fmt::to_string(http::INTERNAL_SERVER_ERROR.first),
-                                                 "Invalid response from snode"s});
+                                        // Unparseable; passing it through as-is makes the caller
+                                        // treat it as a bad peer response.
+                                        return reply(true, {std::move(b)});
                                     }
-                                }
-
-                                if (!storage_cc)
-                                    return reply(true, {std::move(b)});
-
-                                // A forwarded client request's reply has the QUIC client-RPC
-                                // framing; reshape it into oxenmq's: [code, reason] for a failure
-                                // (from "CODE REASON\n\nbody"), the bare result for a success
-                                // (from the [code, result] list).
-                                if (m.is_error()) {
-                                    auto code = b.substr(0, b.find(' '));
-                                    auto nl = b.find("\n\n");
-                                    return reply(
-                                            true,
-                                            {std::move(code),
-                                             nl == std::string::npos ? "" : b.substr(nl + 2)});
-                                }
-                                try {
-                                    oxenc::bt_list_consumer l{b};
-                                    l.consume_integer<int>();
-                                    return reply(true, {std::string{l.consume_dict_data()}});
-                                } catch (const std::exception&) {
-                                    // Unparseable; passing it through as-is makes the caller
-                                    // treat it as a bad peer response.
-                                    return reply(true, {std::move(b)});
-                                }
-                            });
+                                });
+                    } catch (const std::invalid_argument& e) {
+                        // Over the stream's frame size limit: nothing was sent, and without a
+                        // reply the request behind it would never complete.
+                        log::warning(
+                                logcat,
+                                "Could not send {} request on {}: {}",
+                                cmd,
+                                conn->reference_id(),
+                                e.what());
+                        if (onion)
+                            return reply(
+                                    true,
+                                    {fmt::to_string(http::PAYLOAD_TOO_LARGE.first),
+                                     "Request too large for next hop"s});
+                        return reply(false, {"Request too large"s});
+                    }
                 });
     });
 }
@@ -496,9 +536,11 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
                 quic::opt::handshake_timeout{5s},
                 // Streams the peer opens to us on this connection carry its requests:
                 [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
-                    return e.loop.make_shared<quic::BTRequestStream>(c, e, [this](quic::message m) {
-                        handle_request(std::move(m), reach_ep_idx);
-                    });
+                    return e.loop.make_shared<quic::BTRequestStream>(
+                            c,
+                            e,
+                            [this](quic::message m) { handle_request(std::move(m), reach_ep_idx); },
+                            quic::opt::max_request_size{MAX_REQUEST_BODY_SIZE});
                 },
                 quic::connection_established_callback{
                         [this](quic::Connection& c) { on_conn_established(c); }},
@@ -624,9 +666,10 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
                         remote_ip,
                         [msg](http::response_code code, std::string_view res_body) {
                             if (code.first == http::OK.first)
-                                msg.respond(res_body);
+                                respond_within_limit(msg, res_body);
                             else
-                                msg.respond(
+                                respond_within_limit(
+                                        msg,
                                         "{} {}\n\n{}"_format(code.first, code.second, res_body),
                                         true);
                         });
@@ -673,9 +716,10 @@ void QUIC::handle_sn_storage_cc(quic::message msg) {
             std::nullopt,
             [msg](http::response_code code, std::string_view res_body) {
                 if (code.first == http::OK.first)
-                    msg.respond(res_body);
+                    respond_within_limit(msg, res_body);
                 else
-                    msg.respond("{} {}\n\n{}"_format(code.first, code.second, res_body), true);
+                    respond_within_limit(
+                            msg, "{} {}\n\n{}"_format(code.first, code.second, res_body), true);
             },
             /*forwarded=*/true);
     if (!found)
@@ -686,7 +730,7 @@ void QUIC::handle_sn_storage_cc(quic::message msg) {
 // The reply carries oxenmq's two parts, status code and body, as a bt list.
 void QUIC::handle_sn_onion_request(quic::message msg) {
     auto respond = [msg](int code, std::string_view body) {
-        msg.respond(oxenc::bt_serialize(oxenc::bt_list{code, std::string{body}}));
+        respond_within_limit(msg, oxenc::bt_serialize(oxenc::bt_list{code, std::string{body}}));
     };
 
     std::string_view payload;
@@ -743,11 +787,12 @@ void QUIC::handle_onion_request(quic::message msg) {
                     }
 
                     if (res.status.first != http::OK.first)
-                        msg.respond(
+                        respond_within_limit(
+                                msg,
                                 "{} {}\n\n{}"_format(res.status.first, res.status.second, body),
                                 true);
                     else
-                        msg.respond(body);
+                        respond_within_limit(msg, body);
                 },
                 0,  // hopno
                 crypto::EncryptType::aes_gcm,

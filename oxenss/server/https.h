@@ -26,9 +26,6 @@ class OxenMQ;
 namespace oxenss::server {
 using namespace std::literals;
 
-// Maximum incoming HTTPS request size, in bytes.
-inline constexpr uint64_t MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024;
-
 // The library implementing the HTTPS listener.  Which of these are available is decided at build
 // time (see the HTTPS_BACKEND_* cmake options); which one is used is decided at startup.
 enum class HttpsBackend {

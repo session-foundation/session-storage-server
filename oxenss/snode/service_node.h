@@ -95,6 +95,10 @@ inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2
 // ALPN and only the commands a client may send.
 inline constexpr std::array<uint16_t, 3> SN_QUIC_VERSION = {2, 12, 0};
 
+// The hard fork from which every node runs SN_QUIC_VERSION or later, so that node-to-node oxenmq
+// is no longer needed: from here a node's oxenmq port is neither tested nor expected to be.
+inline constexpr hf_revision SN_QUIC_ONLY_HARDFORK = {23, 0};
+
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
         case SnodeStatus::UNSTAKED: return "Unstaked"sv;
@@ -231,7 +235,8 @@ class ServiceNode {
     void oxend_ping();
 
     // Initiate node ping tests
-    void test_reachability(const crypto::legacy_pubkey& sn, int previous_failures);
+    // `test_omq` is whether the node's oxenmq port is tested as well (see ping_peers).
+    void test_reachability(const crypto::legacy_pubkey& sn, int previous_failures, bool test_omq);
 
     // Reports node reachability result to oxend and, if a failure, queues the node for
     // retesting.
@@ -363,11 +368,6 @@ class ServiceNode {
             std::vector<std::string> parts,
             std::function<void(bool success, std::vector<std::string> parts)> cb,
             std::chrono::milliseconds timeout);
-
-    // True if the node runs SN_QUIC_VERSION or later: it reports so, or it holds a node-to-node
-    // QUIC connection with us, which only such a version makes.  (The reported version lags an
-    // upgrade by up to an hour.)
-    bool peer_is_current(const contact& ct);
 
     // Called when a connection with another storage server is established: starts or resumes any
     // dump or delivery that was waiting on the node being reachable.

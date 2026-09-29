@@ -173,10 +173,6 @@ class MQBase {
     // no longer service nodes can be closed.  The default does nothing.
     virtual void sweep_sn_connections() {}
 
-    // True if this transport currently holds a node-to-node connection with the given node.  The
-    // default (for transports that connect on demand) is false.
-    virtual bool sn_connected(const snode::contact&) { return false; }
-
     using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
     using sn_fallback = std::function<void(std::vector<std::string> parts)>;
 

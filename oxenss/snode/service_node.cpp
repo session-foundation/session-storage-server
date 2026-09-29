@@ -1168,37 +1168,43 @@ void ServiceNode::update_last_ping(ReachType type) {
 }
 
 void ServiceNode::ping_peers() {
-    std::lock_guard lock{sn_mutex_};
+    std::vector<std::pair<crypto::legacy_pubkey, int>> to_test;
+    {
+        std::lock_guard lock{sn_mutex_};
 
-    // TODO: Don't do anything until we are fully funded
+        // TODO: Don't do anything until we are fully funded
 
-    if (status_ == SnodeStatus::UNSTAKED || status_ == SnodeStatus::UNKNOWN) {
-        log::trace(logcat, "Skipping peer testing (unstaked)");
-        return;
+        if (status_ == SnodeStatus::UNSTAKED || status_ == SnodeStatus::UNKNOWN) {
+            log::trace(logcat, "Skipping peer testing (unstaked)");
+            return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        // Check if we've been tested (reached) recently ourselves.  Only nodes older than
+        // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an
+        // oxenmq ping is not expected.
+        reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
+
+        if (status_ == SnodeStatus::DECOMMISSIONED) {
+            log::trace(logcat, "Skipping peer testing (decommissioned)");
+            return;
+        }
+
+        /// We always test nodes due to be tested plus one general, non-failing node.
+
+        to_test = reach_records_.get_failing(now);
+        for (int i = 0; i < reachability_testing::RANDOM_TESTS_PER_TICK; i++) {
+            auto rando = reach_records_.next_random(swarm_, now);
+            if (!rando)
+                break;
+            to_test.emplace_back(std::move(*rando), 0);
+        }
     }
 
-    auto now = std::chrono::steady_clock::now();
-
-    // Check if we've been tested (reached) recently ourselves.  Only nodes older than
-    // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an oxenmq
-    // ping is not expected.
-    reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
-
-    if (status_ == SnodeStatus::DECOMMISSIONED) {
-        log::trace(logcat, "Skipping peer testing (decommissioned)");
-        return;
-    }
-
-    /// We always test nodes due to be tested plus one general, non-failing node.
-
-    auto to_test = reach_records_.get_failing(now);
-    for (int i = 0; i < reachability_testing::RANDOM_TESTS_PER_TICK; i++) {
-        auto rando = reach_records_.next_random(swarm_, now);
-        if (!rando)
-            break;
-        to_test.emplace_back(std::move(*rando), 0);
-    }
-
+    // Not under sn_mutex_: the tests' results come back on the QUIC loop and are recorded under
+    // it (report_reachability), so nothing that holds it may wait on that loop, and the sends
+    // below have no need of it in any case.
     if (to_test.empty())
         log::trace(logcat, "no nodes to test this tick");
     else
@@ -1226,6 +1232,7 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
         // node hasn't sent an uptime proof; we could treat it as a failure, but that seems
         // unnecessary since oxend will already fail the service node for not sending uptime proofs.
         log::debug(logcat, "Not testing {}: node is uncontactable", sn);
+        std::lock_guard lock{sn_mutex_};
         reach_records_.remove_node_from_failing(sn);
         return;
     }

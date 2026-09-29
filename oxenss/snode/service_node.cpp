@@ -811,15 +811,6 @@ void ServiceNode::sn_request(
         via_omq(std::move(parts));
 }
 
-bool ServiceNode::peer_is_current(const contact& ct) {
-    if (ct.version >= SN_QUIC_VERSION)
-        return true;
-    for (auto* s : mq_servers_)
-        if (s->sn_connected(ct))
-            return true;
-    return false;
-}
-
 std::vector<std::string> ServiceNode::data_ready_handshake(
         const crypto::legacy_pubkey& pk, std::string_view payload) {
     if (!swarm_.is_member(pk))
@@ -1169,6 +1160,7 @@ void ServiceNode::update_last_ping(ReachType type) {
 
 void ServiceNode::ping_peers() {
     std::vector<std::pair<crypto::legacy_pubkey, int>> to_test;
+    bool test_omq;
     {
         std::lock_guard lock{sn_mutex_};
 
@@ -1181,10 +1173,14 @@ void ServiceNode::ping_peers() {
 
         auto now = std::chrono::steady_clock::now();
 
-        // Check if we've been tested (reached) recently ourselves.  Only nodes older than
-        // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an
-        // oxenmq ping is not expected.
-        reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
+        // Until SN_QUIC_ONLY_HARDFORK, older nodes reach every node over oxenmq, so every node's
+        // oxenmq port has to work and is tested (and expected to be tested) by everyone: a node
+        // whose port is down but that only the older nodes tested would never gather enough
+        // failures to be decommissioned.
+        test_omq = !hf_at_least(SN_QUIC_ONLY_HARDFORK);
+
+        // Check if we've been tested (reached) recently ourselves.
+        reach_records_.check_incoming_tests(now, test_omq);
 
         if (status_ == SnodeStatus::DECOMMISSIONED) {
             log::trace(logcat, "Skipping peer testing (decommissioned)");
@@ -1210,10 +1206,11 @@ void ServiceNode::ping_peers() {
     else
         log::debug(logcat, "{} nodes to test", to_test.size());
     for (const auto& [sn, prev_fails] : to_test)
-        test_reachability(sn, prev_fails);
+        test_reachability(sn, prev_fails, test_omq);
 }
 
-void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previous_failures) {
+void ServiceNode::test_reachability(
+        const crypto::legacy_pubkey& sn, int previous_failures, bool test_omq) {
     log::debug(
             logcat,
             "Testing {} SN {} for reachability",
@@ -1236,11 +1233,6 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
         reach_records_.remove_node_from_failing(sn);
         return;
     }
-
-    // From SN_QUIC_VERSION a node is reached over HTTPS and QUIC only: clients use nothing else,
-    // and node-to-node traffic with it goes over QUIC.  Its oxenmq listener stays up for older
-    // peers but is not tested, so that it can go away once every node is at that version.
-    const bool test_omq = !peer_is_current(*c);
 
     auto test = std::make_shared<sn_test>(
             sn,

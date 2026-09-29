@@ -330,10 +330,6 @@ bool QUIC::has_sn_conn(const crypto::ed25519_pubkey& pk) const {
     return it != sn_conns_.end() && !it->second.empty();
 }
 
-bool QUIC::sn_connected(const snode::contact& ct) {
-    return loop.call_get([this, &ct] { return has_sn_conn(ct.pubkey_ed25519); });
-}
-
 bool QUIC::sn_quic_capable(const snode::contact& ct) const {
     return has_sn_conn(ct.pubkey_ed25519) || ct.version >= snode::SN_QUIC_VERSION;
 }

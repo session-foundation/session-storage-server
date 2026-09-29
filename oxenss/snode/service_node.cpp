@@ -811,15 +811,6 @@ void ServiceNode::sn_request(
         via_omq(std::move(parts));
 }
 
-bool ServiceNode::peer_is_current(const contact& ct) {
-    if (ct.version >= SN_QUIC_VERSION)
-        return true;
-    for (auto* s : mq_servers_)
-        if (s->sn_connected(ct))
-            return true;
-    return false;
-}
-
 std::vector<std::string> ServiceNode::data_ready_handshake(
         const crypto::legacy_pubkey& pk, std::string_view payload) {
     if (!swarm_.is_member(pk))
@@ -1164,50 +1155,63 @@ void ServiceNode::process_snodes_update(std::string_view data) {
 }
 
 void ServiceNode::update_last_ping(ReachType type) {
+    std::lock_guard lock{sn_mutex_};
     reach_records_.incoming_ping(type);
 }
 
 void ServiceNode::ping_peers() {
-    std::lock_guard lock{sn_mutex_};
+    std::vector<std::pair<crypto::legacy_pubkey, int>> to_test;
+    bool test_omq;
+    {
+        std::lock_guard lock{sn_mutex_};
 
-    // TODO: Don't do anything until we are fully funded
+        // TODO: Don't do anything until we are fully funded
 
-    if (status_ == SnodeStatus::UNSTAKED || status_ == SnodeStatus::UNKNOWN) {
-        log::trace(logcat, "Skipping peer testing (unstaked)");
-        return;
+        if (status_ == SnodeStatus::UNSTAKED || status_ == SnodeStatus::UNKNOWN) {
+            log::trace(logcat, "Skipping peer testing (unstaked)");
+            return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        // Until SN_QUIC_ONLY_HARDFORK, older nodes reach every node over oxenmq, so every node's
+        // oxenmq port has to work and is tested (and expected to be tested) by everyone: a node
+        // whose port is down but that only the older nodes tested would never gather enough
+        // failures to be decommissioned.
+        test_omq = !hf_at_least(SN_QUIC_ONLY_HARDFORK);
+
+        // Check if we've been tested (reached) recently ourselves.
+        reach_records_.check_incoming_tests(now, test_omq);
+
+        if (status_ == SnodeStatus::DECOMMISSIONED) {
+            log::trace(logcat, "Skipping peer testing (decommissioned)");
+            return;
+        }
+
+        /// We always test nodes due to be tested plus one general, non-failing node.
+
+        to_test = reach_records_.get_failing(now);
+        for (int i = 0; i < reachability_testing::RANDOM_TESTS_PER_TICK; i++) {
+            auto rando = reach_records_.next_random(swarm_, now);
+            if (!rando)
+                break;
+            to_test.emplace_back(std::move(*rando), 0);
+        }
     }
 
-    auto now = std::chrono::steady_clock::now();
-
-    // Check if we've been tested (reached) recently ourselves.  Only nodes older than
-    // SN_QUIC_VERSION test oxenmq ports (see test_reachability), so once none are left an oxenmq
-    // ping is not expected.
-    reach_records_.check_incoming_tests(now, network_.min_peer_version() < SN_QUIC_VERSION);
-
-    if (status_ == SnodeStatus::DECOMMISSIONED) {
-        log::trace(logcat, "Skipping peer testing (decommissioned)");
-        return;
-    }
-
-    /// We always test nodes due to be tested plus one general, non-failing node.
-
-    auto to_test = reach_records_.get_failing(now);
-    for (int i = 0; i < reachability_testing::RANDOM_TESTS_PER_TICK; i++) {
-        auto rando = reach_records_.next_random(swarm_, now);
-        if (!rando)
-            break;
-        to_test.emplace_back(std::move(*rando), 0);
-    }
-
+    // Not under sn_mutex_: the tests' results come back on the QUIC loop and are recorded under
+    // it (report_reachability), so nothing that holds it may wait on that loop, and the sends
+    // below have no need of it in any case.
     if (to_test.empty())
         log::trace(logcat, "no nodes to test this tick");
     else
         log::debug(logcat, "{} nodes to test", to_test.size());
     for (const auto& [sn, prev_fails] : to_test)
-        test_reachability(sn, prev_fails);
+        test_reachability(sn, prev_fails, test_omq);
 }
 
-void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previous_failures) {
+void ServiceNode::test_reachability(
+        const crypto::legacy_pubkey& sn, int previous_failures, bool test_omq) {
     log::debug(
             logcat,
             "Testing {} SN {} for reachability",
@@ -1226,14 +1230,10 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
         // node hasn't sent an uptime proof; we could treat it as a failure, but that seems
         // unnecessary since oxend will already fail the service node for not sending uptime proofs.
         log::debug(logcat, "Not testing {}: node is uncontactable", sn);
+        std::lock_guard lock{sn_mutex_};
         reach_records_.remove_node_from_failing(sn);
         return;
     }
-
-    // From SN_QUIC_VERSION a node is reached over HTTPS and QUIC only: clients use nothing else,
-    // and node-to-node traffic with it goes over QUIC.  Its oxenmq listener stays up for older
-    // peers but is not tested, so that it can go away once every node is at that version.
-    const bool test_omq = !peer_is_current(*c);
 
     auto test = std::make_shared<sn_test>(
             sn,
@@ -1251,8 +1251,11 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
     host = "{}.snode"_format(oxenc::to_base32z(sn.view()));
 
     log::debug(logcat, "Sending HTTPS ping to {} @ {}", sn, url);
+    // The response arrives on the QUIC loop thread, which must not run storage server logic
+    // (recording the result takes sn_mutex_); the QUIC ping hands its result to a worker the
+    // same way.
     http->post(
-            [test](cpr::Response r) {
+            [this, test](cpr::Response r) {
                 const auto& pk = test->pubkey;
                 bool success = false;
                 if (r.error.code != cpr::ErrorCode::OK) {
@@ -1284,7 +1287,9 @@ void ServiceNode::test_reachability(const crypto::legacy_pubkey& sn, int previou
                 if (success)
                     log::debug(logcat, "Successful HTTPS ping test of {}", pk);
 
-                test->add_result(success);
+                omq_server_->inject_task("quicsn", "https:(reach_report)", "", [test, success] {
+                    test->add_result(success);
+                });
             },
             std::move(url),
             ""s /*body*/,

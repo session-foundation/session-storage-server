@@ -118,8 +118,9 @@ class Database {
 
     // An extension of a message whose expiry is already within this of the maximum expiry is not
     // written when it is made, but held in memory and written this long after the first such
-    // extension of the message; see update_expiry.  Also the most expiry such a message can lose
-    // to a crash.
+    // extension of the message; see update_expiry.  A crash can cost such a message up to twice
+    // this: it may have been the full window short of the maximum when its first deferred
+    // extension arrived, and the deferred value keeps climbing for another window after that.
     static constexpr auto EXPIRY_DEFER_WINDOW = 30min;
     // Recommended period for calling commit_deferred_expiries()
     static constexpr auto EXPIRY_COMMIT_PERIOD = 15s;
@@ -277,7 +278,7 @@ class Database {
     // commit_deferred_expiries(), EXPIRY_DEFER_WINDOW after the message's first deferred
     // extension, or when this object is destroyed.  Clients re-extend their config messages to
     // the maximum expiry on every poll, and writing each of those dominated a busy node's disk
-    // writes.  If the process dies without shutting down, deferring them costs at most
+    // writes.  If the process dies without shutting down, deferring them costs at most twice
     // EXPIRY_DEFER_WINDOW of expiry, a month out, on a message the client will almost always have
     // extended again before then.  Any other change is written immediately.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(

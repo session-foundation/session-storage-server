@@ -1251,8 +1251,11 @@ void ServiceNode::test_reachability(
     host = "{}.snode"_format(oxenc::to_base32z(sn.view()));
 
     log::debug(logcat, "Sending HTTPS ping to {} @ {}", sn, url);
+    // The response arrives on the QUIC loop thread, which must not run storage server logic
+    // (recording the result takes sn_mutex_); the QUIC ping hands its result to a worker the
+    // same way.
     http->post(
-            [test](cpr::Response r) {
+            [this, test](cpr::Response r) {
                 const auto& pk = test->pubkey;
                 bool success = false;
                 if (r.error.code != cpr::ErrorCode::OK) {
@@ -1284,7 +1287,9 @@ void ServiceNode::test_reachability(
                 if (success)
                     log::debug(logcat, "Successful HTTPS ping test of {}", pk);
 
-                test->add_result(success);
+                omq_server_->inject_task("quicsn", "https:(reach_report)", "", [test, success] {
+                    test->add_result(success);
+                });
             },
             std::move(url),
             ""s /*body*/,

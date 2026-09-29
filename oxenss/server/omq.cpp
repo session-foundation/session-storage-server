@@ -299,8 +299,7 @@ OMQ::OMQ(
     // clang-format on
     omq_.set_general_threads(1);
 
-    omq_.MAX_MSG_SIZE =
-            10 * 1024 * 1024;  // 10 MB (needed by the fileserver, and swarm msg serialization)
+    omq_.MAX_MSG_SIZE = MAX_REQUEST_BODY_SIZE;
 
     // Be explicit about wanting per-SN unique connection IDs:
     omq_.EPHEMERAL_ROUTING_ID = false;

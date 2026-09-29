@@ -60,6 +60,16 @@ namespace quic {
 
 }  // namespace oxenss
 
+namespace oxenss::server {
+
+// Maximum incoming request size, in bytes, on every transport: an HTTPS body, an oxenmq message
+// part, and a QUIC request or response frame.  Nothing forwarded between nodes is larger than the
+// request it arrived as (an onion request loses a layer at every hop), and a relayed response is
+// what the exit node produced, which the file server's maximum file size keeps within this.
+inline constexpr uint64_t MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024;
+
+}  // namespace oxenss::server
+
 /// Namespace for http constants/types
 namespace oxenss::http {
 

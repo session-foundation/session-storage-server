@@ -88,8 +88,6 @@ class QUIC : public MQBase {
 
     void sweep_sn_connections() override;
 
-    bool sn_connected(const snode::contact& ct) override;
-
     // Sends over the held connection when the node speaks QUIC (see sn_quic_capable),
     // establishing the connection first if needed; the request is passed to `fallback` for a node
     // that does not.  A single part is the request body as-is, several are sent as a bt list (see

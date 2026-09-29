@@ -1,3 +1,15 @@
+oxen-storage-server (2.12.0~rc8-1~deb13) trixie; urgency=medium
+
+  * Correct the stated crash exposure of a deferred expiry refresh
+  * Don't hold sn_mutex_ while sending reachability tests
+  * Test every node's oxenmq port until hard fork 23
+  * Record incoming pings under sn_mutex_
+  * Hand HTTPS ping results to a worker
+  * Set the QUIC frame size limit to the HTTPS one; fail oversize sends
+  * Bump libquic to 1.10.0 stable
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 29 Sep 2026 15:50:58 -0300
+
 oxen-storage-server (2.12.0~rc7-1~deb13) trixie; urgency=medium
 
   * require fixed liboxenmq dev build

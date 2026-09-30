@@ -1,3 +1,11 @@
+oxen-storage-server (2.12.0~rc9-1) unstable; urgency=medium
+
+  * bump required libquic to 1.10
+  * Shut the QUIC side down before oxenmq, and destroy it after
+  * Bump libquic to 1.10.2
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 30 Sep 2026 13:53:19 -0300
+
 oxen-storage-server (2.12.0~rc8-1) unstable; urgency=medium
 
   * Correct the stated crash exposure of a deferred expiry refresh

@@ -1,3 +1,10 @@
+oxen-storage-server (2.12.0~rc9-2~ubuntu2604) resolute; urgency=medium
+
+  * bump required libquic
+  * Require libquic 1.10.2-2 or newer
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 30 Sep 2026 20:30:30 -0300
+
 oxen-storage-server (2.12.0~rc9-1~ubuntu2604) resolute; urgency=medium
 
   * bump required libquic to 1.10

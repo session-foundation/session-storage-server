@@ -299,10 +299,14 @@ int main(int argc, char* argv[]) {
         service_node.shutdown();
         log::info(logcat, "Stopping https server");
         https_server->shutdown(true);
+        // The QUIC loop hands everything it receives to oxenmq jobs, and those jobs use the QUIC
+        // server.  So: stop the QUIC side from producing work, then oxenmq (which finishes the
+        // jobs it is running), and only then destroy the QUIC server.
         log::info(logcat, "Stopping quic server");
-        quic.reset();
+        quic->shutdown();
         log::info(logcat, "Stopping omq server");
         oxenmq_server_ptr.reset();
+        quic.reset();
         log::info(logcat, "Shutting down");
     } catch (const snode::startup_aborted&) {
         log::error(logcat, "Received signal {}, aborting startup", signalled.load());

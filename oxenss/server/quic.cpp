@@ -188,6 +188,20 @@ static std::optional<crypto::ed25519_pubkey> sn_key(quic::Connection& c) {
             {reinterpret_cast<const char*>(key.data()), key.size()});
 }
 
+void QUIC::shutdown() {
+    loop.call_get([this] {
+        // Streams are deleted through their endpoint's job queue, so the registry, which holds
+        // them directly and through its connections, has to go before the endpoints do.
+        pending_sn_conns_.clear();
+        sn_bidir_.clear();
+        sn_streams_.clear();
+        sn_conns_.clear();
+        // Closing the connections fires callbacks that use reach_ep.
+        endpoints.clear();
+        reach_ep = nullptr;
+    });
+}
+
 void QUIC::on_conn_established(quic::Connection& c) {
     if (c.selected_alpn() != SN_ALPN)
         return;
@@ -379,6 +393,8 @@ void QUIC::sn_request(
                reply,
                timeout,
                fallback = std::move(fallback)]() mutable {
+        if (!reach_ep)
+            return;  // shut down; see shutdown()
         if (!sn_quic_capable(ct))
             return fallback(std::move(parts));
 
@@ -851,6 +867,8 @@ void QUIC::send_notification(
                quic_conns = std::move(quic_conns),
                command = std::move(command),
                notification = std::string{notification}] {
+        if (endpoints.empty())
+            return;  // shut down; see shutdown()
         for (const auto& [ep_idx, cid] : quic_conns) {
             assert(ep_idx < endpoints.size());
             if (auto conn = endpoints[ep_idx]->get_conn(cid))
@@ -923,6 +941,8 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
     // The registry is loop-owned, so the rest happens there.  (This is also called with the
     // service node's mutex held, and call() does not block.)
     loop.call([this, test = std::move(test), ct = *maybe_ct, report, ping]() mutable {
+        if (!reach_ep)
+            return;  // shut down; see shutdown()
         if (sn_quic_capable(ct)) {
             // Ping over the connection we hold with the node (establishing it if needed), and
             // keep it.

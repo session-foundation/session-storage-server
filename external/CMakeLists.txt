@@ -66,7 +66,7 @@ include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
 # 1.10.0 is the first release with a configurable BTRequestStream frame size limit.
-sessiondep_or_submodule(liboxenquic 1.10.0 oxen-libquic oxen::quic)
+sessiondep_or_submodule(liboxenquic 1.10.2 oxen-libquic oxen::quic)
 
 # 1.3.2 is the first release carrying the fixed libzmq and the proxy deadlock fix.
 sessiondep_or_submodule(liboxenmq 1.3.2 oxen-mq oxenmq::oxenmq)

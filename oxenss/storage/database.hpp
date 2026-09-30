@@ -7,12 +7,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 #include "oxenss/crypto/keys.h"
 
@@ -34,6 +39,13 @@ enum class StoreResult {
     Full,      // Can't insert right now because the database is full.
 };
 
+// Hashes a message hash (a base64 digest) by decoding just enough of it to fill a size_t; the
+// definition explains why it is not noexcept.
+struct message_hash_hasher {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const;
+};
+
 // Storage database class.
 class Database {
     // Held by pointer so that this header does not have to pull in SQLiteCpp.
@@ -53,13 +65,65 @@ class Database {
     // Shifts every pending retry's next_retry earlier, so that a test can reach the ready state
     // without waiting out RETRY_INITIAL_DELAY.
     void test_suite_backdate_retries(std::chrono::seconds age);
+    // Shifts every deferred expiry's commit time earlier, so that a test can make it due without
+    // waiting out EXPIRY_DEFER_WINDOW.
+    void test_suite_backdate_deferred_expiries(std::chrono::seconds age);
+    // The expiry actually stored in the messages table (i.e. ignoring any deferred extension).
+    std::optional<int64_t> test_suite_stored_expiry(const std::string& hash);
+
+    // Expiry extensions not yet written to the messages table; see update_expiry.  Every entry
+    // is for a message whose stored expiry is a month out, so a message can never expire from
+    // the table while an extension of it is still deferred.  The queue holds
+    // the same entries in commit order (commit times are fixed when an entry is created, so that
+    // is insertion order); an entry erased before its turn leaves a queue element that finds
+    // nothing, or finds a newer entry that is not yet due, and is skipped.
+    struct deferred_expiry {
+        int64_t owner;
+        int64_t expiry;  // ms since the epoch, like the messages table
+        std::chrono::system_clock::time_point commit_at;
+    };
+    std::mutex deferred_mutex_;
+    std::unordered_map<std::string, deferred_expiry, message_hash_hasher, std::equal_to<>>
+            deferred_;
+    std::deque<std::pair<std::chrono::system_clock::time_point, std::string>> deferred_queue_;
+
+    // The deferred expiry, if any, of the given message of the given owner.
+    std::optional<int64_t> deferred_expiry_of(std::string_view hash, int64_t owner);
+    // Drops any deferred extensions of the given messages: for use after their stored expiry has
+    // been written directly, or the messages deleted.
+    void forget_deferred(std::string_view hash);
+    void forget_deferred(std::span<const std::string> hashes);
+    void forget_deferred(std::span<const std::pair<namespace_id, std::string>> ns_hashes);
+    // Replaces each message's expiry with its deferred extension, where there is one.
+    void apply_deferred(std::span<message> msgs);
+    // Removes and returns every deferred extension for the given owner.
+    std::vector<std::pair<std::string, deferred_expiry>> take_deferred(int64_t owner);
+    // Writes the given (already removed) deferred extensions to the table, never lowering an
+    // expiry: an extension recorded since the entries were taken may already have been written.
+    void write_deferred(
+            session::sqlite::Connection& conn,
+            std::span<const std::pair<std::string, deferred_expiry>> entries);
 
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
+    // Counted once at startup, then kept current by the methods that store and delete messages:
+    // counting them with a query reads an entire index, which is slow on a big database or slow
+    // storage.
+    std::atomic<int64_t> message_count_ = 0;
+
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
+
+    // An extension of a message whose expiry is already within this of the maximum expiry is not
+    // written when it is made, but held in memory and written this long after the first such
+    // extension of the message; see update_expiry.  A crash can cost such a message up to twice
+    // this: it may have been the full window short of the maximum when its first deferred
+    // extension arrived, and the deferred value keeps climbing for another window after that.
+    static constexpr auto EXPIRY_DEFER_WINDOW = 30min;
+    // Recommended period for calling commit_deferred_expiries()
+    static constexpr auto EXPIRY_COMMIT_PERIOD = 15s;
 
     static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
 
@@ -128,7 +192,8 @@ class Database {
     // Retrieves all messages.
     std::vector<message> retrieve_all();
 
-    // Return the total number of messages stored
+    // Return the total number of messages stored.  This is tracked in memory from a count taken
+    // at startup, so changes made to the database by anything else are not seen.
     int64_t get_message_count();
 
     // Returns the per-owner counts of stored messages, for storage statistics purposes.
@@ -210,6 +275,16 @@ class Database {
     //
     // new_exp can be length one to apply the same timestamp to all messages, or the same length as
     // msg_hashes to apply a different timestamp to each.
+    //
+    // An extension of a message whose expiry is already within EXPIRY_DEFER_WINDOW of the maximum
+    // (now + TTL_MAXIMUM_PRIVATE) is deferred: it takes effect immediately as far as every method
+    // of this class is concerned but is only written to the database by
+    // commit_deferred_expiries(), EXPIRY_DEFER_WINDOW after the message's first deferred
+    // extension, or when this object is destroyed.  Clients re-extend their config messages to
+    // the maximum expiry on every poll, and writing each of those dominated a busy node's disk
+    // writes.  If the process dies without shutting down, deferring them costs at most twice
+    // EXPIRY_DEFER_WINDOW of expiry, a month out, on a message the client will almost always have
+    // extended again before then.  Any other change is written immediately.
     std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> update_expiry(
             const user_pubkey& pubkey,
             std::span<const std::string> msg_hashes,
@@ -235,6 +310,11 @@ class Database {
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
+
+    // Writes the deferred expiry extensions that are due (see update_expiry) to the database, or
+    // all of them if `all` is set.  The `Database` instance owner should call this periodically
+    // (every EXPIRY_COMMIT_PERIOD is recommended).
+    void commit_deferred_expiries(bool all = false);
 
     // Adds a request retry to the database, to be retried later.  If req_id is specified, this
     // is a subsequent failure on the same request.  It's not great to leak database table indices
@@ -325,6 +405,11 @@ class Database {
 
     // Removes all pending deliveries to `pubkey`.
     void remove_deliveries(const crypto::legacy_pubkey& pubkey);
+
+    // Pending dumps and deliveries refer to their recipient node through a shared recipients
+    // table; this removes the recipients that neither refers to any more.  Meant to be called
+    // periodically.
+    void clean_pending_recipients();
 
     // Remove the specified request retry.  This is one node's retry request, not the request
     // itself -- if no more nodes need the request retried it will be removed as well.

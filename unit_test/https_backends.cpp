@@ -17,6 +17,7 @@
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <oxenc/base64.h>
+#include <oxenc/hex.h>
 #include <sodium.h>
 
 #include <oxenss/common/format.h>
@@ -29,6 +30,19 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(OXENSS_HTTPS_MICROHTTPD) && defined(__linux__)
+#include <gnutls/gnutls.h>
+
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <fstream>
+#include <optional>
+#include <sstream>
+#endif
 
 using namespace oxenss;
 using namespace std::literals;
@@ -183,6 +197,23 @@ TEST_CASE("https backends", "[https]") {
                 CHECK(j.count("version"));
             }
 
+            SECTION("short json body survives moving the rendered response") {
+                // A body of 15 bytes or fewer fits inside the std::string object itself, so a
+                // view of it does not survive the string being moved; longer bodies live in a
+                // separate buffer that moves with the string and so never showed the problem.
+                // Both backends move what render() returns before writing it.  (No round trip:
+                // a client request whose reply is that short needs the swarm, which this node
+                // doesn't have.)
+                rpc::Response resp{
+                        http::OK, nlohmann::json{{"expiries", nlohmann::json::object()}}};
+                auto rendered = node.https->render(resp);
+                server::RenderedResponse moved = std::move(rendered);
+                CHECK(moved.body == R"({"expiries":{}})");
+                server::RenderedResponse assigned;
+                assigned = node.https->render(resp);
+                CHECK(assigned.body == R"({"expiries":{}})");
+            }
+
             SECTION("obsolete long-poll header") {
                 auto r = post(node, "/storage_rpc/v1", info_request, {{"X-Loki-Long-Poll", "1"}});
                 CHECK(r.status_code == 410);
@@ -236,6 +267,77 @@ TEST_CASE("https backends", "[https]") {
         }
     }
 }
+
+#if defined(OXENSS_HTTPS_MICROHTTPD) && defined(__linux__)
+
+namespace {
+
+// CPU time consumed so far, in milliseconds, by the thread of this process named `name`.
+std::optional<long> thread_cpu_ms(std::string_view name) {
+    for (const auto& task : std::filesystem::directory_iterator{"/proc/self/task"}) {
+        std::string comm;
+        std::getline(std::ifstream{task.path() / "comm"}, comm);
+        if (comm != name)
+            continue;
+        std::string stat;
+        std::getline(std::ifstream{task.path() / "stat"}, stat);
+        // The fields after the parenthesised name are whitespace separated, starting at field 3;
+        // utime and stime are fields 14 and 15.
+        std::istringstream fields{stat.substr(stat.rfind(')') + 2)};
+        std::string tok;
+        long ticks = 0;
+        for (int field = 3; fields >> tok && field <= 15; field++)
+            if (field >= 14)
+                ticks += std::stol(tok);
+        return ticks * 1000 / sysconf(_SC_CLK_TCK);
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+// libmicrohttpd's epoll mode left a connection whose TLS handshake was waiting on the client on
+// its ready list, so it polled with a zero timeout and re-ran the handshake continuously until
+// the client's next flight arrived; a client that never finished kept it spinning until the
+// connection timeout.  session-deps carries a patch for it; this makes sure it stays fixed.
+TEST_CASE("https backend - a stalled TLS handshake does not spin libmicrohttpd", "[https]") {
+    test_node node{server::HttpsBackend::microhttpd};
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(node.port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+
+    // Send the ClientHello and then never send anything else: the server answers with its flight
+    // and is left waiting for our Finished.
+    gnutls_certificate_credentials_t cred;
+    REQUIRE(gnutls_certificate_allocate_credentials(&cred) == 0);
+    gnutls_session_t session;
+    REQUIRE(gnutls_init(&session, GNUTLS_CLIENT | GNUTLS_NONBLOCK) == 0);
+    REQUIRE(gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, cred) == 0);
+    REQUIRE(gnutls_set_default_priority(session) == 0);
+    gnutls_transport_set_int(session, fd);
+    REQUIRE(gnutls_handshake(session) == GNUTLS_E_AGAIN);
+    std::this_thread::sleep_for(200ms);
+
+    auto before = thread_cpu_ms("MHD-single");
+    REQUIRE(before);
+    std::this_thread::sleep_for(500ms);
+    auto after = thread_cpu_ms("MHD-single");
+    REQUIRE(after);
+    // Waiting on the client costs nothing; the spin burns the whole interval.
+    CHECK(*after - *before < 50);
+
+    gnutls_deinit(session);
+    gnutls_certificate_free_credentials(cred);
+    close(fd);
+}
+
+#endif
 
 // Throughput/latency comparison of the backends on loopback.  Everything but the HTTP/TLS layer
 // is identical between them, so this isolates exactly the thing the runtime switch changes.

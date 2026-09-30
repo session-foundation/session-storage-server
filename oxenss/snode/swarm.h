@@ -69,6 +69,13 @@ struct SwarmMemberState {
     // to Nil once acknowledged (or to NeedsToRequest to try again if it fails).
     SwarmRequestedDBDump our_ss_requested_db_dump;
 
+    // Whether this member joined a swarm we were already in (as opposed to us entering its swarm,
+    // or it merely being unknown after a restart).  Such a member needs our copy of the swarm's
+    // messages: a 2.12+ node asks for it in its own handshake with us, but an older one never
+    // handshakes with a swarm it joins and expects the messages to follow our handshake with it,
+    // so we push them when it acknowledges that.  Cleared once that decision is made.
+    bool joined_our_swarm;
+
     // The earliest timestamp at which the swarm will check if they have received contact
     // information for this member yet and can send them data. Only utilised when status is
     // 'ContactDetailsPending' before transitioning to 'ContactDetailsReady' when the contact

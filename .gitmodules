@@ -1,6 +1,6 @@
 [submodule "vendors/oxen-mq"]
 	path = external/oxen-mq
-	url = https://github.com/oxen-io/oxen-mq.git
+	url = https://github.com/session-foundation/liboxenmq.git
 [submodule "vendors/nlohmann_json"]
 	path = external/nlohmann_json
 	url = https://github.com/nlohmann/json.git

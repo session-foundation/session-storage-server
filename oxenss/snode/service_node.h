@@ -89,15 +89,15 @@ inline constexpr hf_revision STORAGE_SERVER_HARDFORK = {19, 6};
 // The storage server version at which initial handshaking is supported before attempting a swarm
 // message transfer.
 inline constexpr std::array<uint16_t, 3> NEW_SWARM_MEMBER_HANDSHAKE_VERSION = {2, 10, 0};
-// The storage server version at which the sn.data_ready handshake carries a request payload (which
-// lets the new member ask us for a copy of the swarm's messages).  Older versions ignore any
-// payload, and send none.
-inline constexpr std::array<uint16_t, 3> SN_DATA_READY_WITH_REQUEST_VERSION = {2, 12, 0};
 
 // The storage server version from which node-to-node traffic goes over a held QUIC connection
 // (negotiated with server::SN_ALPN) rather than oxenmq.  Older versions only accept the client
 // ALPN and only the commands a client may send.
 inline constexpr std::array<uint16_t, 3> SN_QUIC_VERSION = {2, 12, 0};
+
+// The hard fork from which every node runs SN_QUIC_VERSION or later, so that node-to-node oxenmq
+// is no longer needed: from here a node's oxenmq port is neither tested nor expected to be.
+inline constexpr hf_revision SN_QUIC_ONLY_HARDFORK = {23, 0};
 
 constexpr std::string_view to_string(SnodeStatus status) {
     switch (status) {
@@ -138,6 +138,10 @@ class ServiceNode {
     Swarm swarm_;
 
     server::OMQ& omq_server_;
+
+    // DO NOT MODIFY THESE AFTER STARTUP.  They are set up by the constructor and by the single
+    // register_mq_server call made before the servers start accepting requests, and from then on
+    // are read with no lock held (by stores, notifications, and sn_request, from any thread).
     std::vector<server::MQBase*> mq_servers_;
     // The QUIC server, once registered: node-to-node requests go to it first, and it hands back
     // those for nodes that do not speak QUIC to be sent over oxenmq (see sn_request).
@@ -231,7 +235,8 @@ class ServiceNode {
     void oxend_ping();
 
     // Initiate node ping tests
-    void test_reachability(const crypto::legacy_pubkey& sn, int previous_failures);
+    // `test_omq` is whether the node's oxenmq port is tested as well (see ping_peers).
+    void test_reachability(const crypto::legacy_pubkey& sn, int previous_failures, bool test_omq);
 
     // Reports node reachability result to oxend and, if a failure, queues the node for
     // retesting.
@@ -257,8 +262,10 @@ class ServiceNode {
 
     const contact& own_address() { return our_contact_; }
 
-    // Adds a MQ server, i.e. QUIC.  The OMQ server is added automatically during construction and
-    // should not be added.
+    // Adds the QUIC MQ server.  The OMQ server is added automatically during construction and
+    // should not be added.  This must be called exactly once, during startup, before either server
+    // starts accepting requests: the server list is read without locking from then on.  Throws if
+    // called a second time.
     void register_mq_server(server::MQBase* server);
 
     // Sets the http client needed to perform HTTPS reachability tests
@@ -347,9 +354,11 @@ class ServiceNode {
     void queue_swarm_dump(const crypto::legacy_pubkey& pk);
 
     // Handles a data_ready handshake from swarm member `pk` (see check_new_members).  `payload`
-    // is the request payload, empty from pre-2.12 nodes.  Returns the reply to send: "OK", or a
-    // reason the handshake was refused.
-    std::string data_ready_handshake(const crypto::legacy_pubkey& pk, std::string_view payload);
+    // is the request payload, empty from pre-2.12 nodes.  Returns the reply parts to send: "OK"
+    // followed by a bt dict about us (currently just our version under "#"), or a single reason
+    // the handshake was refused.
+    std::vector<std::string> data_ready_handshake(
+            const crypto::legacy_pubkey& pk, std::string_view payload);
 
     // Sends a node-to-node request to `ct` (see server::MQBase::sn_request): over QUIC for a node
     // that speaks it, over oxenmq for the rest.
@@ -359,11 +368,6 @@ class ServiceNode {
             std::vector<std::string> parts,
             std::function<void(bool success, std::vector<std::string> parts)> cb,
             std::chrono::milliseconds timeout);
-
-    // True if the node runs SN_QUIC_VERSION or later: it reports so, or it holds a node-to-node
-    // QUIC connection with us, which only such a version makes.  (The reported version lags an
-    // upgrade by up to an hour.)
-    bool peer_is_current(const contact& ct);
 
     // Called when a connection with another storage server is established: starts or resumes any
     // dump or delivery that was waiting on the node being reachable.

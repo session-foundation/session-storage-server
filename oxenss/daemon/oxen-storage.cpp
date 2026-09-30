@@ -16,11 +16,16 @@
 #include <oxenmq/oxenmq.h>
 #include <sodium/core.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -41,6 +46,60 @@ std::atomic<int> signalled = 0;
 extern "C" void handle_signal(int sig) {
     signalled = sig;
 }
+
+#ifdef ENABLE_SYSTEMD
+// Until READY=1 goes out, the only limit systemd applies to us is TimeoutStartSec, and a database
+// schema upgrade on a slow disk can outlast it, after which we are killed mid-upgrade and restarted
+// into the same upgrade.  Asking for more time every few seconds, with a status line saying what we
+// are doing, covers however long the upgrade takes; EXTEND_TIMEOUT_USEC only comes into play once
+// the unit's own timeout would have expired, so this changes nothing about a quick start.  A plain
+// thread because it has to run before oxenmq or the QUIC loop exist.
+class startup_keepalive {
+  public:
+    startup_keepalive() : thread_{[this] { run(); }} {}
+    ~startup_keepalive() { stop(); }
+
+    void status(std::string s) {
+        {
+            std::lock_guard lock{mut_};
+            status_ = std::move(s);
+        }
+        cv_.notify_all();
+    }
+
+    void stop() {
+        {
+            std::lock_guard lock{mut_};
+            if (done_)
+                return;
+            done_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+  private:
+    void run() {
+        using namespace std::literals;
+        std::unique_lock lock{mut_};
+        while (!done_) {
+            sd_notify(0, ("EXTEND_TIMEOUT_USEC=30000000\nSTATUS=" + status_).c_str());
+            cv_.wait_for(lock, 5s);
+        }
+    }
+
+    std::mutex mut_;
+    std::condition_variable cv_;
+    std::string status_ = "Starting up";
+    bool done_ = false;
+    std::thread thread_;
+};
+#else
+struct startup_keepalive {
+    void status(const std::string&) {}
+    void stop() {}
+};
+#endif
 
 int main(int argc, char* argv[]) {
 
@@ -105,12 +164,15 @@ int main(int argc, char* argv[]) {
     }
 
     try {
+        startup_keepalive keepalive;
+
         std::vector<crypto::x25519_pubkey> stats_access_keys;
         for (const auto& key : options.stats_access_keys) {
             stats_access_keys.push_back(crypto::x25519_pubkey::from_hex(key));
             log::info(logcat, "Stats access key: {}", key);
         }
 
+        keepalive.status("Fetching service node keys from oxend");
         const auto [l_keys, ed_keys, x_keys] =
                 rpc::get_sn_keys(options.oxend_omq_rpc, [] { return signalled == 0; });
 
@@ -149,6 +211,7 @@ int main(int argc, char* argv[]) {
         auto oxenmq_server_ptr = std::make_unique<server::OMQ>(x_keys, stats_access_keys);
         auto& oxenmq_server = *oxenmq_server_ptr;
 
+        keepalive.status("Opening the database (a schema upgrade can take a few minutes)");
         snode::ServiceNode service_node{
                 l_keys,
                 me,
@@ -199,6 +262,7 @@ int main(int argc, char* argv[]) {
         service_node.set_http_client(http_client);
         request_handler.set_http_client(http_client);
 
+        keepalive.status("Waiting for oxend and the initial service node list");
         oxenmq_server.init(
                 &service_node,
                 &request_handler,
@@ -206,10 +270,12 @@ int main(int argc, char* argv[]) {
                 oxenmq::address{options.oxend_omq_rpc},
                 [] { return signalled == 0; });
 
+        keepalive.status("Starting listeners");
         quic->startup_endpoint();
 
         https_server->start();
 
+        keepalive.stop();
 #ifdef ENABLE_SYSTEMD
         sd_notify(0, "READY=1");
         oxenmq_server->add_timer(

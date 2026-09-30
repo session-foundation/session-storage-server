@@ -26,9 +26,6 @@ class OxenMQ;
 namespace oxenss::server {
 using namespace std::literals;
 
-// Maximum incoming HTTPS request size, in bytes.
-inline constexpr uint64_t MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024;
-
 // The library implementing the HTTPS listener.  Which of these are available is decided at build
 // time (see the HTTPS_BACKEND_* cmake options); which one is used is decided at startup.
 enum class HttpsBackend {
@@ -100,12 +97,14 @@ struct HttpsCall : std::enable_shared_from_this<HttpsCall> {
 
 // A response ready to be written by a backend: the status, the complete header list (including
 // the Server header and a Content-Type defaulted from the body type when the response did not
-// supply one), and the body.  `body` may refer into the rpc::Response it was rendered from, so
-// that must outlive this.
+// supply one), and the body.  `body` refers into either `body_storage` (a serialized json body)
+// or the rpc::Response it was rendered from, which must outlive this.  The storage is held by
+// pointer so that moving a RenderedResponse never moves the string: a short string keeps its
+// characters inside the object, and a view of them would not survive the move.
 struct RenderedResponse {
     http::response_code status;
     std::vector<std::pair<std::string, std::string>> headers;
-    std::string body_storage;
+    std::unique_ptr<std::string> body_storage;
     std::string_view body;
 };
 

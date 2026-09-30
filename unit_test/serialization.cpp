@@ -92,13 +92,11 @@ TEST_CASE("v1 serialization - message payload 100MiB", "[serialization]") {
     auto elapsed = std::chrono::high_resolution_clock::now() - begin;
 
     size_t total_bytes = msg_list.size() * base_msg.data.size();
-    std::string total_bytes_str = oxenss::util::get_human_readable_bytes(total_bytes);
     auto total_gbs = static_cast<double>(total_bytes) / (1024 * 1024 * 1024);
-    double gbs_per_s =
-            total_gbs / std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    double gbs_per_s = total_gbs / std::chrono::duration<double>{elapsed}.count();
 
-    fmt::println(
-            "Messages: {}; Size: {}; Elapsed: {}; Rate: {:.2f} GiB/s",
+    fmt::print(
+            "Messages: {}; Size: {}; Elapsed: {}; Rate: {:.2f} GiB/s\n",
             msg_list.size(),
             oxenss::util::get_human_readable_bytes(total_bytes),
             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed),

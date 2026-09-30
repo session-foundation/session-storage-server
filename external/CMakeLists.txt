@@ -12,18 +12,20 @@ endif()
 
 
 session_dep(libsodium 1.0.18)
-session_dep(libzmq 4.3)
+
+# oxen-mq takes libzmq through session-deps itself when built from the submodule below, and by
+# default gets the static copy: every libzmq release through 4.3.5 can abort on a heartbeat timer
+# firing for a connection that died while its receive pipe was full, and only session-deps' copy
+# carries the fix (see deps/libzmq.cmake there).  oxenmq enables heartbeats on every connection, so
+# a busy node hits this in production.  A system liboxenmq (1.3.2 and later, the floor below) bundles
+# a copy of its own.  This is a default rather than forced so that a system libzmq known to carry
+# the fix can be chosen with -DBUILD_STATIC_libzmq=OFF.
+option(BUILD_STATIC_libzmq "Build oxen-mq against session-deps' static libzmq rather than a system one" ON)
 if(HTTPS_BACKEND_UWEBSOCKETS)
-    # Only uSockets wants OpenSSL; everything else TLS-related here is gnutls, and session-deps no
-    # longer builds OpenSSL at all: a static libcrypto and a static gnutls define conflicting
-    # symbols and cannot be linked into one binary.  So this backend takes OpenSSL from the system
-    # only, and has no place in an all-static build.
-    if(BUILD_STATIC_DEPS)
-        message(FATAL_ERROR
-            "HTTPS_BACKEND_UWEBSOCKETS needs the system's OpenSSL and cannot be combined with "
-            "BUILD_STATIC_DEPS")
-    endif()
-    find_package(OpenSSL 3 REQUIRED)
+    # Only uSockets wants OpenSSL; everything else TLS-related here is gnutls.  A static build gets
+    # session-deps' OpenSSL, whose archives have everything but the public API hidden so that its
+    # copy of the CRYPTOGAMS assembly cannot collide with gnutls's (see deps/libssl.cmake there).
+    session_dep(libssl 3 WITH libcrypto)
 endif()
 session_dep(libcurl 7.68)
 
@@ -31,25 +33,19 @@ session_dep(libcurl 7.68)
 # it directly for certificate generation.
 session_dep(gnutls 3.6)
 
-# 1.0.8 is a security floor, not an API one: the code needs nothing newer than 0.9.75, but
+# Always built from session-deps rather than taken from the system: every release through 1.0.10
+# busy-waits for the whole of each TLS handshake in epoll mode, and session-deps carries the patch
+# for it (see deps/libmicrohttpd.cmake there).  The version is a security floor, not an API one:
 # 1.0.7/1.0.8 fixed crashes and out-of-bounds writes in the request parser that anyone able to
-# reach the HTTPS port can trigger.  No current Debian/Ubuntu stable ships that, so this is a
-# static build nearly everywhere for now; lower the floor for a distro only once its package has
-# those fixes backported.
+# reach the HTTPS port can trigger.
 if(HTTPS_BACKEND_MICROHTTPD)
+    set(BUILD_STATIC_libmicrohttpd ON)
     session_dep(libmicrohttpd 1.0.8)
 endif()
 
 # oxenss/http drives curl from libquic's event loop, so it needs libevent itself rather than just
 # inheriting it from libquic (which isn't built at all when a system liboxenquic is used).
 session_dep(libevent_core 2.1)
-
-# oxen-mq looks for plain `sodium` and `libzmq` targets set up by the parent project and links to
-# those in preference to going looking for system libraries of its own.
-add_library(sodium INTERFACE)
-target_link_libraries(sodium INTERFACE sessiondep::libsodium)
-add_library(libzmq INTERFACE)
-target_link_libraries(libzmq INTERFACE sessiondep::libzmq)
 
 
 # oxenc and oxen-logging come from libquic's submodules: libquic pulls them in anyway, and a second
@@ -69,9 +65,11 @@ endif()
 include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-sessiondep_or_submodule(liboxenquic 1.9.0 oxen-libquic oxen::quic)
+# 1.10.0 is the first release with a configurable BTRequestStream frame size limit.
+sessiondep_or_submodule(liboxenquic 1.10.0 oxen-libquic oxen::quic)
 
-sessiondep_or_submodule(liboxenmq 1.3.0 oxen-mq oxenmq::oxenmq)
+# 1.3.2 is the first release carrying the fixed libzmq and the proxy deadlock fix.
+sessiondep_or_submodule(liboxenmq 1.3.2 oxen-mq oxenmq::oxenmq)
 
 set(JSON_MultipleHeaders ON CACHE BOOL "") # Allows multi-header nlohmann use
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -95,7 +93,7 @@ add_library(uSockets STATIC EXCLUDE_FROM_ALL ${usockets_src})
 target_include_directories(uSockets PRIVATE uWebSockets/uSockets/src)
 target_compile_definitions(uSockets PRIVATE LIBUS_USE_OPENSSL)
 target_compile_features(uSockets PRIVATE c_std_11 cxx_std_17)
-target_link_libraries(uSockets OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(uSockets sessiondep::libssl sessiondep::libcrypto)
 
 # The uWebSockets C++ layer is header-only but isn't actually prefixed in the repository itself, but
 # rather only on install (which, as above, is just a very simple Makefile).  This is unfortunate

@@ -146,8 +146,8 @@ RenderedResponse HTTPS::render(const rpc::Response& res) const {
     // NB: if the dump() here throws then it means we messed up and put some invalid data
     // (probably binary) into a json value.
     if (json) {
-        out.body_storage = json->dump();
-        out.body = out.body_storage;
+        out.body_storage = std::make_unique<std::string>(json->dump());
+        out.body = *out.body_storage;
     } else if (binary) {
         out.body = {reinterpret_cast<const char*>(binary->data()), binary->size()};
     } else {

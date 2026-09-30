@@ -22,6 +22,12 @@ namespace oxenss::server {
 
 static auto logcat = log::Cat("server");
 
+// libmicrohttpd's own messages.  Its logger gives no severity, and nearly everything it reports
+// is a connection-level event (a peer hanging up mid-reply, a rejected TLS handshake) that the
+// uWebSockets backend never surfaced at all, so they go to debug under their own category.  The
+// one thing worth a warning, a daemon failing to start, is reported by start_daemon itself.
+static auto mhdcat = log::Cat("server.http");
+
 namespace detail {
 
     // The connection-side half of a request.  Shared between libmicrohttpd's per-request context
@@ -341,7 +347,7 @@ void HTTPS_MHD::on_log(const char* fmt, va_list ap) {
     std::string_view msg{buf, std::min<size_t>(n, sizeof(buf) - 1)};
     while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
         msg.remove_suffix(1);
-    log::warning(logcat, "libmicrohttpd: {}", msg);
+    log::debug(mhdcat, "{}", msg);
 }
 
 MHD_Daemon* HTTPS_MHD::start_daemon(const std::string& addr, uint16_t port, bool dual_stack) {

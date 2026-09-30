@@ -80,6 +80,12 @@ class QUIC : public MQBase {
 
     void startup_endpoint();
 
+    // Destroys the endpoints, closing every connection, and drops the SN connection registry.
+    // Afterwards nothing arrives from the network and the loop hands nothing more to oxenmq, so
+    // oxenmq can be torn down next while this object, which its queued jobs use, still exists.
+    // Anything asked of this object after this is dropped, without a reply or fallback.
+    void shutdown();
+
     void notify(std::vector<connection_id>&, std::string_view notification) override;
 
     void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;

@@ -1,3 +1,12 @@
+oxen-storage-server (2.12.0~rc10-1~deb14) forky; urgency=medium
+
+  * ci-upload: upload .ddeb debug packages and .buildinfo files
+  * bump oxenmq for late reply warning silencing
+  * Bump libquic & session-deps
+  * Rebuild with libquic 1.11.0
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 05 Oct 2026 23:15:09 -0300
+
 oxen-storage-server (2.12.0~rc9-2~deb14) forky; urgency=medium
 
   * bump required libquic

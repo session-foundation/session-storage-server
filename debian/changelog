@@ -1,3 +1,13 @@
+oxen-storage-server (2.12.0~rc10-1~ubuntu2610) stonking; urgency=medium
+
+  * ci-upload: upload .ddeb debug packages and .buildinfo files
+  * Drop the xz override and use Ubuntu's default zstd .deb compression
+  * bump oxenmq for late reply warning silencing
+  * Bump libquic & session-deps
+  * Rebuild with libquic 1.11.0
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 05 Oct 2026 23:15:15 -0300
+
 oxen-storage-server (2.12.0~rc9-2~ubuntu2610) stonking; urgency=medium
 
   * bump required libquic

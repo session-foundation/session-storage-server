@@ -1,3 +1,9 @@
+oxen-storage-server (2.12.0~rc10-2~deb14+1) forky; urgency=medium
+
+  * Rebuild against current forky libraries
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 13 Oct 2026 22:37:21 -0300
+
 oxen-storage-server (2.12.0~rc10-2~deb14) forky; urgency=medium
 
   * Rebuild

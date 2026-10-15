@@ -1,3 +1,9 @@
+oxen-storage-server (2.12.0~rc10-3~ubuntu2404) noble; urgency=medium
+
+  * bump required libquic for latest fixes
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 15 Oct 2026 13:35:04 -0300
+
 oxen-storage-server (2.12.0~rc10-2~ubuntu2404) noble; urgency=medium
 
   * Rebuild

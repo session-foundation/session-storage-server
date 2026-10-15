@@ -1,3 +1,9 @@
+oxen-storage-server (2.12.0-1~ubuntu2610) stonking; urgency=medium
+
+  * UNRELEASED
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 15 Oct 2026 19:14:20 -0300
+
 oxen-storage-server (2.12.0~rc10-3~ubuntu2610) stonking; urgency=medium
 
   * bump required libquic for latest fixes

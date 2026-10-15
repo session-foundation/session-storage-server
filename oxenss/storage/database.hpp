@@ -125,7 +125,7 @@ class Database {
     // Recommended period for calling commit_deferred_expiries()
     static constexpr auto EXPIRY_COMMIT_PERIOD = 15s;
 
-    static constexpr int64_t SIZE_LIMIT = 10LL * 1024 * 1024 * 1024;  // 10 GiB
+    static constexpr int64_t SIZE_LIMIT = 20LL * 1024 * 1024 * 1024;  // 20 GiB
 
     // How long after a swarm request to a peer times out before we first retry it.
     static constexpr auto RETRY_INITIAL_DELAY = 15s;

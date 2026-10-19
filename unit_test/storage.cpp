@@ -15,6 +15,7 @@
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <catch2/catch.hpp>
+#include <spdlog/sinks/ringbuffer_sink.h>
 #include "oxenss/common/format.h"
 #include "oxenss/utils/time.hpp"
 
@@ -72,6 +73,62 @@ TEST_CASE("storage - data persistence", "[storage]") {
         CHECK(items[0].msg_namespace == namespace_id::Default);
         CHECK(items[0].expiry - items[0].timestamp == ttl);
         CHECK(items[0].data == bytes);
+    }
+}
+
+TEST_CASE("storage - slow query logging", "[storage]") {
+    StorageDeleter fixture;
+
+    auto sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(1000);
+    oxen::log::add_sink(sink, "%v");
+    // Not remove_sink: that needs oxen-logging 1.2.2, and the test binary adds no other sinks.
+    struct SinkRemover {
+        ~SinkRemover() { oxen::log::clear_sinks(); }
+    } remover;
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+
+    // Holds the write lock from another connection for 100ms while `storage` stores a message, so
+    // that the store's BEGIN IMMEDIATE has to wait for it.
+    auto store_while_locked = [&](Database& storage, std::string hash) {
+        std::promise<void> locked;
+        auto holder = std::async(std::launch::async, [&locked] {
+            SQLite::Database other{"storage.db", SQLite::OPEN_READWRITE};
+            SQLite::Transaction t{other, SQLite::TransactionBehavior::IMMEDIATE};
+            locked.set_value();
+            std::this_thread::sleep_for(100ms);
+            t.commit();
+        });
+        locked.get_future().wait();
+        CHECK(storage.store({pubkey, std::move(hash), namespace_id::Default, now, now + 1h, "x"}) ==
+              StoreResult::New);
+        holder.get();
+    };
+
+    auto slow_queries = [&] {
+        std::vector<std::string> slow;
+        for (auto& line : sink->last_formatted())
+            if (line.starts_with("Slow query (")) {
+                if (line.ends_with('\n'))
+                    line.pop_back();
+                slow.push_back(std::move(line));
+            }
+        return slow;
+    };
+
+    {
+        Database storage{"."};
+        store_while_locked(storage, "hash1");
+        CHECK(slow_queries().empty());
+    }
+    {
+        Database storage{".", 50ms};
+        store_while_locked(storage, "hash2");
+        auto slow = slow_queries();
+        REQUIRE(slow.size() == 1);
+        CHECK_THAT(slow[0], Catch::Matchers::EndsWith("): BEGIN IMMEDIATE"));
     }
 }
 

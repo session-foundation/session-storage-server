@@ -217,6 +217,7 @@ int main(int argc, char* argv[]) {
                 me,
                 oxenmq_server,
                 options.data_dir,
+                std::chrono::milliseconds{options.db_slow_query_ms},
                 options.force_start,
                 options.skip_bootstrap};
 

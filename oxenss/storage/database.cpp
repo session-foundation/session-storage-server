@@ -576,6 +576,25 @@ void Database::setup_connection(session::sqlite::Connection& conn) {
     if (int rc = db.tryExec("PRAGMA synchronous = NORMAL"); rc != SQLITE_OK)
         log::error(logcat, "Failed to set synchronous mode to NORMAL: {}", sqlite3_errstr(rc));
 
+    // sqlite only measures to the millisecond, so the nanoseconds it reports end in 000000.
+    if (slow_query_ > 0ms)
+        if (int rc = sqlite3_trace_v2(
+                    db.getHandle(),
+                    SQLITE_TRACE_PROFILE,
+                    [](unsigned, void* self, void* stmt, void* elapsed) {
+                        std::chrono::nanoseconds t{*static_cast<int64_t*>(elapsed)};
+                        if (t >= static_cast<Database*>(self)->slow_query_)
+                            log::warning(
+                                    logcat,
+                                    "Slow query ({}): {}",
+                                    util::short_duration(t),
+                                    sqlite3_sql(static_cast<sqlite3_stmt*>(stmt)));
+                        return 0;
+                    },
+                    this);
+            rc != SQLITE_OK)
+            log::error(logcat, "Failed to enable slow query logging: {}", sqlite3_errstr(rc));
+
     // The same for every connection, but only obtainable from one.
     int page_size = db.execAndGet("PRAGMA page_size").getInt();
     page_size_.store(page_size, std::memory_order_relaxed);
@@ -589,7 +608,8 @@ void Database::setup_connection(session::sqlite::Connection& conn) {
     }
 }
 
-Database::Database(std::filesystem::path db_path) : db_path_{std::move(db_path)} {
+Database::Database(std::filesystem::path db_path, std::chrono::milliseconds slow_query) :
+        db_path_{std::move(db_path)}, slow_query_{slow_query} {
     namespace ss = session::sqlite;
     db_ = std::make_unique<ss::Database>(
             db_path_ / u8"storage.db",

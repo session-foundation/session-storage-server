@@ -22,6 +22,7 @@ struct command_line_options {
     bool testnet = false;
     std::string log_level{logging::DEFAULT_LOG_LEVELS};
     std::filesystem::path data_dir;
+    int db_slow_query_ms = 0;       // 0 disables slow query logging
     std::string oxend_key;          // test only (but needed for backwards compatibility)
     std::string oxend_x25519_key;   // test only
     std::string oxend_ed25519_key;  // test only

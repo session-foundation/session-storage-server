@@ -105,6 +105,7 @@ struct test_node {
                        keys.x25519.pub},
                omq,
                dir.path,
+               /*db_slow_query=*/0ms,
                /*force_start=*/true,
                /*skip_bootstrap=*/true},
             ce{keys.x25519},

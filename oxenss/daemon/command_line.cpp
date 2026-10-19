@@ -11,6 +11,7 @@
 #include <CLI/Error.hpp>
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <optional>
 
 extern "C" {
@@ -149,6 +150,15 @@ parse_result parse_cli_args(int argc, char* argv[]) {
             ->type_name("LEVELS")
             // A config file value is split on commas into several values; put them back together.
             ->join(',')
+            ->capture_default_str();
+    cli.add_option(
+               "--db-slow-query-ms",
+               options.db_slow_query_ms,
+               "Log every database statement that takes at least this many milliseconds; 0 "
+               "disables.  The time includes any wait for the database write lock, so a slow "
+               "'BEGIN IMMEDIATE' is waiting on some other writer rather than being slow itself.")
+            ->type_name("MS")
+            ->check(CLI::Range(0, std::numeric_limits<int>::max()))
             ->capture_default_str();
     cli.add_option(
                "--oxend-rpc",

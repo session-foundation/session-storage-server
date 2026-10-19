@@ -31,6 +31,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
+#include <oxenss/server/https_uws.h>
+#endif
+
 #if defined(OXENSS_HTTPS_MICROHTTPD) && defined(__linux__)
 #include <gnutls/gnutls.h>
 
@@ -268,6 +272,24 @@ TEST_CASE("https backends", "[https]") {
         }
     }
 }
+
+#ifdef OXENSS_HTTPS_UWEBSOCKETS
+
+// uWebSockets keeps its event loop in a thread_local, freed when the server thread exits, but a
+// response to a request still in flight at shutdown (an onion request forwarded to another node,
+// say) arrives afterwards on an OMQ worker and is handed to that loop.  It must be dropped rather
+// than queued into freed memory.
+TEST_CASE("https backend - uWebSockets drops work handed to it after shutdown", "[https]") {
+    test_node node{server::HttpsBackend::uwebsockets};
+    auto& uws = dynamic_cast<server::HTTPS_uWS&>(*node.https);
+    node.https->shutdown(true);
+
+    bool ran = false;
+    uws.run_on_loop([&ran] { ran = true; });
+    CHECK_FALSE(ran);
+}
+
+#endif
 
 #if defined(OXENSS_HTTPS_MICROHTTPD) && defined(__linux__)
 

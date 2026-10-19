@@ -26,9 +26,6 @@ override_dh_auto_configure:
 		$(DEB_CMAKE_ARCH_OPTIONS) \
 		-DOXENSS_VERSIONTAG=$(call dpkg_late_eval,OXENSS_VERSIONTAG,echo '$(DEB_VERSION)' | sed -e 's/^[0-9.]*//')
 
-override_dh_strip:
-	dh_strip --no-ddebs
-
 override_dh_installsystemd:
 	dh_installsystemd --name=oxen-testnet-storage-server --no-enable --no-start
 	dh_installsystemd --name=oxen-storage-server

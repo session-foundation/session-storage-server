@@ -118,6 +118,16 @@ class Database {
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
 
+    // clean_expired() and remove_expired_retry_requests() delete at most this many rows per
+    // transaction, and stop starting new transactions once a call has spent EXPIRY_DELETE_BUDGET,
+    // leaving the rest to the next call.  The chunks let other writers in between them, and the
+    // budget makes sure they actually get in: a writer waiting on the lock sleeps in sqlite's busy
+    // handler and rarely wakes during the instant between two chunks, so without it a backlog (such
+    // as the burst of failed forwards that expires together after a mass restart) would hold the
+    // lock as long as one big DELETE did.
+    static constexpr int EXPIRY_DELETE_CHUNK = 250;
+    static constexpr auto EXPIRY_DELETE_BUDGET = 250ms;
+
     // An extension of a message whose expiry is already within this of the maximum expiry is not
     // written when it is made, but held in memory and written this long after the first such
     // extension of the message; see update_expiry.  A crash can cost such a message up to twice
@@ -222,7 +232,7 @@ class Database {
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
 
     // Removes expired messages from the database; the `Database` instance owner should call
-    // this periodically.
+    // this periodically.  A large backlog takes several calls; see EXPIRY_DELETE_CHUNK.
     void clean_expired();
 
     // Deletes all messages owned by the given pubkey.  Returns the [namespace, hash] pairs of any
@@ -417,6 +427,9 @@ class Database {
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);
 
+    // Removes retry requests older than RETRY_EXPIRY; like clean_expired(), a large backlog takes
+    // several calls.
+    //
     // the `now` argument here only exists for the test suite; do not use it.
     void remove_expired_retry_requests(
             std::chrono::system_clock::time_point now = std::chrono::system_clock::now());

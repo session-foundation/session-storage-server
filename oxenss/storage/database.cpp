@@ -36,6 +36,22 @@ namespace {
     using namespace session::sqlite;
     using util::to_span;
 
+    // Runs `query`, a DELETE of at most EXPIRY_DELETE_CHUNK rows older than `cutoff` (its two
+    // parameters, in that order), until a run deletes less than a full chunk or the call's
+    // EXPIRY_DELETE_BUDGET is spent.  Returns the number of rows deleted.
+    template <typename Cutoff>
+    int64_t delete_in_chunks(Connection& conn, std::string_view query, Cutoff cutoff) {
+        const auto deadline = std::chrono::steady_clock::now() + Database::EXPIRY_DELETE_BUDGET;
+        int64_t total = 0;
+        while (true) {
+            int deleted = conn.prepared_exec(query, cutoff, Database::EXPIRY_DELETE_CHUNK);
+            total += deleted;
+            if (deleted < Database::EXPIRY_DELETE_CHUNK ||
+                std::chrono::steady_clock::now() >= deadline)
+                return total;
+        }
+    }
+
     // For an INSERT that may take an ON CONFLICT DO UPDATE branch instead: sqlite's change count
     // counts such an update the same as an insert, but only an actual insert sets the connection's
     // last insert rowid.  It is reset beforehand, rather than compared with its previous value,
@@ -647,8 +663,11 @@ Database::~Database() {
 /// relying on holding a connection; see store() for why DEFERRED is not good enough.
 
 void Database::clean_expired() {
-    message_count_ -= db_->conn().prepared_exec(
-            "DELETE FROM messages WHERE expiry <= ?",
+    auto conn = db_->conn();
+    message_count_ -= delete_in_chunks(
+            conn,
+            "DELETE FROM messages WHERE id IN"
+            " (SELECT id FROM messages WHERE expiry <= ? ORDER BY expiry LIMIT ?)",
             to_epoch_ms(std::chrono::system_clock::now()));
 }
 
@@ -1872,9 +1891,11 @@ void Database::remove_node_retry_request(int64_t req_id) {
 
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
     auto conn = db_->conn();
-
-    conn.prepared_exec(
-            "DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - RETRY_EXPIRY));
+    delete_in_chunks(
+            conn,
+            "DELETE FROM retry_requests WHERE id IN"
+            " (SELECT id FROM retry_requests WHERE created < ? ORDER BY created LIMIT ?)",
+            to_epoch_double(now - RETRY_EXPIRY));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {

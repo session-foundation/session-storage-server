@@ -106,10 +106,6 @@ class Database {
             session::sqlite::Connection& conn,
             std::span<const std::pair<std::string, deferred_expiry>> entries);
 
-    // How long, give or take one message, bulk_store() keeps the write lock before committing what
-    // it has so far and queueing up again behind other writers.
-    static constexpr auto BULK_STORE_PIECE = 10ms;
-
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 
@@ -121,6 +117,20 @@ class Database {
   public:
     // Recommended period for calling clean_expired()
     static constexpr auto CLEANUP_PERIOD = 10s;
+
+    // How long the long runs of writes -- bulk_store(), and clean_expired() and
+    // remove_expired_retry_requests() working through a backlog -- keep the write lock, give or
+    // take one statement, before committing what they have so far and queueing up again behind
+    // other writers.
+    static constexpr auto BULK_WORK_TARGET = 10ms;
+
+    // clean_expired() and remove_expired_retry_requests() delete at most this many rows per
+    // statement, until BULK_WORK_TARGET, in each transaction, so that a backlog (such
+    // as the burst of failed forwards that expires together after a mass restart) doesn't keep
+    // other writers waiting for one big DELETE.  Small enough that one statement takes only a few
+    // milliseconds on slow storage, where deleting a message, with its index entries and cascades,
+    // can take a fraction of one.
+    static constexpr int EXPIRY_DELETE_CHUNK = 25;
 
     // An extension of a message whose expiry is already within this of the maximum expiry is not
     // written when it is made, but held in memory and written this long after the first such
@@ -225,10 +235,10 @@ class Database {
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
 
-    // Removes expired messages from the database; the `Database` instance owner should call
-    // this periodically.  Until then the methods that read messages or their expiries for clients
-    // and peers skip expired messages, so how far behind this falls affects only disk use and
-    // get_message_count().
+    // Removes expired messages from the database, EXPIRY_DELETE_CHUNK at a time; the `Database`
+    // instance owner should call this periodically.  Until then the methods that read messages or
+    // their expiries for clients and peers skip expired messages, so how far behind this falls
+    // affects only disk use and get_message_count().
     void clean_expired();
 
     // Deletes all messages owned by the given pubkey.  Returns the [namespace, hash] pairs of any
@@ -423,6 +433,8 @@ class Database {
     // itself -- if no more nodes need the request retried it will be removed as well.
     void remove_node_retry_request(int64_t req_id);
 
+    // Removes retry requests older than RETRY_EXPIRY, EXPIRY_DELETE_CHUNK at a time.
+    //
     // the `now` argument here only exists for the test suite; do not use it.
     void remove_expired_retry_requests(
             std::chrono::system_clock::time_point now = std::chrono::system_clock::now());

@@ -304,6 +304,34 @@ TEST_CASE("storage - tracked message count", "[storage]") {
     check(storage, 1);
 }
 
+TEST_CASE("storage - expired messages are deleted across chunks", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+    constexpr int expired = 2 * Database::EXPIRY_DELETE_CHUNK + 17, live = 3;
+
+    Database storage{"."};
+    std::vector<message> msgs;
+    for (int i = 0; i < expired; i++)
+        msgs.emplace_back(
+                pubkey, "x{}"_format(i), namespace_id::Default, now - 2h, now - 1h - 1s * i, "x");
+    for (int i = 0; i < live; i++)
+        msgs.emplace_back(pubkey, "l{}"_format(i), namespace_id::Default, now, now + 1h, "l");
+    storage.bulk_store(msgs);
+    REQUIRE(storage.get_message_count() == expired + live);
+
+    storage.clean_expired();
+    CHECK(storage.get_message_count() == live);
+    CHECK(storage.get_namespace_counts() ==
+          std::vector<std::pair<namespace_id, int64_t>>{{namespace_id::Default, live}});
+    auto [items, more] = storage.retrieve(pubkey, namespace_id::Default, "");
+    REQUIRE(items.size() == live);
+    for (auto& m : items)
+        CHECK(m.hash.starts_with("l"));
+}
+
 TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
     StorageDeleter fixture;
 
@@ -1038,6 +1066,29 @@ TEST_CASE("storage - retry requests", "[storage]") {
     CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
     req_count = storage.retry_request_count();
     CHECK(req_count == 1);
+}
+
+TEST_CASE("storage - expired retry requests are deleted across chunks", "[storage]") {
+    StorageDeleter fixture;
+    crypto::legacy_pubkey pk1, pk2;
+    pk1.load_from_hex("1111111111111111111111111111111111111111111111111111111111111111");
+    pk2.load_from_hex("2222222222222222222222222222222222222222222222222222222222222222");
+    constexpr int expired = 2 * Database::EXPIRY_DELETE_CHUNK + 17;
+
+    Database storage{"."};
+    // Each request goes to two nodes, so every deletion also cascades through retry_node_requests.
+    for (int i = 0; i < expired; i++)
+        storage.add_retry_request(
+                pk2, "cmd", "payload", storage.add_retry_request(pk1, "cmd", "payload"));
+    REQUIRE(storage.retry_request_count() == 2 * expired);
+
+    std::this_thread::sleep_for(10ms);
+    auto cutoff = std::chrono::system_clock::now() + Database::RETRY_EXPIRY;
+    std::this_thread::sleep_for(10ms);
+    storage.add_retry_request(pk1, "cmd", "fresh");
+
+    storage.remove_expired_retry_requests(cutoff);
+    CHECK(storage.retry_request_count() == 1);
 }
 
 TEST_CASE("storage - ready retry requests", "[storage]") {

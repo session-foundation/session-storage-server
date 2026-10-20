@@ -36,6 +36,27 @@ namespace {
     using namespace session::sqlite;
     using util::to_span;
 
+    // Runs `query`, a DELETE of at most EXPIRY_DELETE_CHUNK rows older than `cutoff` (its two
+    // parameters, in that order), until a run deletes less than a full chunk, committing and
+    // queueing again for the write lock every BULK_WORK_TARGET.  Returns the number of rows
+    // deleted.
+    template <typename Cutoff>
+    int64_t delete_in_chunks(Connection& conn, std::string_view query, Cutoff cutoff) {
+        int64_t total = 0;
+        bool more = true;
+        while (more) {
+            auto transaction = conn.begin_immediate();
+            const auto piece_end = std::chrono::steady_clock::now() + Database::BULK_WORK_TARGET;
+            do {
+                int deleted = conn.prepared_exec(query, cutoff, Database::EXPIRY_DELETE_CHUNK);
+                total += deleted;
+                more = deleted == Database::EXPIRY_DELETE_CHUNK;
+            } while (more && std::chrono::steady_clock::now() < piece_end);
+            transaction.commit();
+        }
+        return total;
+    }
+
     // For an INSERT that may take an ON CONFLICT DO UPDATE branch instead: sqlite's change count
     // counts such an update the same as an insert, but only an actual insert sets the connection's
     // last insert rowid.  It is reset beforehand, rather than compared with its previous value,
@@ -657,8 +678,11 @@ Database::~Database() {
 /// why a write also can't use a DEFERRED transaction.
 
 void Database::clean_expired() {
-    message_count_ -= db_->conn().prepared_exec_immediate(
-            "DELETE FROM messages WHERE expiry <= ?",
+    auto conn = db_->conn();
+    message_count_ -= delete_in_chunks(
+            conn,
+            "DELETE FROM messages WHERE id IN"
+            " (SELECT id FROM messages WHERE expiry <= ? ORDER BY expiry LIMIT ?)",
             to_epoch_ms(std::chrono::system_clock::now()));
 }
 
@@ -831,7 +855,7 @@ void Database::bulk_store(std::span<const message> items) {
             " WHERE EXCLUDED.timestamp > messages.timestamp");
 
     // A batch is up to a megabyte, and slow to insert when the pages it touches aren't cached, so
-    // it is committed in pieces of about BULK_STORE_PIECE rather than in one transaction: each
+    // it is committed in pieces of about BULK_WORK_TARGET rather than in one transaction: each
     // piece's begin_immediate() goes behind whatever writes queued up during the last one, rather
     // than leaving them waiting for the whole batch.  A batch that fails partway keeps the pieces
     // already committed, which is harmless: they are upserts, so if the batch is sent again,
@@ -842,7 +866,7 @@ void Database::bulk_store(std::span<const message> items) {
     auto next = items.begin();
     while (next != items.end()) {
         auto transaction = conn.begin_immediate();
-        const auto piece_end = std::chrono::steady_clock::now() + BULK_STORE_PIECE;
+        const auto piece_end = std::chrono::steady_clock::now() + BULK_WORK_TARGET;
         std::unordered_map<user_pubkey, std::optional<int64_t>> owners;
         int64_t added = 0;
         do {
@@ -1916,9 +1940,11 @@ void Database::remove_node_retry_request(int64_t req_id) {
 
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
     auto conn = db_->conn();
-
-    conn.prepared_exec_immediate(
-            "DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - RETRY_EXPIRY));
+    delete_in_chunks(
+            conn,
+            "DELETE FROM retry_requests WHERE id IN"
+            " (SELECT id FROM retry_requests WHERE created < ? ORDER BY created LIMIT ?)",
+            to_epoch_double(now - RETRY_EXPIRY));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {

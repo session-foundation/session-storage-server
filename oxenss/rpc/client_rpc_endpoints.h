@@ -192,6 +192,9 @@ struct store final : recursive {
 /// - `last_hash` (optional) retrieve messages stored by this storage server since `last_hash` was
 ///   stored.  Can also be specified as `lastHash`.  An empty string (or null) is treated as an
 ///   omitted value.
+/// - `reverse_direction` (optional) boolean; when true messages are returned newest first, walking
+///   backwards from the message just older than `last_hash` if given and found, or from the most
+///   recent message otherwise.  `more` then means that older messages remain.  Defaults to false.
 /// - `subaccount`/`subaccount_sig` (optional) see description in `store`.  Only subaccount tokens
 ///   with the read bit set may invoke this method.
 /// - `max_count`/`max_size` (optional) these two integer values control how many messages to
@@ -247,7 +250,8 @@ struct store final : recursive {
 /// - "data" -- the message data; b64-encoded for json, bytes for bt-encoded requests.
 ///
 /// Messages order is such that the hash of the last message is the appropriate value to provide as
-/// a future "last_hash" value, but otherwise no particular ordering is guaranteed.
+/// a future "last_hash" value for a request in the same direction, but otherwise no particular
+/// ordering is guaranteed.
 struct retrieve final : endpoint {
     static constexpr auto names() { return NAMES("retrieve"); }
 
@@ -257,6 +261,7 @@ struct retrieve final : endpoint {
     std::optional<std::string> last_hash;
     std::optional<int> max_count;
     std::optional<int> max_size;
+    bool reverse_direction = false;
 
     bool check_signature = false;  // For transition; delete this once we require sigs always
     std::optional<std::array<unsigned char, 32>> pubkey_ed25519;

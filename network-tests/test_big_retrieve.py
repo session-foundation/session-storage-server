@@ -370,3 +370,68 @@ def test_retrieve_size_and_count(rpc, big_store):
     s10_or_700k = json.loads(s10_or_700k[0])
     assert [x['hash'] for x in s10_or_700k['messages']] == hashes[30:37]
     assert s10_or_700k['more']
+
+
+def test_retrieve_direction(rpc, big_store):
+    conn = big_store['conn']
+    sk = big_store['sk']
+    pk = big_store['pk']
+    hashes = big_store['hashes']
+
+    ts = int(time.time() * 1000)
+    to_sign = "retrieve{}".format(ts).encode()
+    sig = sk.sign(to_sign, encoder=Base64Encoder).signature.decode()
+
+    def retrieve(**params):
+        r = rpc.request(
+            conn,
+            'retrieve',
+            [
+                json.dumps(
+                    {
+                        "pubkey": pk,
+                        "timestamp": ts,
+                        "signature": sig,
+                        "reverse_direction": True,
+                        **params,
+                    }
+                )
+            ],
+        ).get()
+        assert len(r) == 1
+        return json.loads(r[0])
+
+    newest = retrieve(max_count=5)
+    assert [x['hash'] for x in newest['messages']] == list(reversed(hashes[-5:]))
+    assert newest['more']
+
+    # An unknown last_hash starts from the newest message, as an omitted one does
+    unknown = retrieve(max_count=5, last_hash='A' * 43)
+    assert [x['hash'] for x in unknown['messages']] == list(reversed(hashes[-5:]))
+    assert unknown['more']
+
+    # Two pages back from hashes[79]: only older messages, no repeats
+    page1 = retrieve(max_count=5, last_hash=hashes[79])
+    assert [x['hash'] for x in page1['messages']] == list(reversed(hashes[74:79]))
+    assert page1['more']
+
+    page2 = retrieve(max_count=5, last_hash=page1['messages'][-1]['hash'])
+    assert [x['hash'] for x in page2['messages']] == list(reversed(hashes[69:74]))
+    assert page2['more']
+
+    oldest = retrieve(max_count=10, last_hash=hashes[4])
+    assert [x['hash'] for x in oldest['messages']] == list(reversed(hashes[0:4]))
+    assert not oldest['more']
+
+    nothing = retrieve(max_count=10, last_hash=hashes[0])
+    assert nothing['messages'] == []
+    assert not nothing['more']
+
+    # The default size limit (1/5 of max, 16 messages) applies backwards too
+    sdefault = retrieve(last_hash=hashes[30])
+    assert [x['hash'] for x in sdefault['messages']] == list(reversed(hashes[14:30]))
+    assert sdefault['more']
+
+    forward = retrieve(max_count=5, last_hash=hashes[10], reverse_direction=False)
+    assert [x['hash'] for x in forward['messages']] == hashes[11:16]
+    assert forward['more']

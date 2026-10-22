@@ -134,7 +134,12 @@ int main(int argc, char* argv[]) {
     // Always print version for the logs
     log::info(logcat, "{}", STORAGE_SERVER_VERSION_INFO);
 
-    log::info(logcat, "Log levels: {}", options.log_level);
+    log::info(
+            logcat,
+            "Log levels: {}{}{}",
+            logging::DEFAULT_LOG_LEVELS,
+            options.log_level.empty() ? "" : ", then ",
+            options.log_level);
     log::info(logcat, "Setting database location to {}", util::to_sv(options.data_dir.u8string()));
     log::info(logcat, "Connecting to oxend @ {}", options.oxend_omq_rpc);
 

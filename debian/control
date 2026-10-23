@@ -25,7 +25,7 @@ Homepage: https://oxen.io
 
 Package: oxen-storage-server
 Architecture: any
-Depends: oxend, ${shlibs:Depends}, ${misc:Depends}
+Depends: oxend, libngtcp2-16 (>= 1.25.0+stf2), ${shlibs:Depends}, ${misc:Depends}
 Suggests: oxen-service-node
 Description: Oxen storage server
  This package contains the Oxen storage server component of a Oxen service

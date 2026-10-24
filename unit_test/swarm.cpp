@@ -9,6 +9,8 @@
 
 #include <oxenc/base64.h>
 
+#include "deleter.hpp"
+
 using namespace std::literals;
 
 using ip_ports = std::tuple<const char*, uint16_t, uint16_t>;
@@ -43,10 +45,7 @@ TEST_CASE("swarm - pubkey to swarm space", "[swarm]") {
     CHECK(oxenss::pubkey_to_swarm_space(pk) == 0x0123456789abcdefULL);
 }
 
-struct StorageDeleter {
-    StorageDeleter() { std::filesystem::remove("storage.db"); }
-    ~StorageDeleter() { std::filesystem::remove("storage.db"); }
-};
+using oxenss::test::StorageDeleter;
 
 TEST_CASE("service nodes - pubkey to swarm id") {
     const auto fake_pk = oxenss::crypto::legacy_pubkey::from_hex(

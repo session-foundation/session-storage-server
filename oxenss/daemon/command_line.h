@@ -1,11 +1,14 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
 #include <oxenss/logging/oxen_logger.h>
+
+#include <oxen/quic/opt.hpp>
 
 namespace oxenss::cli {
 
@@ -16,6 +19,12 @@ struct command_line_options {
     // compiled in, the command line parser substitutes one that is.)
     std::string https_backend = "microhttpd";
     uint16_t omq_quic_port = 22020;
+    bool quic_gro = true;
+    bool quic_gso = true;
+    // Unset uses server::QUIC::transport_options' defaults.
+    std::optional<oxen::quic::opt::congestion_control> quic_congestion_control;
+    std::optional<size_t> quic_recv_buffer;
+    std::optional<size_t> quic_send_buffer;
     std::string oxend_omq_rpc;  // Defaults to ipc://$HOME/.oxen/[testnet/]oxend.sock
     bool skip_bootstrap = false;
     bool force_start = false;

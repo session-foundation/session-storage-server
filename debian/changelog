@@ -1,3 +1,22 @@
+oxen-storage-server (2.12.1~rc1-1~deb13) trixie; urgency=medium
+
+  * Fix tag builds' archive name and upload directory
+  * Add --db-slow-query-ms to log slow database statements
+  * Drop uWebSockets loop work handed over after the server thread exits
+  * Require updated libngtcp2 with ngtcp2 mempool disabled
+  * Update libquic to 1.13.0
+  * Request larger UDP socket buffers for the QUIC endpoints
+  * Add --gro/--gso options, on by default, for the QUIC sockets
+  * Add a --congestion-control option for QUIC
+  * Add --udp-recv-buffer/--udp-send-buffer options for QUIC
+  * Default to cubic congestion control for QUIC
+  * Bump version to 2.12.1
+  * bump required libquic
+  * Fix conflicting StorageDeleter implementations
+  * Rediff patches
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 24 Oct 2026 16:51:03 -0300
+
 oxen-storage-server (2.12.0-3~deb13) trixie; urgency=medium
 
   * Rebuild

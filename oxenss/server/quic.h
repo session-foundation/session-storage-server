@@ -82,6 +82,8 @@ class QUIC : public MQBase {
         // UDP offloads to use on the endpoints' sockets, where the OS supports them.
         bool gro = true;
         bool gso = true;
+        // Applies to what we send, on both incoming and outgoing connections.
+        quic::opt::congestion_control congestion_control = quic::opt::congestion_control::bbr;
     };
 
     QUIC(snode::ServiceNode& snode,
@@ -131,6 +133,7 @@ class QUIC : public MQBase {
     std::vector<std::shared_ptr<quic::Endpoint>> endpoints;
     quic::Endpoint* reach_ep = nullptr;
     size_t reach_ep_idx = 0;
+    quic::opt::congestion_control congestion_control;
 
     rpc::RequestHandler& request_handler;
 

@@ -261,7 +261,10 @@ int main(int argc, char* argv[]) {
                 rate_limiter,
                 std::move(quic_bind),
                 ed_keys.sec,
-                server::QUIC::transport_options{.gro = options.quic_gro, .gso = options.quic_gso});
+                server::QUIC::transport_options{
+                        .gro = options.quic_gro,
+                        .gso = options.quic_gso,
+                        .congestion_control = options.quic_congestion_control});
         service_node.register_mq_server(quic.get());
 
         auto http_client = std::make_shared<http::Client>(quic->loop);

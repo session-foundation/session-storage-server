@@ -7,6 +7,8 @@
 
 #include <oxenss/logging/oxen_logger.h>
 
+#include <oxen/quic/opt.hpp>
+
 namespace oxenss::cli {
 
 struct command_line_options {
@@ -18,6 +20,8 @@ struct command_line_options {
     uint16_t omq_quic_port = 22020;
     bool quic_gro = true;
     bool quic_gso = true;
+    oxen::quic::opt::congestion_control quic_congestion_control =
+            oxen::quic::opt::congestion_control::bbr;
     std::string oxend_omq_rpc;  // Defaults to ipc://$HOME/.oxen/[testnet/]oxend.sock
     bool skip_bootstrap = false;
     bool force_start = false;

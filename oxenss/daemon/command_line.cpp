@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
 
 extern "C" {
@@ -186,6 +187,22 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "On by default; ignored where the OS doesn't support it, and turned off "
                "automatically if the network device rejects it.")
             ->capture_default_str();
+    using oxen::quic::opt::congestion_control;
+    cli.add_option(
+               "--congestion-control",
+               options.quic_congestion_control,
+               "Congestion control algorithm for what we send over QUIC: bbr, cubic, or reno.  "
+               "BBR keeps its sending rate through light packet loss; cubic and reno slow down "
+               "on any loss.")
+            ->transform(CLI::CheckedTransformer(
+                                std::map<std::string, congestion_control>{
+                                        {"bbr", congestion_control::bbr},
+                                        {"cubic", congestion_control::cubic},
+                                        {"reno", congestion_control::reno}},
+                                CLI::ignore_case)
+                                .description(""))
+            ->type_name("ALGORITHM")
+            ->default_str("bbr");
     cli.add_option(
                "--https-port",
                options.https_port,

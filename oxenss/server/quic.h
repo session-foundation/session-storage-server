@@ -68,6 +68,13 @@ inline constexpr size_t SN_ONION_STREAMS = 4;
 // client reroutes rather than waits.  Generous: a healthy 100Mbit link clears this in seconds.
 inline constexpr size_t SN_ONION_STREAM_MAX_BACKLOG = 50 * 1024 * 1024;
 
+// UDP socket buffer sizes requested for the QUIC endpoints.  Every other storage server sends to
+// us over the one socket, in bursts, so the OS defaults (about 200kB on Linux) overflow and drop
+// packets whenever the QUIC loop falls briefly behind.  Linux caps these at the
+// net.core.rmem_max/wmem_max sysctls, which the libquic-common package raises to allow them.
+inline constexpr size_t QUIC_RECV_BUFFER = 8 * 1024 * 1024;
+inline constexpr size_t QUIC_SEND_BUFFER = 1 * 1024 * 1024;
+
 enum class sn_stream_kind { command, data, onion };
 
 class QUIC : public MQBase {

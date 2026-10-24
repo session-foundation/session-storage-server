@@ -59,7 +59,8 @@ QUIC::QUIC(
                 a,
                 make_endpoint_static_secret(sk),
                 quic::opt::inbound_alpns{ALPN, SN_ALPN},
-                quic::opt::outbound_alpns{ALPN}));
+                quic::opt::outbound_alpns{ALPN},
+                quic::opt::socket_buffers{.recv = QUIC_RECV_BUFFER, .send = QUIC_SEND_BUFFER}));
         if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack))) {
             reach_ep = endpoints.back().get();
             reach_ep_idx = endpoints.size() - 1;

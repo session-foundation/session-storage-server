@@ -38,8 +38,11 @@ QUIC::QUIC(
         rpc::RequestHandler& rh,
         rpc::RateLimiter& rl,
         std::span<const Address> bind,
-        const crypto::ed25519_seckey& sk) :
-        tls_creds{quic::GNUTLSCreds::make_from_ed_seckey(sk.str())}, request_handler{rh} {
+        const crypto::ed25519_seckey& sk,
+        const transport_options& opts) :
+        tls_creds{quic::GNUTLSCreds::make_from_ed_seckey(sk.str())},
+        congestion_control{opts.congestion_control},
+        request_handler{rh} {
     service_node_ = &snode;
     request_handler_ = &rh;
     rate_limiter_ = &rl;
@@ -48,6 +51,13 @@ QUIC::QUIC(
 
     if (bind.empty())
         throw std::invalid_argument{"No bind addresses given to QUIC listener!"};
+
+    std::optional<quic::opt::allow_gro> gro;
+    if (opts.gro)
+        gro.emplace();
+    std::optional<quic::opt::allow_gso> gso;
+    if (opts.gso)
+        gso.emplace();
 
     endpoints.reserve(bind.size());
     for (auto& a : bind) {
@@ -59,7 +69,10 @@ QUIC::QUIC(
                 a,
                 make_endpoint_static_secret(sk),
                 quic::opt::inbound_alpns{ALPN, SN_ALPN},
-                quic::opt::outbound_alpns{ALPN}));
+                quic::opt::outbound_alpns{ALPN},
+                opts.socket_buffers,
+                gro,
+                gso));
         if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack))) {
             reach_ep = endpoints.back().get();
             reach_ep_idx = endpoints.size() - 1;
@@ -137,6 +150,7 @@ void QUIC::startup_endpoint() {
         ep->listen(
                 tls_creds,
                 quic::opt::idle_timeout{MAX_IDLE_TIMEOUT},
+                congestion_control,
                 // Stream constructor: all incoming streams become BTRequestStreams, allowing
                 // clients to use multiple streams to send higher/lower priority data in parallel by
                 // juggling streams.
@@ -550,6 +564,7 @@ void QUIC::sn_connect(const snode::contact& ct, sn_conn_callback cb) {
                 quic::opt::keep_alive{SN_CONN_KEEP_ALIVE},
                 quic::opt::idle_timeout{SN_CONN_IDLE_TIMEOUT},
                 quic::opt::handshake_timeout{5s},
+                congestion_control,
                 // Streams the peer opens to us on this connection carry its requests:
                 [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                     return e.loop.make_shared<quic::BTRequestStream>(
@@ -970,7 +985,8 @@ void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {
             auto conn = reach_ep->connect(
                     {ct.pubkey_ed25519.view(), ct.ip, ct.omq_quic_port},
                     tls_creds,
-                    quic::opt::handshake_timeout{5s});
+                    quic::opt::handshake_timeout{5s},
+                    congestion_control);
             ping(std::move(test), *conn->open_stream<quic::BTRequestStream>(), true);
         } catch (const std::exception& e) {
             log::debug(logcat, "QUIC reachability test failed for {}: {}", test->pubkey, e.what());

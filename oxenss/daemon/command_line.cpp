@@ -1,6 +1,7 @@
 #include "command_line.h"
 #include <oxenss/logging/oxen_logger.h>
 #include <oxenss/server/https.h>
+#include <oxenss/server/quic.h>
 #include <oxenss/version.h>
 #include <oxenss/common/format.h>
 #include <oxenss/utils/string_utils.hpp>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
 
 extern "C" {
@@ -172,6 +174,66 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "Public port to listen on for OxenMQ (TCP) and QUIC (UDP) connections")
             ->capture_default_str()
             ->type_name("PORT");
+    cli.add_flag(
+               "--gro,!--no-gro",
+               options.quic_gro,
+               "Receive QUIC packets with UDP GRO, where the kernel merges consecutive packets "
+               "from a sender so that fewer receive calls and less socket buffer are needed.  On "
+               "by default; ignored where the OS doesn't support it.")
+            ->capture_default_str();
+    cli.add_flag(
+               "--gso,!--no-gso",
+               options.quic_gso,
+               "Send QUIC packets with UDP GSO, handing the kernel a run of packets in one call.  "
+               "On by default; ignored where the OS doesn't support it, and turned off "
+               "automatically if the network device rejects it.")
+            ->capture_default_str();
+    const server::QUIC::transport_options quic_defaults{};
+    using oxen::quic::opt::congestion_control;
+    const std::map<std::string, congestion_control> algorithms{
+            {"bbr", congestion_control::bbr},
+            {"cubic", congestion_control::cubic},
+            {"reno", congestion_control::reno}};
+    std::string default_algorithm;
+    for (const auto& [name, algo] : algorithms)
+        if (algo == quic_defaults.congestion_control)
+            default_algorithm = name;
+    cli.add_option(
+               "--congestion-control",
+               options.quic_congestion_control,
+               "Congestion control algorithm for what we send over QUIC: bbr, cubic, or reno.  "
+               "Cubic and reno slow down on any loss, easing off peers that are dropping packets "
+               "because they can't keep up; BBR keeps its sending rate until loss exceeds 2%.")
+            ->transform(CLI::CheckedTransformer(algorithms, CLI::ignore_case).description(""))
+            ->type_name("ALGORITHM")
+            ->default_str(default_algorithm);
+    auto size_str = [](size_t bytes) {
+        if (bytes % (1024 * 1024) == 0)
+            return "{}MiB"_format(bytes / (1024 * 1024));
+        if (bytes % 1024 == 0)
+            return "{}KiB"_format(bytes / 1024);
+        return "{}"_format(bytes);
+    };
+    cli.add_option(
+               "--udp-recv-buffer",
+               options.quic_recv_buffer,
+               "UDP receive buffer size to request for the QUIC sockets, such as 4MiB or 512KiB; "
+               "0 leaves the OS default.  Linux only allows up to the net.core.rmem_max sysctl, "
+               "which the libquic-common package raises; a warning is logged if the OS gives "
+               "less than requested.")
+            ->transform(CLI::AsSizeValue(false).description(""))
+            ->type_name("SIZE")
+            ->default_str(size_str(quic_defaults.socket_buffers.recv.value_or(0)));
+    cli.add_option(
+               "--udp-send-buffer",
+               options.quic_send_buffer,
+               "UDP send buffer size to request for the QUIC sockets, such as 1MiB or 512KiB; 0 "
+               "leaves the OS default.  Linux only allows up to the net.core.wmem_max sysctl, "
+               "which the libquic-common package raises; a warning is logged if the OS gives "
+               "less than requested.")
+            ->transform(CLI::AsSizeValue(false).description(""))
+            ->type_name("SIZE")
+            ->default_str(size_str(quic_defaults.socket_buffers.send.value_or(0)));
     cli.add_option(
                "--https-port",
                options.https_port,

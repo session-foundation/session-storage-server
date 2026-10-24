@@ -1,6 +1,7 @@
 #include "command_line.h"
 #include <oxenss/logging/oxen_logger.h>
 #include <oxenss/server/https.h>
+#include <oxenss/server/quic.h>
 #include <oxenss/version.h>
 #include <oxenss/common/format.h>
 #include <oxenss/utils/string_utils.hpp>
@@ -203,6 +204,34 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                                 .description(""))
             ->type_name("ALGORITHM")
             ->default_str("bbr");
+    const server::QUIC::transport_options quic_defaults{};
+    auto size_str = [](size_t bytes) {
+        if (bytes % (1024 * 1024) == 0)
+            return "{}MiB"_format(bytes / (1024 * 1024));
+        if (bytes % 1024 == 0)
+            return "{}KiB"_format(bytes / 1024);
+        return "{}"_format(bytes);
+    };
+    cli.add_option(
+               "--udp-recv-buffer",
+               options.quic_recv_buffer,
+               "UDP receive buffer size to request for the QUIC sockets, such as 4MiB or 512KiB; "
+               "0 leaves the OS default.  Linux only allows up to the net.core.rmem_max sysctl, "
+               "which the libquic-common package raises; a warning is logged if the OS gives "
+               "less than requested.")
+            ->transform(CLI::AsSizeValue(false).description(""))
+            ->type_name("SIZE")
+            ->default_str(size_str(quic_defaults.socket_buffers.recv.value_or(0)));
+    cli.add_option(
+               "--udp-send-buffer",
+               options.quic_send_buffer,
+               "UDP send buffer size to request for the QUIC sockets, such as 1MiB or 512KiB; 0 "
+               "leaves the OS default.  Linux only allows up to the net.core.wmem_max sysctl, "
+               "which the libquic-common package raises; a warning is logged if the OS gives "
+               "less than requested.")
+            ->transform(CLI::AsSizeValue(false).description(""))
+            ->type_name("SIZE")
+            ->default_str(size_str(quic_defaults.socket_buffers.send.value_or(0)));
     cli.add_option(
                "--https-port",
                options.https_port,

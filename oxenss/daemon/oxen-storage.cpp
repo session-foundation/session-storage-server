@@ -255,16 +255,21 @@ int main(int argc, char* argv[]) {
                 ssl_key,
                 l_keys);
 
+        server::QUIC::transport_options quic_opts{
+                .gro = options.quic_gro,
+                .gso = options.quic_gso,
+                .congestion_control = options.quic_congestion_control};
+        if (options.quic_recv_buffer)
+            quic_opts.socket_buffers.recv = *options.quic_recv_buffer;
+        if (options.quic_send_buffer)
+            quic_opts.socket_buffers.send = *options.quic_send_buffer;
         auto quic = std::make_unique<server::QUIC>(
                 service_node,
                 request_handler,
                 rate_limiter,
                 std::move(quic_bind),
                 ed_keys.sec,
-                server::QUIC::transport_options{
-                        .gro = options.quic_gro,
-                        .gso = options.quic_gso,
-                        .congestion_control = options.quic_congestion_control});
+                quic_opts);
         service_node.register_mq_server(quic.get());
 
         auto http_client = std::make_shared<http::Client>(quic->loop);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -22,6 +23,9 @@ struct command_line_options {
     bool quic_gso = true;
     oxen::quic::opt::congestion_control quic_congestion_control =
             oxen::quic::opt::congestion_control::bbr;
+    // Unset uses server::QUIC::transport_options' defaults.
+    std::optional<size_t> quic_recv_buffer;
+    std::optional<size_t> quic_send_buffer;
     std::string oxend_omq_rpc;  // Defaults to ipc://$HOME/.oxen/[testnet/]oxend.sock
     bool skip_bootstrap = false;
     bool force_start = false;

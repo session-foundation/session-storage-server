@@ -83,7 +83,7 @@ class QUIC : public MQBase {
         bool gro = true;
         bool gso = true;
         // Applies to what we send, on both incoming and outgoing connections.
-        quic::opt::congestion_control congestion_control = quic::opt::congestion_control::bbr;
+        quic::opt::congestion_control congestion_control = quic::opt::congestion_control::cubic;
     };
 
     QUIC(snode::ServiceNode& snode,

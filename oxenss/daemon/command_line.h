@@ -21,9 +21,8 @@ struct command_line_options {
     uint16_t omq_quic_port = 22020;
     bool quic_gro = true;
     bool quic_gso = true;
-    oxen::quic::opt::congestion_control quic_congestion_control =
-            oxen::quic::opt::congestion_control::bbr;
     // Unset uses server::QUIC::transport_options' defaults.
+    std::optional<oxen::quic::opt::congestion_control> quic_congestion_control;
     std::optional<size_t> quic_recv_buffer;
     std::optional<size_t> quic_send_buffer;
     std::string oxend_omq_rpc;  // Defaults to ipc://$HOME/.oxen/[testnet/]oxend.sock

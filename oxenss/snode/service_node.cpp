@@ -90,11 +90,12 @@ ServiceNode::ServiceNode(
         const contact& contact,
         server::OMQ& omq_server,
         const std::filesystem::path& db_location,
+        std::chrono::milliseconds db_slow_query,
         bool force_start,
         bool skip_bootstrap) :
         force_start_{force_start},
         skip_bootstrap_{skip_bootstrap},
-        db{std::make_unique<Database>(db_location)},
+        db{std::make_unique<Database>(db_location, db_slow_query)},
         our_keys_{keys},
         our_contact_{contact},
         network_{*omq_server},

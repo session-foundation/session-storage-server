@@ -3,6 +3,7 @@
 #include "https.h"
 
 #include <future>
+#include <mutex>
 #include <thread>
 
 #include <uWebSockets/App.h>
@@ -34,12 +35,17 @@ class HTTPS_uWS : public HTTPS {
     void write(HttpResponse& res, const rpc::Response& response, bool force_close);
 
     // Runs `f` on the server thread: immediately if already on it, otherwise deferred into the
-    // event loop (all writes have to happen on that thread).
+    // event loop (all writes have to happen on that thread).  Once the server thread is on its way
+    // out `f` is dropped: replies to requests that were in flight at shutdown still arrive from
+    // other threads after that, and there is no longer a loop or a connection for them.
     template <typename Func>
     void run_on_loop(Func&& f) {
-        if (std::this_thread::get_id() == server_thread_.get_id())
+        if (std::this_thread::get_id() == server_thread_.get_id()) {
             f();
-        else
+            return;
+        }
+        std::lock_guard lock{loop_mutex_};
+        if (loop_)
             loop_->defer(std::forward<Func>(f));
     }
 
@@ -57,7 +63,10 @@ class HTTPS_uWS : public HTTPS {
     // Whether we have sent the startup/shutdown signals
     bool sent_startup_{false}, sent_shutdown_{false};
 
-    // The uWebSockets event loop pointer (so that we can inject a callback to shut it down)
+    // The server thread's event loop, through which other threads hand it work.  Set and cleared
+    // by the server thread itself: the loop is a thread_local there, freed when that thread exits,
+    // so it is cleared on the way out and anything handed over afterwards is dropped.
+    std::mutex loop_mutex_;
     uWS::Loop* loop_{nullptr};
     // The socket(s) we are listening on
     std::vector<us_listen_socket_t*> listen_socks_;

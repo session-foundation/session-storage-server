@@ -55,18 +55,15 @@ HTTPS_uWS::HTTPS_uWS(
         HTTPS{sn, rh, rl, std::move(legacy_keys)} {
     // uWS is designed to work from a single thread, which is good (we pull off the requests and
     // then stick them into the LMQ job queue to be scheduled along with other jobs).  But as a
-    // consequence, we need to create everything inside that thread.  We *also* need to get the
-    // (thread local) event loop pointer back from the thread so that we can shut it down later
-    // (injecting a callback into it is one of the few thread-safe things we can do across
-    // threads).
+    // consequence, we need to create everything inside that thread, including the (thread local)
+    // event loop that other threads reach it through: see run_on_loop().
     //
     // Things we need in the owning thread, fulfilled from the http thread:
 
-    // - the uWS::Loop* for the event loop thread (which is thread_local).  We can get this
-    // during
-    //   thread startup, after the thread does basic initialization.
-    std::promise<uWS::Loop*> loop_promise;
-    auto loop_future = loop_promise.get_future();
+    // - word that the thread has set up the app (and with it `loop_`), or the exception that
+    //   stopped it.
+    std::promise<void> ready_promise;
+    auto ready_future = ready_promise.get_future();
 
     // - the us_listen_socket_t* on which the server is listening.  We can't get this until we
     //   actually start listening, so wait until `start()` for it.  (We also double-purpose it
@@ -98,9 +95,19 @@ HTTPS_uWS::HTTPS_uWS(
 
     server_thread_ = std::thread{
             [this, bind = std::move(bind), &https_opts](
-                    std::promise<uWS::Loop*> loop_promise,
+                    std::promise<void> ready_promise,
                     std::future<bool> startup_future,
                     std::promise<std::vector<us_listen_socket_t*>> startup_success) {
+                // Runs on every way out of this thread, which all end with the thread_local loop
+                // being freed.
+                struct loop_clearer {
+                    HTTPS_uWS& self;
+                    ~loop_clearer() {
+                        std::lock_guard lock{self.loop_mutex_};
+                        self.loop_ = nullptr;
+                    }
+                } clear_loop{*this};
+
                 uWS::SSLApp https{https_opts};
                 try {
                     // Routing is done by HTTPS::on_headers(), so everything goes through the one
@@ -109,11 +116,15 @@ HTTPS_uWS::HTTPS_uWS(
                         handle(res, req);
                     });
                 } catch (...) {
-                    loop_promise.set_exception(std::current_exception());
+                    ready_promise.set_exception(std::current_exception());
                     return;
                 }
+                {
+                    std::lock_guard lock{loop_mutex_};
+                    loop_ = uWS::Loop::get();
+                }
                 // We've initialized, signal the calling thread
-                loop_promise.set_value(uWS::Loop::get());
+                ready_promise.set_value();
                 // Now wait until we get the signal to go (sent when the caller calls start() call).
                 if (!startup_future.get())
                     // False means cancel, i.e. we got destroyed/shutdown without start() being
@@ -169,11 +180,11 @@ HTTPS_uWS::HTTPS_uWS(
 
                 https.run();
             },
-            std::move(loop_promise),
+            std::move(ready_promise),
             startup_promise_.get_future(),
             std::move(startup_success_promise)};
 
-    loop_ = loop_future.get();
+    ready_future.get();
 }
 
 void HTTPS_uWS::write(HttpResponse& r, const rpc::Response& response, bool force_close) {
@@ -253,7 +264,7 @@ void HTTPS_uWS::shutdown(bool join) {
             startup_promise_.set_value(false);
             sent_startup_ = true;
         } else if (!listen_socks_.empty()) {
-            loop_->defer([this] {
+            run_on_loop([this] {
                 log::trace(logcat, "closing {} listening sockets", listen_socks_.size());
                 for (auto* s : listen_socks_)
                     us_listen_socket_close(/*ssl=*/true, s);

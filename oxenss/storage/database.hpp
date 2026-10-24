@@ -57,6 +57,8 @@ class Database {
 
     const std::filesystem::path db_path_;
 
+    const std::chrono::milliseconds slow_query_;
+
     // Constant for the database, but written from whichever thread opens a connection, so atomic
     // even though every write stores the same value.
     std::atomic<int> page_size_ = 0;
@@ -145,7 +147,11 @@ class Database {
 
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().
-    explicit Database(std::filesystem::path db_path);
+    //
+    // If `slow_query` is positive then every statement taking at least that long is logged.  The
+    // time runs from a statement's first step to its completion or reset, so it includes any wait
+    // for the write lock: a slow `BEGIN IMMEDIATE` is a writer waiting for another to finish.
+    explicit Database(std::filesystem::path db_path, std::chrono::milliseconds slow_query = 0ms);
 
     ~Database();
 

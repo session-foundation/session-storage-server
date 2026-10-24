@@ -16,6 +16,8 @@ struct command_line_options {
     // compiled in, the command line parser substitutes one that is.)
     std::string https_backend = "microhttpd";
     uint16_t omq_quic_port = 22020;
+    bool quic_gro = true;
+    bool quic_gso = true;
     std::string oxend_omq_rpc;  // Defaults to ipc://$HOME/.oxen/[testnet/]oxend.sock
     bool skip_bootstrap = false;
     bool force_start = false;

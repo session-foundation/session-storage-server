@@ -172,6 +172,20 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "Public port to listen on for OxenMQ (TCP) and QUIC (UDP) connections")
             ->capture_default_str()
             ->type_name("PORT");
+    cli.add_flag(
+               "--gro,!--no-gro",
+               options.quic_gro,
+               "Receive QUIC packets with UDP GRO, where the kernel merges consecutive packets "
+               "from a sender so that fewer receive calls and less socket buffer are needed.  On "
+               "by default; ignored where the OS doesn't support it.")
+            ->capture_default_str();
+    cli.add_flag(
+               "--gso,!--no-gso",
+               options.quic_gso,
+               "Send QUIC packets with UDP GSO, handing the kernel a run of packets in one call.  "
+               "On by default; ignored where the OS doesn't support it, and turned off "
+               "automatically if the network device rejects it.")
+            ->capture_default_str();
     cli.add_option(
                "--https-port",
                options.https_port,

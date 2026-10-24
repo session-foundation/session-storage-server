@@ -38,7 +38,8 @@ QUIC::QUIC(
         rpc::RequestHandler& rh,
         rpc::RateLimiter& rl,
         std::span<const Address> bind,
-        const crypto::ed25519_seckey& sk) :
+        const crypto::ed25519_seckey& sk,
+        const transport_options& opts) :
         tls_creds{quic::GNUTLSCreds::make_from_ed_seckey(sk.str())}, request_handler{rh} {
     service_node_ = &snode;
     request_handler_ = &rh;
@@ -48,6 +49,13 @@ QUIC::QUIC(
 
     if (bind.empty())
         throw std::invalid_argument{"No bind addresses given to QUIC listener!"};
+
+    std::optional<quic::opt::allow_gro> gro;
+    if (opts.gro)
+        gro.emplace();
+    std::optional<quic::opt::allow_gso> gso;
+    if (opts.gso)
+        gso.emplace();
 
     endpoints.reserve(bind.size());
     for (auto& a : bind) {
@@ -60,7 +68,9 @@ QUIC::QUIC(
                 make_endpoint_static_secret(sk),
                 quic::opt::inbound_alpns{ALPN, SN_ALPN},
                 quic::opt::outbound_alpns{ALPN},
-                quic::opt::socket_buffers{.recv = QUIC_RECV_BUFFER, .send = QUIC_SEND_BUFFER}));
+                opts.socket_buffers,
+                gro,
+                gso));
         if (!reach_ep && (a.is_ipv4() || (a.is_any_addr() && a.dual_stack))) {
             reach_ep = endpoints.back().get();
             reach_ep_idx = endpoints.size() - 1;

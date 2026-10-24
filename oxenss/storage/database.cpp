@@ -701,8 +701,10 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     auto conn = db_->conn();
     auto st = conn.prepared_st(
             "SELECT hash, owners.type, owners.pubkey, namespace, timestamp, expiry, data"
-            " FROM messages JOIN owners ON messages.owner = owners.id WHERE hash = ?");
+            " FROM messages JOIN owners ON messages.owner = owners.id"
+            " WHERE hash = ? AND expiry > ?");
     st->bindNoCopy(1, msg_hash);
+    st->bind(2, to_epoch_ms(std::chrono::system_clock::now()));
     std::optional<message> msg;
     while (st->executeStep()) {
         assert(!msg);
@@ -911,12 +913,14 @@ std::pair<std::vector<message>, bool> Database::retrieve(
 
     auto st = conn.prepared_st(
             last_id ? "SELECT hash, namespace, timestamp, expiry, data FROM messages "
-                      "WHERE owner = ? AND namespace = ? AND id > ? ORDER BY id LIMIT ?"
+                      "WHERE owner = ? AND namespace = ? AND expiry > ? AND id > ? "
+                      "ORDER BY id LIMIT ?"
                     : "SELECT hash, namespace, timestamp, expiry, data FROM messages "
-                      "WHERE owner = ? AND namespace = ? ORDER BY id LIMIT ?");
+                      "WHERE owner = ? AND namespace = ? AND expiry > ? ORDER BY id LIMIT ?");
     int pos = 1;
     st->bind(pos++, *ownerid);
     st->bind(pos++, to_int(ns));
+    st->bind(pos++, to_epoch_ms(std::chrono::system_clock::now()));
     if (last_id)
         st->bind(pos++, *last_id);
     st->bind(pos++, max_results ? static_cast<int>(*max_results) + 1 : -1);
@@ -1349,7 +1353,10 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
     if (!owner)
         return result;
 
-    auto select_st = conn.prepared_st("SELECT expiry FROM messages WHERE hash = ? AND owner = ?");
+    // An expired message that clean_expired() hasn't got to yet must not be found here, or an
+    // extension would bring it back.
+    auto select_st = conn.prepared_st(
+            "SELECT expiry FROM messages WHERE hash = ? AND owner = ? AND expiry > ?");
     // Unconditional: the decision to write has already been made against the current expiry,
     // which for a deferred extension is later than the stored one.
     auto update_st = conn.prepared_st(update_expiry_sql);
@@ -1391,7 +1398,7 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
 
         auto cur = current_of.find(hash);
         if (cur == current_of.end()) {
-            auto stored = exec_and_maybe_get<int64_t>(select_st, hash, *owner);
+            auto stored = exec_and_maybe_get<int64_t>(select_st, hash, *owner, to_epoch_ms(now));
             select_st->reset();
             if (!stored)
                 continue;
@@ -1457,9 +1464,11 @@ std::map<std::string, int64_t> Database::get_expiries(
     if (!owner)
         return result;
 
-    auto st = conn.prepared_st("SELECT expiry FROM messages WHERE hash = ? AND owner = ?");
+    auto st = conn.prepared_st(
+            "SELECT expiry FROM messages WHERE hash = ? AND owner = ? AND expiry > ?");
+    const auto now_ms = to_epoch_ms(std::chrono::system_clock::now());
     for (const auto& hash : msg_hashes) {
-        if (auto exp = exec_and_maybe_get<int64_t>(st, hash, *owner))
+        if (auto exp = exec_and_maybe_get<int64_t>(st, hash, *owner, now_ms))
             result.emplace(hash, *exp);
         st->reset();
     }
@@ -1741,7 +1750,7 @@ static const swarm_range_query next_dump_batch_sql{R"(
 SELECT messages.id, owners.type, owners.pubkey, messages.hash, messages.namespace,
        messages.timestamp, messages.expiry, messages.data
 FROM messages JOIN owners ON messages.owner = owners.id
-WHERE messages.id >= ?5 AND messages.id <= ?6 AND {}
+WHERE messages.id >= ?5 AND messages.id <= ?6 AND messages.expiry > ?7 AND {}
 ORDER BY messages.id)"};
 
 std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
@@ -1751,6 +1760,7 @@ std::pair<std::vector<message>, int64_t> Database::next_dump_batch(
     bind_swarm_range(*st, lower, upper);
     st->bind(5, from_id);
     st->bind(6, end_id);
+    st->bind(7, to_epoch_ms(std::chrono::system_clock::now()));
 
     std::pair<std::vector<message>, int64_t> result{{}, 0};
     auto& [messages, last_id] = result;
@@ -1843,8 +1853,10 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
             " JOIN owners ON owners.id = messages.owner"
             " WHERE pending_deliveries.recipient ="
             " (SELECT id FROM pending_recipients WHERE pubkey = ?)"
+            " AND messages.expiry > ?"
             " ORDER BY pending_deliveries.message");
     st->bind(1, pubkey.str());
+    st->bind(2, to_epoch_ms(std::chrono::system_clock::now()));
 
     std::pair<std::vector<message>, std::vector<int64_t>> result;
     auto& [messages, ids] = result;

@@ -226,7 +226,9 @@ class Database {
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
 
     // Removes expired messages from the database; the `Database` instance owner should call
-    // this periodically.
+    // this periodically.  Until then the methods that read messages or their expiries for clients
+    // and peers skip expired messages, so how far behind this falls affects only disk use and
+    // get_message_count().
     void clean_expired();
 
     // Deletes all messages owned by the given pubkey.  Returns the [namespace, hash] pairs of any

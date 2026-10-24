@@ -503,12 +503,14 @@ TEST_CASE("storage - remove expired entries", "[storage]") {
     CHECK(storage.get_owner_count() == 3);
     CHECK(storage.get_message_count() == 6);
 
+    std::this_thread::sleep_for(5ms);
     {
         const auto lastHash = "";
         auto [items, more] = storage.retrieve(pubkey1, namespace_id::Default, lastHash);
-        REQUIRE(items.size() == 2);
+        REQUIRE(items.size() == 1);
+        CHECK(items[0].hash == "hash0");
     }
-    std::this_thread::sleep_for(5ms);
+    CHECK(storage.get_message_count() == 6);
     storage.clean_expired();
     {
         const auto lastHash = "";
@@ -886,6 +888,47 @@ TEST_CASE("storage - deferred expiry extensions are written at shutdown", "[stor
     }
     Database storage{"."};
     CHECK(TestSuiteHacks::db_stored_expiry(storage, "h1") == to_epoch_ms(base + 5min));
+}
+
+TEST_CASE("storage - expired messages are hidden until deleted", "[storage]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto peer = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    using hashes = std::vector<std::string>;
+    using expiries = std::map<std::string, int64_t>;
+    const auto ns = namespace_id::Default;
+    const auto now = std::chrono::system_clock::now();
+
+    REQUIRE(storage.store({pk, "live", ns, now - 1h, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk, "dead", ns, now - 1h, now - 1s, "data"}) == StoreResult::New);
+    REQUIRE(storage.get_message_count() == 2);
+
+    auto [msgs, more] = storage.retrieve(pk, ns, "");
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].hash == "live");
+    CHECK_FALSE(storage.retrieve_by_hash("dead"));
+    CHECK(storage.get_expiries(pk, hashes{"live", "dead"}) ==
+          expiries{{"live", to_epoch_ms(now + 1h)}});
+
+    CHECK(storage.update_expiry(pk, hashes{"dead"}, std::array{now + 2h}).empty());
+    CHECK(TestSuiteHacks::db_stored_expiry(storage, "dead") == to_epoch_ms(now - 1s));
+
+    auto [dump, last_id] = storage.next_dump_batch(1, storage.max_message_id(), 0, 0, 1 << 20);
+    REQUIRE(dump.size() == 1);
+    CHECK(dump[0].hash == "live");
+
+    storage.queue_delivery(peer, "live");
+    storage.queue_delivery(peer, "dead");
+    auto [delivery, ids] = storage.next_delivery_batch(peer, 1 << 20);
+    REQUIRE(delivery.size() == 1);
+    CHECK(delivery[0].hash == "live");
+
+    storage.clean_expired();
+    CHECK(storage.get_message_count() == 1);
 }
 
 // The connection pool belongs to session-sqlite now, so rather than asserting on its internals this

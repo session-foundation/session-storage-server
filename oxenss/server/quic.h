@@ -20,6 +20,7 @@ class RequestHandler;
 namespace oxenss::server {
 
 namespace quic = oxen::quic;
+using namespace quic::literals;
 
 using Address = quic::Address;
 
@@ -72,11 +73,25 @@ enum class sn_stream_kind { command, data, onion };
 
 class QUIC : public MQBase {
   public:
+    struct transport_options {
+        // Every other storage server sends to us over the one socket, in bursts, so the OS default
+        // buffers (about 200kB on Linux) overflow and drop packets whenever the QUIC loop falls
+        // briefly behind.  Linux caps these at the net.core.rmem_max/wmem_max sysctls, which the
+        // libquic-common package raises to allow them.
+        quic::opt::socket_buffers socket_buffers{.recv = 8_Mi, .send = 1_Mi};
+        // UDP offloads to use on the endpoints' sockets, where the OS supports them.
+        bool gro = true;
+        bool gso = true;
+        // Applies to what we send, on both incoming and outgoing connections.
+        quic::opt::congestion_control congestion_control = quic::opt::congestion_control::cubic;
+    };
+
     QUIC(snode::ServiceNode& snode,
          rpc::RequestHandler& rh,
          rpc::RateLimiter& rl,
          std::span<const Address> bind,
-         const crypto::ed25519_seckey& sk);
+         const crypto::ed25519_seckey& sk,
+         const transport_options& opts);
 
     void startup_endpoint();
 
@@ -118,6 +133,7 @@ class QUIC : public MQBase {
     std::vector<std::shared_ptr<quic::Endpoint>> endpoints;
     quic::Endpoint* reach_ep = nullptr;
     size_t reach_ep_idx = 0;
+    quic::opt::congestion_control congestion_control;
 
     rpc::RequestHandler& request_handler;
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Script used with Drone CI to upload build artifacts (because specifying all this in
-# .drone.jsonnet is too painful).
+# Script used by CI to upload build artifacts (because specifying all this in the CI config is too
+# painful).
 
 
 
@@ -19,9 +19,11 @@ set -o xtrace  # Don't start tracing until *after* we write the ssh key
 
 chmod 600 ssh_key
 
-branch_or_tag=${DRONE_BRANCH:-${DRONE_TAG:-unknown}}
+# A tag build goes into a directory named for the tag: CI sets a branch for tag builds too, but that
+# is only the forge's guess at which branch the tag is on.
+branch_or_tag=${CI_COMMIT_TAG:-${CI_COMMIT_BRANCH:-unknown}}
 
-upload_to="oxen.rocks/${DRONE_REPO// /_}/${branch_or_tag// /_}"
+upload_to="builds.session.codes/${CI_REPO// /_}/${branch_or_tag// /_}"
 
 filename=
 for f in oxen-storage-*.tar.xz oxen-storage-*.zip; do
@@ -49,7 +51,7 @@ for p in "${upload_dirs[@]}"; do
 -mkdir $dir_tmp"
 done
 
-sftp -i ssh_key -b - -o StrictHostKeyChecking=off drone@oxen.rocks <<SFTP
+sftp -i ssh_key -b - -o StrictHostKeyChecking=off drone@builds.session.codes <<SFTP
 $mkdirs
 put $filename $upload_to
 SFTP

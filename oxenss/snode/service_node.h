@@ -249,6 +249,7 @@ class ServiceNode {
             const contact& contact,
             server::OMQ& omq_server,
             const std::filesystem::path& db_location,
+            std::chrono::milliseconds db_slow_query,
             bool force_start,
             bool skip_bootstrap);
 

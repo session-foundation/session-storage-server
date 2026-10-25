@@ -642,12 +642,13 @@ Database::~Database() {
 ///     }
 ///
 /// Connections are independent: WAL mode lets one writer run concurrently with any number of
-/// readers, each reader seeing a consistent snapshot, and busy_timeout covers writer contention.
-/// Multi-statement sequences that must be atomic use an explicit IMMEDIATE transaction rather than
-/// relying on holding a connection; see store() for why DEFERRED is not good enough.
+/// readers, each reader seeing a consistent snapshot.  Every write goes through begin_immediate(),
+/// or prepared_exec_immediate() for a single statement, so that writers queue for the write lock
+/// and take it as soon as it is free rather than sleeping in sqlite's busy handler; see store() for
+/// why a write also can't use a DEFERRED transaction.
 
 void Database::clean_expired() {
-    message_count_ -= db_->conn().prepared_exec(
+    message_count_ -= db_->conn().prepared_exec_immediate(
             "DELETE FROM messages WHERE expiry <= ?",
             to_epoch_ms(std::chrono::system_clock::now()));
 }
@@ -724,7 +725,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
         // below) before it writes, and a deferred transaction that upgrades to a write lock fails
         // with SQLITE_BUSY_SNAPSHOT if anything else committed since the read snapshot was taken.
         // That error does not invoke the busy handler, so busy_timeout cannot retry it.
-        SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+        auto transaction = conn.begin_immediate();
 
         int64_t owner_id;
         if (auto maybe = exec_and_maybe_get<int64_t>(
@@ -803,7 +804,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
 
 void Database::bulk_store(std::span<const message> items) {
     auto conn = db_->conn();
-    SQLite::Transaction t{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto t = conn.begin_immediate();
     auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
     auto insert_owner = conn.prepared_st(
             "INSERT INTO owners (pubkey, type) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING id");
@@ -964,11 +965,13 @@ std::vector<message> Database::retrieve_all() {
 std::vector<std::pair<namespace_id, std::string>> Database::delete_all(const user_pubkey& pubkey) {
     auto conn = db_->conn();
 
+    auto transaction = conn.begin_immediate();
     auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " RETURNING namespace, hash");
     auto deleted = get_all_pairs<namespace_id, std::string>(st, pubkey.raw_bytes(), pubkey.type());
+    transaction.commit();
     message_count_ -= static_cast<int64_t>(deleted.size());
     forget_deferred(deleted);
     return deleted;
@@ -977,12 +980,14 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_all(const use
 std::vector<std::string> Database::delete_all(const user_pubkey& pubkey, namespace_id ns) {
     auto conn = db_->conn();
 
+    auto transaction = conn.begin_immediate();
     auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
             " AND namespace = ?"
             " RETURNING hash");
     auto deleted = get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), ns);
+    transaction.commit();
     message_count_ -= static_cast<int64_t>(deleted.size());
     forget_deferred(deleted);
     return deleted;
@@ -1014,7 +1019,7 @@ std::vector<std::string> Database::delete_by_hash(
     // get_expiries do the same.
     std::vector<std::string> deleted;
 
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
 
     auto owner = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
@@ -1040,6 +1045,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
         const user_pubkey& pubkey, std::chrono::system_clock::time_point timestamp) {
     auto conn = db_->conn();
 
+    auto transaction = conn.begin_immediate();
     auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
@@ -1047,6 +1053,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::delete_by_timestamp(
             " RETURNING namespace, hash");
     auto deleted = get_all_pairs<namespace_id, std::string>(
             st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp));
+    transaction.commit();
     message_count_ -= static_cast<int64_t>(deleted.size());
     forget_deferred(deleted);
     return deleted;
@@ -1058,6 +1065,7 @@ std::vector<std::string> Database::delete_by_timestamp(
         std::chrono::system_clock::time_point timestamp) {
     auto conn = db_->conn();
 
+    auto transaction = conn.begin_immediate();
     auto st = conn.prepared_st(
             "DELETE FROM messages"
             " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
@@ -1065,6 +1073,7 @@ std::vector<std::string> Database::delete_by_timestamp(
             " RETURNING hash");
     auto deleted =
             get_all<std::string>(st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(timestamp), ns);
+    transaction.commit();
     message_count_ -= static_cast<int64_t>(deleted.size());
     forget_deferred(deleted);
     return deleted;
@@ -1083,15 +1092,18 @@ void Database::revoke_subaccounts(
     auto conn = db_->conn();
 
     if (subaccounts.size() == 1) {
-        auto insert_token = conn.prepared_st(fmt::format(
-                "{} VALUES ((SELECT id FROM owners WHERE pubkey = ? AND type = ?), ?) {}",
-                ins_revoke_prefix,
-                ins_revoke_suffix));
-        exec_query(insert_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
+        conn.prepared_exec_immediate(
+                fmt::format(
+                        "{} VALUES ((SELECT id FROM owners WHERE pubkey = ? AND type = ?), ?) {}",
+                        ins_revoke_prefix,
+                        ins_revoke_suffix),
+                pubkey.raw_bytes(),
+                pubkey.type(),
+                subaccounts[0].view());
         return;
     }
 
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
 
     auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
     auto ownerid = exec_and_maybe_get<int64_t>(get_owner, pubkey.raw_bytes(), pubkey.type());
@@ -1116,13 +1128,14 @@ int Database::unrevoke_subaccounts(
 
     auto conn = db_->conn();
 
-    if (subaccounts.size() == 1) {
-        auto remove_token = conn.prepared_st(
+    if (subaccounts.size() == 1)
+        return conn.prepared_exec_immediate(
                 "DELETE FROM revoked_subaccounts"
                 " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
-                " AND token = ?");
-        return exec_query(remove_token, pubkey.raw_bytes(), pubkey.type(), subaccounts[0].view());
-    }
+                " AND token = ?",
+                pubkey.raw_bytes(),
+                pubkey.type(),
+                subaccounts[0].view());
 
     SQLite::Statement st{
             conn.sql,
@@ -1138,7 +1151,10 @@ int Database::unrevoke_subaccounts(
     for (const auto& sa : subaccounts)
         tokens.push_back(sa.view());
 
-    return exec_query(st, pubkey.raw_bytes(), pubkey.type(), bind_each{tokens});
+    auto transaction = conn.begin_immediate();
+    auto removed = exec_query(st, pubkey.raw_bytes(), pubkey.type(), bind_each{tokens});
+    transaction.commit();
+    return removed;
 }
 
 bool Database::subaccount_revoked(const user_pubkey& pubkey, const subaccount_token& subaccount) {
@@ -1286,7 +1302,7 @@ void Database::commit_deferred_expiries(bool all) {
         return;
 
     auto conn = db_->conn();
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     write_deferred(conn, due);
     transaction.commit();
     log::debug(logcat, "Wrote {} deferred expiry extensions", due.size());
@@ -1311,7 +1327,7 @@ std::vector<std::pair<std::string, std::chrono::system_clock::time_point>> Datab
 
     // One statement per hash; see delete_by_hash.  IMMEDIATE so that the expiry read below is
     // still the stored one when we decide what to do with it.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
 
     auto owner = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
@@ -1419,7 +1435,7 @@ std::map<std::string, int64_t> Database::get_expiries(
     // consistent snapshot.
     std::map<std::string, int64_t> result;
 
-    SQLite::Transaction transaction{conn.sql};
+    auto transaction = conn.begin();
 
     auto owner = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
@@ -1452,7 +1468,7 @@ std::vector<std::pair<namespace_id, std::string>> Database::update_all_expiries(
 
     // Deferred extensions have to be in the table before the shortening can see them; see the
     // namespace variant.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     auto owner = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
             pubkey.raw_bytes(),
@@ -1478,7 +1494,7 @@ std::vector<std::string> Database::update_all_expiries(
     // took a message past new_exp when its stored expiry was not would otherwise survive.  All of
     // the owner's are written, not just this namespace's, because the entries don't record
     // namespaces; that is merely an early commit for the others.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     auto owner = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
             pubkey.raw_bytes(),
@@ -1498,7 +1514,7 @@ std::vector<std::string> Database::update_all_expiries(
 
 void oxenss::Database::test_suite_backdate_retries(std::chrono::seconds age) {
     auto conn = db_->conn();
-    conn.prepared_exec(
+    conn.prepared_exec_immediate(
             "UPDATE retry_node_requests SET next_retry = next_retry - ?",
             std::chrono::duration<double>{age}.count());
 }
@@ -1526,7 +1542,7 @@ int64_t Database::add_retry_request(
 
     // The two inserts have to land together: the second one is what makes the first one reachable,
     // so a failure between them would leave an orphaned retry_requests row that nothing retries.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
 
     // insert into request table if not present
     if (req_id == 0) {
@@ -1581,7 +1597,7 @@ void Database::foreach_ready_retry_request(std::function<
         updates.emplace_back(req_id, sent ? sent_retry : unsent_retry);
     }
 
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     for (const auto& [req_id, next_retry] : updates)
         conn.prepared_exec(
                 "UPDATE retry_node_requests SET next_retry = ? WHERE id = ?", next_retry, req_id);
@@ -1654,7 +1670,7 @@ void Database::queue_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm, i
 
     // One transaction so that clean_pending_recipients can't remove a new recipient before the
     // dump refers to it.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     conn.prepared_exec(insert_pending_recipient, pubkey.str());
     conn.prepared_exec(
             "INSERT INTO pending_dumps (recipient, swarm, next_id, end_id)"
@@ -1690,7 +1706,7 @@ void Database::update_dump(
         int64_t next_id,
         std::chrono::system_clock::time_point next_attempt) {
     auto conn = db_->conn();
-    conn.prepared_exec(
+    conn.prepared_exec_immediate(
             "UPDATE pending_dumps SET next_id = ?, next_attempt = ?"
             " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?) AND swarm = ?",
             next_id,
@@ -1701,7 +1717,7 @@ void Database::update_dump(
 
 void Database::remove_dump(const crypto::legacy_pubkey& pubkey, uint64_t swarm) {
     auto conn = db_->conn();
-    conn.prepared_exec(
+    conn.prepared_exec_immediate(
             "DELETE FROM pending_dumps"
             " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?) AND swarm = ?",
             pubkey.str(),
@@ -1760,16 +1776,19 @@ static constexpr auto queue_delivery_sql =
 
 void Database::queue_delivery(const crypto::legacy_pubkey& pubkey, const std::string& hash) {
     auto conn = db_->conn();
+    auto transaction = conn.begin_immediate();
 
     // Almost always the recipient already exists and this one statement queues the delivery.
-    if (conn.prepared_exec(queue_delivery_sql, pubkey.str(), hash) > 0)
+    if (conn.prepared_exec(queue_delivery_sql, pubkey.str(), hash) > 0) {
+        transaction.commit();
         return;
+    }
 
     // Nothing inserted: this is the recipient's first pending delivery (so no pending_recipients
-    // row yet), or it is already queued, or the message is gone.  Add the recipient and retry, in
-    // one transaction so that clean_pending_recipients can't remove the recipient in between, and
-    // rolled back if the retry inserts nothing either so that the recipient isn't left unused.
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    // row yet), or it is already queued, or the message is gone.  Add the recipient and retry,
+    // rolling back if the retry inserts nothing either so that the recipient isn't left unused.
+    // Being in the same transaction keeps clean_pending_recipients from removing the recipient in
+    // between.
     conn.prepared_exec(insert_pending_recipient, pubkey.str());
     if (conn.prepared_exec(queue_delivery_sql, pubkey.str(), hash) > 0)
         transaction.commit();
@@ -1789,7 +1808,7 @@ std::vector<crypto::legacy_pubkey> Database::delivery_peers() {
 }
 
 void Database::clean_pending_recipients() {
-    db_->conn().prepared_exec(
+    db_->conn().prepared_exec_immediate(
             "DELETE FROM pending_recipients WHERE"
             " NOT EXISTS (SELECT 1 FROM pending_dumps WHERE recipient = pending_recipients.id)"
             " AND NOT EXISTS (SELECT 1 FROM pending_deliveries"
@@ -1844,7 +1863,7 @@ std::pair<std::vector<message>, std::vector<int64_t>> Database::next_delivery_ba
 void Database::remove_deliveries(
         const crypto::legacy_pubkey& pubkey, std::span<const int64_t> ids) {
     auto conn = db_->conn();
-    SQLite::Transaction transaction{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+    auto transaction = conn.begin_immediate();
     auto recipient = exec_and_maybe_get<int64_t>(
             conn.prepared_st("SELECT id FROM pending_recipients WHERE pubkey = ?"), pubkey.str());
     if (!recipient)
@@ -1859,7 +1878,7 @@ void Database::remove_deliveries(
 }
 
 void Database::remove_deliveries(const crypto::legacy_pubkey& pubkey) {
-    db_->conn().prepared_exec(
+    db_->conn().prepared_exec_immediate(
             "DELETE FROM pending_deliveries"
             " WHERE recipient = (SELECT id FROM pending_recipients WHERE pubkey = ?)",
             pubkey.str());
@@ -1867,18 +1886,18 @@ void Database::remove_deliveries(const crypto::legacy_pubkey& pubkey) {
 
 void Database::remove_node_retry_request(int64_t req_id) {
     auto conn = db_->conn();
-    conn.prepared_exec("DELETE FROM retry_node_requests WHERE id = ?", req_id);
+    conn.prepared_exec_immediate("DELETE FROM retry_node_requests WHERE id = ?", req_id);
 }
 
 void Database::remove_expired_retry_requests(std::chrono::system_clock::time_point now) {
     auto conn = db_->conn();
 
-    conn.prepared_exec(
+    conn.prepared_exec_immediate(
             "DELETE FROM retry_requests WHERE created < ?", to_epoch_double(now - RETRY_EXPIRY));
 }
 
 void Database::update_current_swarm(uint64_t swarm_id) {
-    db_->conn().prepared_exec(
+    db_->conn().prepared_exec_immediate(
             "INSERT OR REPLACE INTO state_kv (key, value) VALUES ('swarm_id', ?)",
             static_cast<int64_t>(swarm_id));
 }

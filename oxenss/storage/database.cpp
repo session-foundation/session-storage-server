@@ -795,7 +795,7 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                 log::error(logcat, "Failed to store message: database is full");
             return StoreResult::Full;
         } else {
-            log::critical(logcat, "Failed to store message: {}", e.getErrorStr());
+            log::critical(logcat, "Failed to store message: {}", e.what());
             throw;
         }
     }

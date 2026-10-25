@@ -102,10 +102,10 @@ TEST_CASE("storage - slow query logging", "[storage]") {
         holder.get();
     };
 
-    auto slow_queries = [&] {
+    auto logged = [&](std::string_view prefix) {
         std::vector<std::string> slow;
         for (auto& line : sink->last_formatted())
-            if (line.starts_with("Slow query (")) {
+            if (line.starts_with(prefix)) {
                 if (line.ends_with('\n'))
                     line.pop_back();
                 slow.push_back(std::move(line));
@@ -116,14 +116,19 @@ TEST_CASE("storage - slow query logging", "[storage]") {
     {
         Database storage{"."};
         store_while_locked(storage, "hash1");
-        CHECK(slow_queries().empty());
+        CHECK(logged("Slow query (").empty());
+        CHECK(logged("Slow write: ").empty());
     }
     {
         Database storage{".", 50ms};
         store_while_locked(storage, "hash2");
-        auto slow = slow_queries();
+        auto slow = logged("Slow query (");
         REQUIRE(slow.size() == 1);
         CHECK_THAT(slow[0], Catch::Matchers::EndsWith("): BEGIN IMMEDIATE"));
+        // The same wait, seen as the write's wait for the lock
+        auto writes = logged("Slow write: ");
+        REQUIRE(writes.size() == 1);
+        CHECK_THAT(writes[0], Catch::Matchers::Contains("ms for the write lock"));
     }
 }
 

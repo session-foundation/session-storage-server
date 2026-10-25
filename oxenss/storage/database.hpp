@@ -152,9 +152,9 @@ class Database {
     // Constructor.  Note that you *must* also set up a timer that runs periodically (every
     // CLEANUP_PERIOD is recommended) and calls clean_expired().
     //
-    // If `slow_query` is positive then every statement taking at least that long is logged.  The
-    // time runs from a statement's first step to its completion or reset, so it includes any wait
-    // for the write lock: a slow `BEGIN IMMEDIATE` is a writer waiting for another to finish.
+    // If `slow_query` is positive then every statement taking at least that long is logged, and so
+    // is every write transaction whose wait for the write lock and time holding it add up to at
+    // least that long.  A statement's time runs from its first step to its completion or reset.
     explicit Database(std::filesystem::path db_path, std::chrono::milliseconds slow_query = 0ms);
 
     ~Database();

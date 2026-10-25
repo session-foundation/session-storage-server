@@ -617,6 +617,15 @@ Database::Database(std::filesystem::path db_path, std::chrono::milliseconds slow
             ss::busy_timeout{SQLite_busy_timeout},
             ss::post_open{[this](ss::Connection& conn) { setup_connection(conn); }});
 
+    if (slow_query_ > 0ms)
+        db_->set_write_lock_observer(slow_query_, [](auto waited, auto held) {
+            log::warning(
+                    logcat,
+                    "Slow write: waited {} for the write lock, then held it for {}",
+                    util::short_duration(waited),
+                    util::short_duration(held));
+        });
+
     {
         auto conn = db_->conn();
         DatabaseImpl{*this, conn.sql}.initialize_database();

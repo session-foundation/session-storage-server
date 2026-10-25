@@ -555,6 +555,30 @@ TEST_CASE("storage - bulk data storage", "[storage]") {
     CHECK(storage.get_message_count() == num_items);
 }
 
+TEST_CASE("storage - bulk storage large enough to commit in several pieces", "[storage]") {
+    StorageDeleter fixture;
+
+    const auto timestamp = std::chrono::system_clock::now();
+    const std::string data(1000, 'x');
+    const size_t num_owners = 200, per_owner = 100;
+
+    Database storage{"."};
+
+    std::vector<message> items;
+    for (size_t i = 0; i < num_owners * per_owner; ++i) {
+        user_pubkey pubkey;
+        // Interleaved, so that every piece has to look up owners an earlier piece also used
+        REQUIRE(pubkey.load("05{:064x}"_format(i % num_owners)));
+        items.emplace_back(
+                pubkey, fmt::to_string(i), namespace_id::Default, timestamp, timestamp + 1h, data);
+    }
+    CHECK_NOTHROW(storage.bulk_store(items));
+
+    CHECK(storage.get_owner_count() == num_owners);
+    CHECK(storage.get_message_count() == num_owners * per_owner);
+    CHECK(storage.retrieve_all().size() == num_owners * per_owner);
+}
+
 TEST_CASE("storage - bulk storage with overlap", "[storage]") {
     StorageDeleter fixture;
 

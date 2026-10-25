@@ -106,6 +106,10 @@ class Database {
             session::sqlite::Connection& conn,
             std::span<const std::pair<std::string, deferred_expiry>> entries);
 
+    // How long, give or take one message, bulk_store() keeps the write lock before committing what
+    // it has so far and queueing up again behind other writers.
+    static constexpr auto BULK_STORE_PIECE = 10ms;
+
     // keep track of db full errors so we don't print them on every store
     std::atomic<int> db_full_counter = 0;
 

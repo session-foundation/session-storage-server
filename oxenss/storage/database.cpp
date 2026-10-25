@@ -804,35 +804,9 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
 
 void Database::bulk_store(std::span<const message> items) {
     auto conn = db_->conn();
-    auto t = conn.begin_immediate();
     auto get_owner = conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?");
     auto insert_owner = conn.prepared_st(
             "INSERT INTO owners (pubkey, type) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING id");
-    std::unordered_map<user_pubkey, int64_t> seen;
-    for (auto& m : items) {
-        if (!m.pubkey)
-            continue;
-        if (auto [it, ins] = seen.emplace(m.pubkey, 0); ins) {
-            auto ownerid =
-                    exec_and_maybe_get<int64_t>(get_owner, m.pubkey.raw_bytes(), m.pubkey.type());
-            get_owner->reset();
-            if (!ownerid) {
-                ownerid = exec_and_maybe_get<int64_t>(
-                        insert_owner, m.pubkey.raw_bytes(), m.pubkey.type());
-                insert_owner->reset();
-            }
-            if (ownerid)
-                it->second = *ownerid;
-            else {
-                log::error(
-                        logcat,
-                        "Failed to insert owner {} for bulk store",
-                        m.pubkey.prefixed_hex());
-                seen.erase(it);
-            }
-        }
-    }
-
     auto insert_message = conn.prepared_st(
             "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
             " VALUES (?, ?, ?, ?, ?, ?)"
@@ -845,30 +819,60 @@ void Database::bulk_store(std::span<const message> items) {
             " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
             " WHERE EXCLUDED.timestamp > messages.timestamp");
 
-    int64_t added = 0;
-    for (auto& m : items) {
-        if (!m.pubkey)
-            continue;
-        auto owner_it = seen.find(m.pubkey);
-        if (owner_it == seen.end())
-            continue;
+    // A batch is up to a megabyte, and slow to insert when the pages it touches aren't cached, so
+    // it is committed in pieces of about BULK_STORE_PIECE rather than in one transaction: each
+    // piece's begin_immediate() goes behind whatever writes queued up during the last one, rather
+    // than leaving them waiting for the whole batch.  A batch that fails partway keeps the pieces
+    // already committed, which is harmless: they are upserts, so if the batch is sent again,
+    // storing them a second time changes nothing.
+    //
+    // Owner ids are looked up afresh in each piece: between pieces an owner's last message can be
+    // deleted, which deletes the owner.
+    auto next = items.begin();
+    while (next != items.end()) {
+        auto transaction = conn.begin_immediate();
+        const auto piece_end = std::chrono::steady_clock::now() + BULK_STORE_PIECE;
+        std::unordered_map<user_pubkey, std::optional<int64_t>> owners;
+        int64_t added = 0;
+        do {
+            auto& m = *next++;
+            if (!m.pubkey)
+                continue;
+            auto [owner, inserted] = owners.try_emplace(m.pubkey);
+            if (inserted) {
+                owner->second = exec_and_maybe_get<int64_t>(
+                        get_owner, m.pubkey.raw_bytes(), m.pubkey.type());
+                get_owner->reset();
+                if (!owner->second) {
+                    owner->second = exec_and_maybe_get<int64_t>(
+                            insert_owner, m.pubkey.raw_bytes(), m.pubkey.type());
+                    insert_owner->reset();
+                }
+                if (!owner->second)
+                    log::error(
+                            logcat,
+                            "Failed to insert owner {} for bulk store",
+                            m.pubkey.prefixed_hex());
+            }
+            if (!owner->second)
+                continue;
 
-        reset_last_insert(conn.sql);
-        exec_query(
-                insert_message,
-                owner_it->second,
-                m.hash,
-                m.msg_namespace,
-                to_epoch_ms(m.timestamp),
-                to_epoch_ms(m.expiry),
-                to_span(m.data));
-        insert_message->reset();
-        if (inserted_row(conn.sql))
-            added++;
+            reset_last_insert(conn.sql);
+            exec_query(
+                    insert_message,
+                    *owner->second,
+                    m.hash,
+                    m.msg_namespace,
+                    to_epoch_ms(m.timestamp),
+                    to_epoch_ms(m.expiry),
+                    to_span(m.data));
+            insert_message->reset();
+            if (inserted_row(conn.sql))
+                added++;
+        } while (next != items.end() && std::chrono::steady_clock::now() < piece_end);
+        transaction.commit();
+        message_count_ += added;
     }
-
-    t.commit();
-    message_count_ += added;
 }
 
 std::pair<std::vector<message>, bool> Database::retrieve(

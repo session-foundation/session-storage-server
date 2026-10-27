@@ -9,6 +9,7 @@ add_executable(Test
     certificates.cpp
     encrypt.cpp
     https_backends.cpp
+    logging.cpp
     monitor.cpp
     onion_requests.cpp
     rate_limiter.cpp

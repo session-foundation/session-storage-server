@@ -6,8 +6,6 @@
 #include <variant>
 #include <vector>
 
-#include <oxenss/logging/oxen_logger.h>
-
 #include <oxen/quic/opt.hpp>
 
 namespace oxenss::cli {
@@ -29,7 +27,7 @@ struct command_line_options {
     bool skip_bootstrap = false;
     bool force_start = false;
     bool testnet = false;
-    std::string log_level{logging::DEFAULT_LOG_LEVELS};
+    std::string log_level;  // Adjustments to logging::DEFAULT_LOG_LEVELS
     std::filesystem::path data_dir;
     int db_slow_query_ms = 0;       // 0 disables slow query logging
     std::string oxend_key;          // test only (but needed for backwards compatibility)

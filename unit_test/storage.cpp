@@ -102,10 +102,10 @@ TEST_CASE("storage - slow query logging", "[storage]") {
         holder.get();
     };
 
-    auto slow_queries = [&] {
+    auto logged = [&](std::string_view prefix) {
         std::vector<std::string> slow;
         for (auto& line : sink->last_formatted())
-            if (line.starts_with("Slow query (")) {
+            if (line.starts_with(prefix)) {
                 if (line.ends_with('\n'))
                     line.pop_back();
                 slow.push_back(std::move(line));
@@ -116,14 +116,19 @@ TEST_CASE("storage - slow query logging", "[storage]") {
     {
         Database storage{"."};
         store_while_locked(storage, "hash1");
-        CHECK(slow_queries().empty());
+        CHECK(logged("Slow query (").empty());
+        CHECK(logged("Slow write: ").empty());
     }
     {
         Database storage{".", 50ms};
         store_while_locked(storage, "hash2");
-        auto slow = slow_queries();
+        auto slow = logged("Slow query (");
         REQUIRE(slow.size() == 1);
         CHECK_THAT(slow[0], Catch::Matchers::EndsWith("): BEGIN IMMEDIATE"));
+        // The same wait, seen as the write's wait for the lock
+        auto writes = logged("Slow write: ");
+        REQUIRE(writes.size() == 1);
+        CHECK_THAT(writes[0], Catch::Matchers::Contains("ms for the write lock"));
     }
 }
 
@@ -297,6 +302,34 @@ TEST_CASE("storage - tracked message count", "[storage]") {
     // Counted afresh on startup
     Database storage{"."};
     check(storage, 1);
+}
+
+TEST_CASE("storage - expired messages are deleted across chunks", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto now = std::chrono::system_clock::now();
+    constexpr int expired = 2 * Database::EXPIRY_DELETE_CHUNK + 17, live = 3;
+
+    Database storage{"."};
+    std::vector<message> msgs;
+    for (int i = 0; i < expired; i++)
+        msgs.emplace_back(
+                pubkey, "x{}"_format(i), namespace_id::Default, now - 2h, now - 1h - 1s * i, "x");
+    for (int i = 0; i < live; i++)
+        msgs.emplace_back(pubkey, "l{}"_format(i), namespace_id::Default, now, now + 1h, "l");
+    storage.bulk_store(msgs);
+    REQUIRE(storage.get_message_count() == expired + live);
+
+    storage.clean_expired();
+    CHECK(storage.get_message_count() == live);
+    CHECK(storage.get_namespace_counts() ==
+          std::vector<std::pair<namespace_id, int64_t>>{{namespace_id::Default, live}});
+    auto [items, more] = storage.retrieve(pubkey, namespace_id::Default, "");
+    REQUIRE(items.size() == live);
+    for (auto& m : items)
+        CHECK(m.hash.starts_with("l"));
 }
 
 TEST_CASE("storage - namespace message counts", "[storage][namespace]") {
@@ -498,12 +531,14 @@ TEST_CASE("storage - remove expired entries", "[storage]") {
     CHECK(storage.get_owner_count() == 3);
     CHECK(storage.get_message_count() == 6);
 
+    std::this_thread::sleep_for(5ms);
     {
         const auto lastHash = "";
         auto [items, more] = storage.retrieve(pubkey1, namespace_id::Default, lastHash);
-        REQUIRE(items.size() == 2);
+        REQUIRE(items.size() == 1);
+        CHECK(items[0].hash == "hash0");
     }
-    std::this_thread::sleep_for(5ms);
+    CHECK(storage.get_message_count() == 6);
     storage.clean_expired();
     {
         const auto lastHash = "";
@@ -553,6 +588,30 @@ TEST_CASE("storage - bulk data storage", "[storage]") {
 
     CHECK(storage.get_owner_count() == 1);
     CHECK(storage.get_message_count() == num_items);
+}
+
+TEST_CASE("storage - bulk storage large enough to commit in several pieces", "[storage]") {
+    StorageDeleter fixture;
+
+    const auto timestamp = std::chrono::system_clock::now();
+    const std::string data(1000, 'x');
+    const size_t num_owners = 200, per_owner = 100;
+
+    Database storage{"."};
+
+    std::vector<message> items;
+    for (size_t i = 0; i < num_owners * per_owner; ++i) {
+        user_pubkey pubkey;
+        // Interleaved, so that every piece has to look up owners an earlier piece also used
+        REQUIRE(pubkey.load("05{:064x}"_format(i % num_owners)));
+        items.emplace_back(
+                pubkey, fmt::to_string(i), namespace_id::Default, timestamp, timestamp + 1h, data);
+    }
+    CHECK_NOTHROW(storage.bulk_store(items));
+
+    CHECK(storage.get_owner_count() == num_owners);
+    CHECK(storage.get_message_count() == num_owners * per_owner);
+    CHECK(storage.retrieve_all().size() == num_owners * per_owner);
 }
 
 TEST_CASE("storage - bulk storage with overlap", "[storage]") {
@@ -859,6 +918,47 @@ TEST_CASE("storage - deferred expiry extensions are written at shutdown", "[stor
     CHECK(TestSuiteHacks::db_stored_expiry(storage, "h1") == to_epoch_ms(base + 5min));
 }
 
+TEST_CASE("storage - expired messages are hidden until deleted", "[storage]") {
+    StorageDeleter fixture;
+    Database storage{"."};
+
+    user_pubkey pk;
+    REQUIRE(pk.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto peer = crypto::legacy_pubkey::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111");
+    using hashes = std::vector<std::string>;
+    using expiries = std::map<std::string, int64_t>;
+    const auto ns = namespace_id::Default;
+    const auto now = std::chrono::system_clock::now();
+
+    REQUIRE(storage.store({pk, "live", ns, now - 1h, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk, "dead", ns, now - 1h, now - 1s, "data"}) == StoreResult::New);
+    REQUIRE(storage.get_message_count() == 2);
+
+    auto [msgs, more] = storage.retrieve(pk, ns, "");
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].hash == "live");
+    CHECK_FALSE(storage.retrieve_by_hash("dead"));
+    CHECK(storage.get_expiries(pk, hashes{"live", "dead"}) ==
+          expiries{{"live", to_epoch_ms(now + 1h)}});
+
+    CHECK(storage.update_expiry(pk, hashes{"dead"}, std::array{now + 2h}).empty());
+    CHECK(TestSuiteHacks::db_stored_expiry(storage, "dead") == to_epoch_ms(now - 1s));
+
+    auto [dump, last_id] = storage.next_dump_batch(1, storage.max_message_id(), 0, 0, 1 << 20);
+    REQUIRE(dump.size() == 1);
+    CHECK(dump[0].hash == "live");
+
+    storage.queue_delivery(peer, "live");
+    storage.queue_delivery(peer, "dead");
+    auto [delivery, ids] = storage.next_delivery_batch(peer, 1 << 20);
+    REQUIRE(delivery.size() == 1);
+    CHECK(delivery[0].hash == "live");
+
+    storage.clean_expired();
+    CHECK(storage.get_message_count() == 1);
+}
+
 // The connection pool belongs to session-sqlite now, so rather than asserting on its internals this
 // checks what we actually depend on: that concurrent readers and writers all get through without
 // "database is locked" and without losing writes.
@@ -966,6 +1066,29 @@ TEST_CASE("storage - retry requests", "[storage]") {
     CHECK_NOTHROW(storage.remove_expired_retry_requests(the_future));
     req_count = storage.retry_request_count();
     CHECK(req_count == 1);
+}
+
+TEST_CASE("storage - expired retry requests are deleted across chunks", "[storage]") {
+    StorageDeleter fixture;
+    crypto::legacy_pubkey pk1, pk2;
+    pk1.load_from_hex("1111111111111111111111111111111111111111111111111111111111111111");
+    pk2.load_from_hex("2222222222222222222222222222222222222222222222222222222222222222");
+    constexpr int expired = 2 * Database::EXPIRY_DELETE_CHUNK + 17;
+
+    Database storage{"."};
+    // Each request goes to two nodes, so every deletion also cascades through retry_node_requests.
+    for (int i = 0; i < expired; i++)
+        storage.add_retry_request(
+                pk2, "cmd", "payload", storage.add_retry_request(pk1, "cmd", "payload"));
+    REQUIRE(storage.retry_request_count() == 2 * expired);
+
+    std::this_thread::sleep_for(10ms);
+    auto cutoff = std::chrono::system_clock::now() + Database::RETRY_EXPIRY;
+    std::this_thread::sleep_for(10ms);
+    storage.add_retry_request(pk1, "cmd", "fresh");
+
+    storage.remove_expired_retry_requests(cutoff);
+    CHECK(storage.retry_request_count() == 1);
 }
 
 TEST_CASE("storage - ready retry requests", "[storage]") {

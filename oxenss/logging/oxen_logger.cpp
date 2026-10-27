@@ -9,6 +9,17 @@ namespace oxenss::logging {
 
 static auto logcat = oxen::log::Cat("logging");
 
+bool apply_levels(std::string_view log_levels) {
+    log::extract_categories(DEFAULT_LOG_LEVELS).apply();
+    if (log_levels.find_first_not_of(" \t,;") == std::string_view::npos)
+        return true;
+    auto levels = log::extract_categories(log_levels);
+    if (levels.empty())
+        return false;
+    levels.apply();
+    return true;
+}
+
 bool init(const std::filesystem::path& data_dir, std::string_view log_levels) {
     // Sinks first: the level parser reports bad entries through the logger.
     log::add_sink(log::Type::Print, "stdout");
@@ -36,12 +47,8 @@ bool init(const std::filesystem::path& data_dir, std::string_view log_levels) {
         file_logging = false;
     }
 
-    if (log_levels.find_first_not_of(" \t,;") == std::string_view::npos)
-        log_levels = DEFAULT_LOG_LEVELS;
-    auto levels = log::extract_categories(log_levels);
-    if (levels.empty())
+    if (!apply_levels(log_levels))
         return false;
-    levels.apply();
 
     if (file_logging)
         log::info(logcat, "Writing logs to {}", util::to_sv(log_location.u8string()));

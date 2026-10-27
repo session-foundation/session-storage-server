@@ -1,3 +1,17 @@
+oxen-storage-server (2.12.1~rc2-1~deb13) trixie; urgency=medium
+
+  * Update session-sqlite
+  * Make every database write through begin_immediate()
+  * Log sqlite's own message for a failed store
+  * Commit bulk stores in pieces
+  * Log writes that spend too long on the write lock
+  * Don't return expired messages that haven't been deleted yet
+  * Delete expired messages and retry requests in chunks
+  * Apply configured log levels on top of the defaults
+  * Update libquic to the 1.13.0 stable release
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 26 Oct 2026 21:57:37 -0300
+
 oxen-storage-server (2.12.1~rc1-1~deb13) trixie; urgency=medium
 
   * Fix tag builds' archive name and upload directory

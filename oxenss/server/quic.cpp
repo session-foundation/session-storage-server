@@ -237,7 +237,8 @@ void QUIC::on_conn_established(quic::Connection& c) {
     sn_streams streams;
     const quic::opt::max_request_size frame_size{MAX_REQUEST_BODY_SIZE};
     streams.command = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
-    streams.data = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
+    streams.forward = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
+    streams.data =conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     for (auto& s : streams.onion)
         s = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     sn_streams_[conn->reference_id()] = std::move(streams);
@@ -422,6 +423,7 @@ void QUIC::sn_request(
                    data_ready = cmd == "data_ready";
         const auto kind = cmd == "data" ? sn_stream_kind::data
                         : onion         ? sn_stream_kind::onion
+                        : storage_cc    ? sn_stream_kind::forward
                                         : sn_stream_kind::command;
 
         sn_connect(
@@ -448,13 +450,15 @@ void QUIC::sn_request(
                         return reply(false, {"TIMEOUT"s});
                     }
                     if (!stream) {
-                        // For a hop this is the congestion refusal: tell the client now, as a hop
-                        // failure it can reroute on, rather than letting it wait out a timeout.
+                        // For a hop or a forward this is the congestion refusal; a hop fails as a
+                        // hop failure so that the client can reroute.
                         if (onion)
                             return reply(
                                     true,
                                     {fmt::to_string(http::SERVICE_UNAVAILABLE.first),
                                      "Next hop congested"s});
+                        if (kind == sn_stream_kind::forward)
+                            return reply(false, {std::string{SN_STREAM_FULL}});
                         return reply(false, {"TIMEOUT"s});
                     }
 
@@ -602,6 +606,16 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
     switch (kind) {
         case sn_stream_kind::command: return streams.command;
         case sn_stream_kind::data: return streams.data;
+        case sn_stream_kind::forward:
+            if (auto unsent = streams.forward->unsent(); unsent >= SN_FORWARD_STREAM_MAX_BACKLOG) {
+                log::debug(
+                        logcat,
+                        "Refusing forward on {}: forward stream has {} bytes queued",
+                        c.reference_id(),
+                        unsent);
+                return nullptr;
+            }
+            return streams.forward;
         case sn_stream_kind::onion: break;
     }
 

@@ -1620,15 +1620,10 @@ void ServiceNode::check_retry_requests() {
             return false;
 
         auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
-            // We cleanup the request in all situations except timeout (timeout
-            // indicating that the node was non-responsive, maybe offline). In an error
-            // state we don't know what state the recipient's storage server is in and
-            // we default to deleting it and ending the retry attempts.
-            rpc::SNStorageCCResult store_result =
-                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
-            if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+            // In an error state we don't know what state the recipient's storage server is in,
+            // so we default to deleting the request and ending the retry attempts.
+            if (!rpc::interpret_sn_storage_cc_response_parts(success, parts).retryable())
                 db->remove_node_retry_request(req_id);
-            }
         };
         sn_request(*ct, "storage_cc", {cmd, payload}, on_request_done, RETRY_REQUEST_TIMEOUT);
         return true;

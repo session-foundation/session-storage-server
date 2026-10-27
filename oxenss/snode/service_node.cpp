@@ -1000,6 +1000,9 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
         return;
     }
 
+    if (w.failed_batch)
+        return;
+
     if (w.exhausted) {
         if (w.in_flight == 0)
             finish();
@@ -1075,26 +1078,37 @@ void ServiceNode::on_dump_batch_reply(
     auto& w = it->second;
     const auto& [pk, swarm] = key;
 
+    auto b = w.batches.find(last_id);
+    if (b == w.batches.end())
+        return;
     if (!ok) {
+        if (!w.failed_batch)
+            log::info(
+                    logcat,
+                    "Dump batch to {} failed; resuming once the rest of its window resolves",
+                    pk);
+        w.failed_batch = std::min(last_id, w.failed_batch.value_or(last_id));
+    }
+    if (--b->second > 0)
+        return;
+    w.in_flight--;
+
+    while (!w.batches.empty() && w.batches.begin()->second == 0 &&
+           !(w.failed_batch && w.batches.begin()->first >= *w.failed_batch)) {
+        w.next_id = w.batches.begin()->first + 1;
+        w.batches.erase(w.batches.begin());
+    }
+
+    if (w.failed_batch && w.in_flight == 0) {
         log::info(
                 logcat,
-                "Dump batch to {} failed; resuming from message id {} in {}",
+                "Resuming dump to {} from message id {} in {}",
                 pk,
                 w.next_id,
                 DUMP_RETRY_DELAY);
         db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
         dump_windows_.erase(it);
         return;
-    }
-
-    auto b = w.batches.find(last_id);
-    if (b == w.batches.end() || --b->second > 0)
-        return;
-    w.in_flight--;
-
-    while (!w.batches.empty() && w.batches.begin()->second == 0) {
-        w.next_id = w.batches.begin()->first + 1;
-        w.batches.erase(w.batches.begin());
     }
     db->update_dump(pk, swarm, w.next_id, {});
 

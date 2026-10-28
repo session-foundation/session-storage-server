@@ -342,16 +342,28 @@ void OMQ::connect_oxend(const oxenmq::address& oxend_rpc, const std::function<bo
     }
 }
 
-std::chrono::seconds OMQ::oxend_top_block_age(const std::function<bool()>& keep_going) {
-    for (int attempt = 1;; attempt++) {
-        auto prom = std::make_shared<std::promise<std::chrono::seconds>>();
+constexpr auto OXEND_BUSY_POLL_INTERVAL = 2s;
+
+std::optional<std::chrono::seconds> OMQ::oxend_top_block_age(
+        const std::function<bool()>& keep_going, std::chrono::seconds busy_grace) {
+    std::optional<std::chrono::steady_clock::time_point> busy_until;
+    for (int errors = 0;;) {
+        auto prom = std::make_shared<std::promise<std::optional<std::chrono::seconds>>>();
         auto fut = prom->get_future();
         oxend_request(
                 "rpc.get_last_block_header", [prom](bool success, std::vector<std::string> data) {
                     try {
                         if (!success || data.size() < 2 || data[0] != "200")
                             throw std::runtime_error{"{}"_format(fmt::join(data, " "))};
-                        auto header = nlohmann::json::parse(data[1]).at("block_header");
+                        auto reply = nlohmann::json::parse(data[1]);
+                        // oxend answers BUSY, without a block header, from startup until it
+                        // considers itself synchronized: an answer about its sync state, not a
+                        // failure.
+                        if (reply.value<std::string>("status", "") == "BUSY") {
+                            prom->set_value(std::nullopt);
+                            return;
+                        }
+                        auto& header = reply.at("block_header");
                         std::chrono::sys_seconds mined{
                                 std::chrono::seconds{header.at("timestamp").get<int64_t>()}};
                         auto now = std::chrono::floor<std::chrono::seconds>(
@@ -367,16 +379,32 @@ std::chrono::seconds OMQ::oxend_top_block_age(const std::function<bool()>& keep_
                         prom->set_exception(std::current_exception());
                     }
                 });
+        std::optional<std::chrono::seconds> age;
         try {
-            return snode::await_startup(fut, keep_going, "oxend's top block");
+            age = snode::await_startup(fut, keep_going, "oxend's top block");
         } catch (const snode::startup_aborted&) {
             throw;
         } catch (const std::exception& e) {
-            if (attempt >= 5)
+            if (++errors >= 5)
                 throw std::runtime_error{"Could not get the top block from oxend: "s + e.what()};
             log::warning(logcat, "Failed to get the top block from oxend: {}; retrying", e.what());
+            snode::startup_sleep(1s, keep_going);
+            continue;
         }
-        std::this_thread::sleep_for(1s);
+        if (age)
+            return age;
+
+        auto now = std::chrono::steady_clock::now();
+        if (!busy_until) {
+            busy_until = now + busy_grace;
+            log::info(
+                    logcat,
+                    "oxend reports it is still syncing; waiting up to {} for it to catch up",
+                    util::friendly_duration(busy_grace));
+        }
+        if (now >= *busy_until)
+            return std::nullopt;
+        snode::startup_sleep(OXEND_BUSY_POLL_INTERVAL, keep_going);
     }
 }
 

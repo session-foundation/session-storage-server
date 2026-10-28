@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <oxenss/crypto/keys.h>
@@ -51,6 +53,14 @@ inline constexpr auto BOOTSTRAP_TIMEOUT = 10s;
 // that is behind sends us to the bootstrap nodes to find out how far behind it is.
 inline constexpr auto MAX_SYNCED_BLOCK_AGE = 1h;
 
+// How long we keep waiting at startup for an oxend that says it is not yet synchronized before
+// treating it as behind.  oxend says so from every start until it has connected to peers, learnt
+// the network height from their handshakes and fetched the few blocks it missed while down: about
+// 5-20s after its OMQ listener comes up on a warm restart.  Waiting is cheap (we were down for the
+// restart anyway) and a needless bootstrap fetch is not, so this is sized to cover healthy
+// restarts rather than to be short.
+inline constexpr auto OXEND_SYNC_GRACE = 30s;
+
 // Thrown out of startup when the daemon is asked to stop (SIGINT/SIGTERM) before it is up.
 struct startup_aborted : std::exception {
     const char* what() const noexcept override { return "startup aborted"; }
@@ -72,6 +82,20 @@ T await_startup(
             throw startup_aborted{};
         if (ticks % 20 == 0)
             log::warning(log::Cat("snode"), "Still waiting for {}...", waiting_for);
+    }
+}
+
+// Sleeps between startup steps, checking `keep_going` every quarter second and throwing
+// startup_aborted when it says to stop.
+inline void startup_sleep(
+        std::chrono::milliseconds duration, const std::function<bool()>& keep_going) {
+    const auto until = std::chrono::steady_clock::now() + duration;
+    for (auto now = std::chrono::steady_clock::now(); now < until;
+         now = std::chrono::steady_clock::now()) {
+        if (!keep_going())
+            throw startup_aborted{};
+        std::this_thread::sleep_for(
+                std::min<std::chrono::steady_clock::duration>(250ms, until - now));
     }
 }
 

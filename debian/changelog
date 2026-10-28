@@ -1,3 +1,10 @@
+oxen-storage-server (2.12.1-1~ubuntu2610) stonking; urgency=medium
+
+  * require final libquic dev package
+  * Treat a BUSY oxend as syncing instead of exiting at startup
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 28 Oct 2026 17:09:15 -0300
+
 oxen-storage-server (2.12.1~rc2-1~ubuntu2610) stonking; urgency=medium
 
   * Update session-sqlite

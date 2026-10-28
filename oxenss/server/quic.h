@@ -72,9 +72,10 @@ inline constexpr size_t SN_ONION_STREAM_MAX_BACKLOG = 50_Mi;
 
 // Every store we receive is forwarded to each swarm member, so a member draining more slowly than
 // stores arrive would have us buffer them without bound.  Once a peer's forward stream has this
-// much unsent, forwards to it are refused with MQBase::SN_STREAM_FULL, which diverts them to what
-// a timed-out forward is replaced with: a delivery or retry request, held in the database and
-// paced by the peer's acknowledgements.  Only data yet to be sent counts; what is in flight is
+// much unsent, forwards to it are refused with MQBase::SN_STREAM_FULL until it has drained to half
+// this, which diverts them to what a timed-out forward is replaced with: a delivery or retry
+// request, held in the database and paced by the peer's acknowledgements.  (A stream watermark
+// tracks this; see watch_forward_backlog.)  Only data yet to be sent counts; what is in flight is
 // bounded separately by the peer's stream flow control window (at most 16MiB by default), so a
 // forward stream holds at most about twice this.  Forwards only go to the members of our own
 // swarm, so this is held for a handful of peers at most, which lets it be generous.
@@ -202,9 +203,9 @@ class QUIC : public MQBase {
 
     // The stream to send the given kind of traffic on, on the given SN connection.  For onion
     // requests this is whichever onion stream currently has the least data outstanding, or nullptr
-    // when even that one has SN_ONION_STREAM_MAX_BACKLOG unsent; for forwards it is nullptr when
-    // the forward stream has SN_FORWARD_STREAM_MAX_BACKLOG unsent.  Also nullptr if the connection
-    // has no stream set (it is not an established SN connection).
+    // when even that one has SN_ONION_STREAM_MAX_BACKLOG unsent; for forwards it is nullptr while
+    // the forward stream is backlogged (see SN_FORWARD_STREAM_MAX_BACKLOG).  Also nullptr if the
+    // connection has no stream set (it is not an established SN connection).
     std::shared_ptr<quic::BTRequestStream> sn_stream(
             const quic::Connection& c, sn_stream_kind kind) const;
 

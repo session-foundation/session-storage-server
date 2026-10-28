@@ -216,6 +216,43 @@ void QUIC::shutdown() {
     });
 }
 
+// Puts the forward stream to `pk` into the watermark alarm, which refuses forwards to it (see
+// sn_stream), once SN_FORWARD_STREAM_MAX_BACKLOG is unsent, and out again only once that has
+// drained by half, so that a peer only just keeping up is not flipped in and out of it with every
+// forward.  Both transitions are logged, the second with how fast the peer took data meanwhile.
+static void watch_forward_backlog(quic::Stream& stream, const crypto::ed25519_pubkey& pk) {
+    struct backlog_start {
+        std::chrono::steady_clock::time_point time;
+        uint64_t acked;
+    };
+    auto start = std::make_shared<backlog_start>();
+    stream.enable_watermarks(
+            SN_FORWARD_STREAM_MAX_BACKLOG,
+            [pk, start](quic::Stream& s) {
+                *start = {std::chrono::steady_clock::now(), s.acked_bytes()};
+                log::warning(
+                        logcat,
+                        "Forward stream to {} is backlogged with {:.1f}MiB unsent; diverting "
+                        "forwards to it to deliveries and retries until it drains to {}MiB",
+                        pk,
+                        s.unsent() / double{1_Mi},
+                        SN_FORWARD_STREAM_MAX_BACKLOG / 2 / 1_Mi);
+            },
+            SN_FORWARD_STREAM_MAX_BACKLOG / 2,
+            [pk, start](quic::Stream& s) {
+                auto elapsed = std::chrono::steady_clock::now() - start->time;
+                double received = s.acked_bytes() - start->acked;
+                log::info(
+                        logcat,
+                        "Forward stream to {} drained after {}; the peer took {:.1f}MiB meanwhile, "
+                        "at {:.1f}kiB/s",
+                        pk,
+                        util::friendly_duration(elapsed),
+                        received / 1_Mi,
+                        received / 1_ki / std::chrono::duration<double>(elapsed).count());
+            });
+}
+
 void QUIC::on_conn_established(quic::Connection& c) {
     if (c.selected_alpn() != SN_ALPN)
         return;
@@ -238,7 +275,8 @@ void QUIC::on_conn_established(quic::Connection& c) {
     const quic::opt::max_request_size frame_size{MAX_REQUEST_BODY_SIZE};
     streams.command = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     streams.forward = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
-    streams.data =conn->open_stream<quic::BTRequestStream>(handler, frame_size);
+    watch_forward_backlog(*streams.forward, *pk);
+    streams.data = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     for (auto& s : streams.onion)
         s = conn->open_stream<quic::BTRequestStream>(handler, frame_size);
     sn_streams_[conn->reference_id()] = std::move(streams);
@@ -607,14 +645,8 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
         case sn_stream_kind::command: return streams.command;
         case sn_stream_kind::data: return streams.data;
         case sn_stream_kind::forward:
-            if (auto unsent = streams.forward->unsent(); unsent >= SN_FORWARD_STREAM_MAX_BACKLOG) {
-                log::debug(
-                        logcat,
-                        "Refusing forward on {}: forward stream has {} bytes queued",
-                        c.reference_id(),
-                        unsent);
+            if (streams.forward->watermark_status().value_or(false))
                 return nullptr;
-            }
             return streams.forward;
         case sn_stream_kind::onion: break;
     }

@@ -141,17 +141,24 @@ void ServiceNode::on_oxend_connected(const std::function<bool()>& keep_going) {
     auto started = std::chrono::steady_clock::now();
 
     // Whether oxend's node list can be used as-is is a question of whether oxend is synced, and
-    // the age of its top block answers that directly.  This has to be settled before the list
-    // arrives: process_snodes_update() drops the list of an oxend that is still syncing.
+    // the age of its top block (or oxend declining to give one because it knows it is not yet
+    // synced) answers that directly.  This has to be settled before the list arrives:
+    // process_snodes_update() drops the list of an oxend that is still syncing.
     {
-        auto block_age = omq_server_.oxend_top_block_age(keep_going);
+        auto block_age = omq_server_.oxend_top_block_age(keep_going, OXEND_SYNC_GRACE);
         std::lock_guard lock{sn_mutex_};
-        syncing_ = block_age > MAX_SYNCED_BLOCK_AGE;
-        if (syncing_)
+        syncing_ = !block_age || *block_age > MAX_SYNCED_BLOCK_AGE;
+        if (!block_age)
+            log::warning(
+                    logcat,
+                    "oxend is still syncing after {}; storage server will start in syncing mode "
+                    "until oxend catches up",
+                    util::friendly_duration(OXEND_SYNC_GRACE));
+        else if (syncing_)
             log::warning(
                     logcat,
                     "oxend's top block is {} old; treating oxend as still syncing",
-                    util::friendly_duration(block_age));
+                    util::friendly_duration(*block_age));
     }
 
     while (true) {

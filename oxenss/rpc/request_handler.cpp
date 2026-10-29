@@ -430,9 +430,10 @@ SNStorageCCResult interpret_sn_storage_cc_response_parts(
     if (good_result) {
         result.status = SNStorageCCResultStatus::Good;
     } else {
-        bool timeout = !success;
-        if (timeout) {
-            result.status = SNStorageCCResultStatus::Timeout;
+        if (!success) {
+            result.status = parts.size() == 1 && parts[0] == server::MQBase::SN_STREAM_FULL
+                                  ? SNStorageCCResultStatus::StreamFull
+                                  : SNStorageCCResultStatus::Timeout;
         } else if (parts.size() == 2) {
             result.status = SNStorageCCResultStatus::ErrorCodeReason;
             result.error_code = parts[0];
@@ -495,9 +496,11 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
 
                     if (store_result.status != SNStorageCCResultStatus::Good) {
                         peer_result = json{{"failed", true}};
-                        bool timeout = store_result.status == SNStorageCCResultStatus::Timeout;
-                        if (timeout) {
+                        bool retry = store_result.retryable();
+                        if (store_result.status == SNStorageCCResultStatus::Timeout) {
                             peer_result["timeout"] = true;
+                        } else if (store_result.status == SNStorageCCResultStatus::StreamFull) {
+                            peer_result["stream_full"] = true;
                         } else if (
                                 store_result.status == SNStorageCCResultStatus::ErrorCodeReason) {
                             peer_result["code"] = store_result.error_code;
@@ -511,10 +514,10 @@ static void distribute_command(snode::ServiceNode& sn, std::shared_ptr<swarm_res
                                 "Failure response from {} for forwarded command {} ({}): <{}>",
                                 peer.first,
                                 res->cmd,
-                                timeout ? "will be retried" : "unretryable due to error",
+                                retry ? "will be retried" : "unretryable due to error",
                                 peer_result.dump());
 
-                        if (timeout)
+                        if (retry)
                             forward_failed(sn, *res, peer.first);
                     } else if (res->b64) {
                         if (auto it = peer_result.find("signature");

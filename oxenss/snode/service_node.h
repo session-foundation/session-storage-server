@@ -215,7 +215,10 @@ class ServiceNode {
     // Dumps of our messages to other nodes.  Each dump is a database row holding the persisted
     // cursor (see Database::pending_dump) plus, while it is being sent, one of these tracking the
     // batches in flight.  Batches are acknowledged individually and possibly out of order, so the
-    // persisted cursor advances only across the contiguous prefix of acknowledged batches.
+    // persisted cursor advances only across the contiguous prefix of acknowledged batches.  Once a
+    // batch fails the window sends nothing more, and only once every batch in flight has resolved
+    // does it end, for the dump to resume from the cursor after DUMP_RETRY_DELAY: resending
+    // sooner would queue a second copy behind batches that are still waiting to go out.
     struct dump_window {
         int64_t next_id;       // first id not yet acknowledged; mirrors the database row
         int64_t end_id;        // last id the dump covers
@@ -223,6 +226,7 @@ class ServiceNode {
         std::map<int64_t, int> batches{};  // last id of each sent batch -> parts awaiting an ack
         int in_flight = 0;                 // batches with parts awaiting an ack
         bool exhausted = false;            // nothing left to send before end_id
+        std::optional<int64_t> failed_batch;  // lowest failed batch; the cursor stops short of it
         uint64_t generation;               // tells acks for a discarded window from a restarted one
         int64_t sent_messages = 0;
     };

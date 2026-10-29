@@ -55,7 +55,8 @@ inline constexpr auto MAX_IDLE_TIMEOUT = 63s;
 // On each connection with another storage server we open a fixed set of streams and send each
 // kind of traffic on its own, so that none waits behind another (a QUIC stream delivers in order
 // and has its own flow-control window; separate streams do not):
-// - command: forwarded client commands, handshakes and pings -- small and latency-sensitive;
+// - command: handshakes and pings -- small and latency-sensitive;
+// - forward: client commands forwarded to the rest of the swarm;
 // - data: message batches (dumps and deliveries) -- bulk;
 // - onion: onion request hops, spread over several so that a large payload in transit holds up
 //   only the hops sharing its stream.
@@ -67,9 +68,20 @@ inline constexpr size_t SN_ONION_STREAMS = 4;
 // least-loaded onion stream; if even that one has this much unsent, every stream to the peer does
 // (so at least SN_ONION_STREAMS times this is queued) and the hop is refused with a 503 so that the
 // client reroutes rather than waits.  Generous: a healthy 100Mbit link clears this in seconds.
-inline constexpr size_t SN_ONION_STREAM_MAX_BACKLOG = 50 * 1024 * 1024;
+inline constexpr size_t SN_ONION_STREAM_MAX_BACKLOG = 50_Mi;
 
-enum class sn_stream_kind { command, data, onion };
+// Every store we receive is forwarded to each swarm member, so a member draining more slowly than
+// stores arrive would have us buffer them without bound.  Once a peer's forward stream has this
+// much unsent, forwards to it are refused with MQBase::SN_STREAM_FULL until it has drained to half
+// this, which diverts them to what a timed-out forward is replaced with: a delivery or retry
+// request, held in the database and paced by the peer's acknowledgements.  (A stream watermark
+// tracks this; see watch_forward_backlog.)  Only data yet to be sent counts; what is in flight is
+// bounded separately by the peer's stream flow control window (at most 16MiB by default), so a
+// forward stream holds at most about twice this.  Forwards only go to the members of our own
+// swarm, so this is held for a handful of peers at most, which lets it be generous.
+inline constexpr size_t SN_FORWARD_STREAM_MAX_BACKLOG = 16_Mi;
+
+enum class sn_stream_kind { command, forward, data, onion };
 
 class QUIC : public MQBase {
   public:
@@ -159,7 +171,7 @@ class QUIC : public MQBase {
     };
 
     struct sn_streams {
-        std::shared_ptr<quic::BTRequestStream> command, data;
+        std::shared_ptr<quic::BTRequestStream> command, forward, data;
         std::array<std::shared_ptr<quic::BTRequestStream>, SN_ONION_STREAMS> onion;
     };
 
@@ -191,8 +203,9 @@ class QUIC : public MQBase {
 
     // The stream to send the given kind of traffic on, on the given SN connection.  For onion
     // requests this is whichever onion stream currently has the least data outstanding, or nullptr
-    // when even that one has SN_ONION_STREAM_MAX_BACKLOG unsent.  Also nullptr if the connection
-    // has no stream set (it is not an established SN connection).
+    // when even that one has SN_ONION_STREAM_MAX_BACKLOG unsent; for forwards it is nullptr while
+    // the forward stream is backlogged (see SN_FORWARD_STREAM_MAX_BACKLOG).  Also nullptr if the
+    // connection has no stream set (it is not an established SN connection).
     std::shared_ptr<quic::BTRequestStream> sn_stream(
             const quic::Connection& c, sn_stream_kind kind) const;
 

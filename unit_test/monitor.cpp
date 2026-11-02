@@ -53,11 +53,7 @@ std::string account(unsigned char fill) {
     return "\x05"s + std::string(32, static_cast<char>(fill));
 }
 
-connection_id conn(unsigned char fill) {
-    return oxenmq::ConnectionID{std::string(32, static_cast<char>(fill))};
-}
-
-connection_id quic_conn(uint64_t id) {
+connection_id conn(uint64_t id) {
     return std::pair{size_t{0}, oxen::quic::ConnectionID{id}};
 }
 
@@ -113,7 +109,7 @@ TEST_CASE("monitor - foreign subscriptions are extracted and removed", "[monitor
     TestMQ mq;
 
     auto ours = account(0x11), theirs = account(0x22), also_ours = account(0x33);
-    auto conn_a = conn(0xaa), conn_b = conn(0xbb);
+    auto conn_a = conn(1), conn_b = conn(2);
 
     subscribe(mq, ours, conn_a);
     subscribe(mq, theirs, conn_a);
@@ -142,8 +138,8 @@ TEST_CASE("monitor - foreign subscriptions are extracted and removed", "[monitor
 TEST_CASE("monitor - extraction keeps everything when nothing is foreign", "[monitor]") {
     TestMQ mq;
 
-    subscribe(mq, account(0x11), conn(0xaa));
-    subscribe(mq, account(0x22), conn(0xbb));
+    subscribe(mq, account(0x11), conn(1));
+    subscribe(mq, account(0x22), conn(2));
 
     auto dropped = mq.extract_foreign_monitors([](const user_pubkey&) { return true; });
 
@@ -164,7 +160,7 @@ TEST_CASE("monitor - a wrong-sized p= pubkey is rejected outright", "[monitor]")
     auto request = std::move(req).str();
 
     std::string reply;
-    mq.handle_monitor(request, [&reply](std::string r) { reply = std::move(r); }, conn(0xaa));
+    mq.handle_monitor(request, [&reply](std::string r) { reply = std::move(r); }, conn(1));
 
     // The error must be the only thing in the response: carrying on past a bad pubkey reaches the
     // signature check with a short key, and appends a second errcode to this same dict.
@@ -172,22 +168,22 @@ TEST_CASE("monitor - a wrong-sized p= pubkey is rejected outright", "[monitor]")
           nlohmann::json{{"errcode", 2}, {"error", "Provided p= pubkey must be 33 bytes"}});
 }
 
-TEST_CASE("monitor - closing a quic connection drops its subscriptions", "[monitor]") {
+TEST_CASE("monitor - closing a connection drops its subscriptions", "[monitor]") {
     TestMQ mq;
 
     auto a = account(0x11), b = account(0x22);
-    auto q1 = quic_conn(1), q2 = quic_conn(2), omq = conn(0xcc);
+    auto q1 = conn(1), q2 = conn(2), q3 = conn(3);
 
     subscribe(mq, a, q1);
     subscribe(mq, b, q1);
     subscribe(mq, b, q2);
-    subscribe(mq, a, omq);
+    subscribe(mq, a, q3);
 
     mq.remove_monitors_for(q1);
 
     // Both of q1's subscriptions go, and nothing else: not the same account on another
     // connection, nor another connection's subscription to an account q1 was also watching.
-    CHECK(notifiers(mq, a) == std::vector{omq});
+    CHECK(notifiers(mq, a) == std::vector{q3});
     CHECK(notifiers(mq, b) == std::vector{q2});
     CHECK(mq.monitoring_conns_.count(q1) == 0);
     CHECK(mq.monitoring_conns_.count(q2) == 1);
@@ -197,7 +193,7 @@ TEST_CASE("monitor - renewing a subscription doesn't duplicate its index entry",
     TestMQ mq;
 
     auto a = account(0x11);
-    auto q1 = quic_conn(1);
+    auto q1 = conn(1);
 
     subscribe(mq, a, q1);
     subscribe(mq, a, q1);
@@ -205,26 +201,11 @@ TEST_CASE("monitor - renewing a subscription doesn't duplicate its index entry",
     CHECK(mq.monitoring_conns_[q1] == std::vector{a});
 }
 
-TEST_CASE("monitor - oxenmq subscriptions are not indexed by connection", "[monitor]") {
-    TestMQ mq;
-
-    auto a = account(0x11);
-    auto omq = conn(0xcc);
-    subscribe(mq, a, omq);
-
-    CHECK(mq.monitoring_conns_.empty());
-
-    // Nothing tells us when an inbound oxenmq connection goes away, so there is nothing to trigger
-    // a removal and the subscription has to wait for its expiry.
-    mq.remove_monitors_for(omq);
-    CHECK(notifiers(mq, a) == std::vector{omq});
-}
-
 TEST_CASE("monitor - the connection index follows swarm-change removals", "[monitor]") {
     TestMQ mq;
 
     auto ours = account(0x11), theirs = account(0x22);
-    auto q1 = quic_conn(1);
+    auto q1 = conn(1);
 
     subscribe(mq, ours, q1);
     subscribe(mq, theirs, q1);

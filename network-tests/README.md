@@ -17,8 +17,9 @@ Usage:
 - `py.test-3 --transport=omq` sends them over oxenmq instead.  This needs the
   [oxenmq Python module](https://github.com/session-foundation/pyoxenmq), which you can build from
   source or install as the python3-oxenmq deb package from https://deb.session.foundation.  The
-  message monitoring tests and the bt-encoded batch test run under oxenmq and QUIC, which can push
-  notifications and carry bt bodies, and are skipped over HTTPS.
+  bt-encoded batch test runs under oxenmq and QUIC, which carry bt bodies, and is skipped over
+  HTTPS.  The message monitoring tests run only under QUIC, the one transport that carries
+  monitoring.
 
 - `--exclude=<ed25519 pubkey>` keeps the tests away from a particular node.
 

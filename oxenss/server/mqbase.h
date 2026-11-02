@@ -7,12 +7,10 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-#include <variant>
 #include <vector>
 #include <nlohmann/json_fwd.hpp>
 #include <oxen/quic/connection.hpp>
 #include <oxen/quic/connection_ids.hpp>
-#include <oxenmq/connections.h>
 #include <shared_mutex>
 
 #include "../common/namespace.h"
@@ -38,9 +36,9 @@ struct message;
 
 namespace oxenss::server {
 
-// For oxenmq: the connection id; for quic: pair of {endpoint_index, endpoint_connectionid}
-using connection_id =
-        std::variant<oxenmq::ConnectionID, std::pair<size_t, oxen::quic::ConnectionID>>;
+// A QUIC connection, as {endpoint index, connection reference id}: monitors are only carried over
+// QUIC.
+using connection_id = std::pair<size_t, oxen::quic::ConnectionID>;
 
 using namespace std::literals;
 
@@ -108,8 +106,6 @@ class MQBase {
     void update_monitors(std::vector<sub_info>& subs, connection_id conn);
 
     // Removes every monitor subscription belonging to `conn`, for a connection that has gone away.
-    // Only connections tracked in `monitoring_conns_` can be removed this way; for anything else
-    // this does nothing.
     void remove_monitors_for(const connection_id& conn);
 
     // Drops `account` from `conn`'s entry in `monitoring_conns_`.  Must be called with
@@ -136,11 +132,6 @@ class MQBase {
     // Reverse index of `monitoring_`, listing the accounts subscribed to by each connection so
     // that a connection going away doesn't require a scan of the whole table.
     //
-    // Only quic connections are indexed: a closed quic connection is gone for good, and we get
-    // told when it closes.  oxenmq, in contrast, gives us no notification at all when an inbound
-    // connection goes away, so there would be nothing to trigger a lookup and the index would only
-    // accumulate entries; oxenmq subscriptions are cleaned up by expiry instead.
-    //
     // Guarded by `monitoring_mutex_` along with `monitoring_` itself so that the two cannot drift
     // apart.
     std::map<connection_id, std::vector<std::string>> monitoring_conns_;
@@ -159,13 +150,14 @@ class MQBase {
     /// client that has stopped polling cannot tell "the swarm moved" from "no messages arrived".
     void drop_foreign_monitors();
 
-    virtual void notify(std::vector<connection_id>&, std::string_view notification) = 0;
+    /// Pushes a message notification to `conns`.  The default does nothing: only the QUIC server
+    /// carries monitors.
+    virtual void notify(std::vector<connection_id>&, std::string_view) {}
 
     /// Pushes a notification telling `conns` that a monitor subscription of theirs has been
     /// terminated.  This is a separate command from `notify` so that clients which only know
-    /// about message notifications are unaffected by it.
-    virtual void notify_monitor_ended(
-            std::vector<connection_id>&, std::string_view notification) = 0;
+    /// about message notifications are unaffected by it.  The default does nothing, as `notify`.
+    virtual void notify_monitor_ended(std::vector<connection_id>&, std::string_view) {}
 
     virtual void reachability_test(std::shared_ptr<snode::sn_test> test) = 0;
 

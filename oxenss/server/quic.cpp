@@ -914,23 +914,19 @@ nlohmann::json QUIC::wrap_response(
 
 void QUIC::send_notification(
         std::vector<connection_id>& conns, std::string command, std::string_view notification) {
-    std::vector<std::pair<size_t, quic::ConnectionID>> quic_conns;
-    for (const auto& c : conns)
-        if (auto* quic_id = std::get_if<std::pair<size_t, quic::ConnectionID>>(&c))
-            quic_conns.push_back(*quic_id);
-    if (quic_conns.empty())
+    if (conns.empty())
         return;
 
     // The endpoints' connections are loop-owned, and this is called from whichever thread stored
     // the message (never the loop: requests are handled on oxenmq workers), so the lookups go
     // there.  The notification is copied as the caller's buffer won't outlive the call.
     loop.call([this,
-               quic_conns = std::move(quic_conns),
+               conns = conns,
                command = std::move(command),
                notification = std::string{notification}] {
         if (endpoints.empty())
             return;  // shut down; see shutdown()
-        for (const auto& [ep_idx, cid] : quic_conns) {
+        for (const auto& [ep_idx, cid] : conns) {
             assert(ep_idx < endpoints.size());
             if (auto conn = endpoints[ep_idx]->get_conn(cid))
                 if (auto str = conn->get_stream<quic::BTRequestStream>(0))

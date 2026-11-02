@@ -77,24 +77,14 @@ class OMQ:
 
     name = 'omq'
     bt = True
-    monitor = True
+    monitor = False
 
     def __init__(self):
-        from oxenmq import AuthLevel, OxenMQ
+        from oxenmq import OxenMQ
 
         self._omq = OxenMQ()
         self._omq.max_message_size = 10 * 1024 * 1024
-        # Nodes push monitoring notifications to us as commands in a `notify` category, which has
-        # to exist before the instance starts.
-        self._notify_callbacks = {}
-        notify = self._omq.add_category('notify', AuthLevel.none)
-        notify.add_command('message', self._on_notify)
-        notify.add_command('monitor_ended', lambda m: None)
         self._omq.start()
-
-    def _on_notify(self, m):
-        if cb := self._notify_callbacks.get(m.conn):
-            cb(m.data()[0])
 
     def close(self):
         pass
@@ -104,7 +94,7 @@ class OMQ:
 
         # Without this every connection from this instance to one node shares our pubkey as its
         # ZMQ routing id, and the node then treats each new one as taking over the last: replies
-        # to the superseded connection are lost and pushed notifications land on the wrong one.
+        # to the superseded connection are lost.
         return self._omq.connect_remote(
             Address(sn['ip'], sn['port_omq'], bytes.fromhex(sn['pubkey_x25519'])),
             ephemeral_routing_id=True,
@@ -114,12 +104,6 @@ class OMQ:
         return self._omq.request_future(
             conn, f'storage.{method}', _payload_bytes(payload), request_timeout=timeout
         )
-
-    def monitor(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
-        return self._omq.request_future(conn, 'monitor.messages', body, request_timeout=timeout)
-
-    def on_notify(self, conn, cb):
-        self._notify_callbacks[conn] = cb
 
     def oxend(self, method, params):
         from oxenmq import Address

@@ -353,13 +353,6 @@ namespace {
         }
         return c;
     }
-
-    // See `monitoring_conns_`: only quic connections notify us when they close, so only those are
-    // worth indexing by connection.
-    bool indexed_connection(const connection_id& conn) {
-        return std::holds_alternative<std::pair<size_t, oxen::quic::ConnectionID>>(conn);
-    }
-
 }  // namespace
 
 void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
@@ -388,8 +381,7 @@ void MQBase::update_monitors(std::vector<sub_info>& subs, connection_id conn) {
                     "new subscription for {} monitoring namespace(s) {}",
                     pubkey_hex,
                     fmt::join(namespaces, ", "));
-            if (indexed_connection(conn))
-                monitoring_conns_[conn].push_back(pubkey);
+            monitoring_conns_[conn].push_back(pubkey);
             monitoring_.emplace(
                     std::piecewise_construct,
                     std::forward_as_tuple(std::move(pubkey)),

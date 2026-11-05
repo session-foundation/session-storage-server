@@ -503,6 +503,37 @@ TEST_CASE("storage - all of a namespace's expiries", "[storage]") {
     CHECK(storage.get_expiries(nobody, ns0).empty());
 }
 
+TEST_CASE("storage - an account's message counts by namespace", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    using counts = std::vector<std::pair<namespace_id, int64_t>>;
+    const auto now = std::chrono::system_clock::now();
+    const auto ns0 = namespace_id::Default;
+    const auto ns13 = namespace_id{13};
+    const auto ns_neg = namespace_id{-21};
+
+    REQUIRE(storage.store({pk1, "a1", ns0, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a2", ns0, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a3", ns13, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a4", ns_neg, now, now + 1h, "data"}) == StoreResult::New);
+    // Expired but not yet cleaned up
+    REQUIRE(storage.store({pk1, "gone", ns0, now - 2h, now - 1min, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "gone2", namespace_id{5}, now - 2h, now - 1min, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk2, "b1", ns13, now, now + 1h, "data"}) == StoreResult::New);
+
+    CHECK(storage.get_namespace_counts(pk1) == counts{{ns_neg, 1}, {ns0, 2}, {ns13, 1}});
+    CHECK(storage.get_namespace_counts(pk2) == counts{{ns13, 1}});
+    CHECK(storage.get_namespace_counts(nobody).empty());
+}
+
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     StorageDeleter fixture;
 

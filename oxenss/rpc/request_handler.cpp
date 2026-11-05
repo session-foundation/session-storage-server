@@ -1519,6 +1519,47 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
     return cb(Response{http::OK, std::move(res)});
 }
 
+void RequestHandler::process_client_req(
+        rpc::get_message_count&& req, std::function<void(Response)> cb) {
+    log::debug(logcat, "processing get_message_count request");
+
+    if (!swarm_.is_pubkey_for_us(req.pubkey))
+        return cb(handle_wrong_swarm(req.pubkey));
+
+    auto now = system_clock::now();
+    if (req.sig_ts < now - SIGNATURE_TOLERANCE || req.sig_ts > now + SIGNATURE_TOLERANCE) {
+        log::debug(
+                logcat,
+                "get_message_count: invalid timestamp ({}s from now)",
+                duration_cast<seconds>(req.sig_ts - now).count());
+        return cb(Response{
+                http::NOT_ACCEPTABLE, "get_message_count timestamp too far from current time"sv});
+    }
+
+    if (!verify_signature(
+                *service_node_.db,
+                req.pubkey,
+                req.pubkey_ed25519,
+                req.subaccount,
+                subaccount_access::Read,
+                false,
+                req.signature,
+                "get_message_count",
+                req.sig_ts)) {
+        log::debug(logcat, "get_message_count: signature verification failed");
+        return cb(
+                Response{http::UNAUTHORIZED, "get_message_count signature verification failed"sv});
+    }
+
+    int64_t total = 0;
+    auto by_ns = json::object();
+    for (auto [ns, count] : service_node_.db->get_namespace_counts(req.pubkey)) {
+        total += count;
+        by_ns[to_string(ns)] = count;
+    }
+    return cb(Response{http::OK, json{{"total", total}, {"namespace", std::move(by_ns)}}});
+}
+
 namespace {
     struct batch_state {
         json results = json::array();

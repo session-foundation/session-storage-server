@@ -711,6 +711,17 @@ std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts() {
     return get_all_pairs<namespace_id, int64_t>(st);
 }
 
+std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts(
+        const user_pubkey& pubkey) {
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(
+            "SELECT namespace, COUNT(*) FROM messages"
+            " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?) AND expiry > ?"
+            " GROUP BY namespace");
+    return get_all_pairs<namespace_id, int64_t>(
+            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(std::chrono::system_clock::now()));
+}
+
 int64_t Database::get_total_bytes() {
     auto conn = db_->conn();
     return conn.prepared_get<int64_t>("PRAGMA page_count") * page_size_;

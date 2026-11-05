@@ -938,6 +938,30 @@ void get_expiries::load_from(bt_dict_consumer params) {
 }
 
 template <typename Dict>
+static void load(get_message_count& gc, Dict& d) {
+    auto [pubkey, pk_ed25519, sig, subacc, subacc_sig, timestamp] =
+            load_fields<Str, SV, SV, SV, SV, TP>(
+                    d,
+                    "pubkey",
+                    "pubkey_ed25519",
+                    "signature",
+                    "subaccount",
+                    "subaccount_sig",
+                    "timestamp");
+
+    load_pk_signature(gc, d, pubkey, pk_ed25519, sig);
+    load_subaccount(gc, d, subacc, subacc_sig);
+    require("timestamp", timestamp);
+    gc.sig_ts = *timestamp;
+}
+void get_message_count::load_from(json params) {
+    load(*this, params);
+}
+void get_message_count::load_from(bt_dict_consumer params) {
+    load(*this, params);
+}
+
+template <typename Dict>
 static void load(get_swarm& g, Dict& d) {
     auto [pubKey, pubkey] = load_fields<Str, Str>(d, "pubKey", "pubkey");
 

@@ -223,6 +223,9 @@ class Database {
     // Returns the number of messages grouped by namespace id
     std::vector<std::pair<namespace_id, int64_t>> get_namespace_counts();
 
+    // Returns the number of the account's unexpired messages in each namespace that has any.
+    std::vector<std::pair<namespace_id, int64_t>> get_namespace_counts(const user_pubkey& pubkey);
+
     // Returns the number of allocated bytes used on disk (i.e. used pages * page size).  This
     // includes both used and unused storage (i.e. allocated on disk, currently currently unused
     // that will likely be reused by sqlite when needed).

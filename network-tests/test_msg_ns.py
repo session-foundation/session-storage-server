@@ -523,3 +523,28 @@ def test_get_expiries_namespace(rpc, random_sn, sk, exclude):
     r = rpc.request(conns[1], 'get_expiries', [json.dumps(params).encode()]).get()
     assert r[0] == b'400'
 
+
+def test_get_message_count(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+    sns = ss.random_swarm_members(swarm, 2, exclude)
+    conns = [rpc.connect(sn) for sn in sns]
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+
+    def get_message_count():
+        now = int(time.time() * 1000)
+        params = {
+            "pubkey": my_ss_id,
+            "timestamp": now,
+            "signature": sk.sign(
+                f"get_message_count{now}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        r = rpc.request(conns[1], 'get_message_count', [json.dumps(params).encode()]).get()
+        assert len(r) == 1
+        return json.loads(r[0])
+
+    assert get_message_count() == {"total": 0, "namespace": {}}
+
+    _store_in_namespaces(rpc, conns[0], sk, {0: 3, 13: 2, -21: 1})
+
+    assert get_message_count() == {"total": 6, "namespace": {"0": 3, "13": 2, "-21": 1}}

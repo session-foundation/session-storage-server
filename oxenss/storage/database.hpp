@@ -331,9 +331,9 @@ class Database {
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
 
-    // Retrieves the expiries of all of an account's unexpired messages, in every namespace, as a
+    // Retrieves the expiries of all of an account's unexpired messages in the given namespace, as a
     // map of hash -> expiry.
-    std::map<std::string, int64_t> get_all_expiries(const user_pubkey& pubkey);
+    std::map<std::string, int64_t> get_expiries(const user_pubkey& pubkey, namespace_id ns);
 
     // Writes the deferred expiry extensions that are due (see update_expiry) to the database, or
     // all of them if `all` is set.  The `Database` instance owner should call this periodically

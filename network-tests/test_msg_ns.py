@@ -443,3 +443,83 @@ def test_public_outbox(rpc, random_sn, sk, exclude):
         ],
         "more": False,
     }
+
+
+def _store_in_namespaces(rpc, conn, sk, counts):
+    """Stores `counts[ns]` messages in each namespace `ns`, and returns {ns: {hash: expiry}}."""
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+    stored = {}
+    for ns, n in counts.items():
+        stored[ns] = {}
+        for i in range(n):
+            ts = int(time.time() * 1000)
+            exp = ts + 3_600_000
+            req = {
+                "pubkey": my_ss_id,
+                "timestamp": ts,
+                "expiry": exp,
+                "namespace": ns,
+                "data": b64(f"ns {ns} msg {i}".encode()),
+            }
+            if ns != 0:
+                req["signature"] = sk.sign(
+                    f"store{ns}{ts}".encode(), encoder=Base64Encoder
+                ).signature.decode()
+            r = rpc.request(conn, 'store', [json.dumps(req).encode()]).get()
+            assert len(r) == 1
+            r = json.loads(r[0])
+            hashes = {v['hash'] for v in r['swarm'].values() if 'hash' in v}
+            assert len(hashes) == 1
+            stored[ns][hashes.pop()] = exp
+    return stored
+
+
+def test_get_expiries_namespace(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+    sns = ss.random_swarm_members(swarm, 2, exclude)
+    conns = [rpc.connect(sn) for sn in sns]
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+
+    stored = _store_in_namespaces(rpc, conns[0], sk, {0: 2, 13: 3, -21: 1})
+
+    def get_expiries(ns, *, sign_ns=None):
+        now = int(time.time() * 1000)
+        sig_ns = ns if sign_ns is None else sign_ns
+        params = {
+            "pubkey": my_ss_id,
+            "namespace": ns,
+            "timestamp": now,
+            "signature": sk.sign(
+                f"get_expiriesN{sig_ns}{now}".encode(), encoder=Base64Encoder
+            ).signature.decode(),
+        }
+        return rpc.request(conns[1], 'get_expiries', [json.dumps(params).encode()]).get()
+
+    for ns in (0, 13, -21):
+        r = get_expiries(ns)
+        assert len(r) == 1
+        assert json.loads(r[0]) == {"expiries": stored[ns]}
+
+    r = get_expiries(42)
+    assert len(r) == 1
+    assert json.loads(r[0]) == {"expiries": {}}
+
+    # The namespace is part of the signature, so one signed for another namespace is refused
+    r = get_expiries(13, sign_ns=0)
+    assert r == [b'401', b'get_expiries signature verification failed']
+
+    # messages and namespace are mutually exclusive
+    now = int(time.time() * 1000)
+    h = next(iter(stored[0]))
+    params = {
+        "pubkey": my_ss_id,
+        "messages": [h],
+        "namespace": 0,
+        "timestamp": now,
+        "signature": sk.sign(
+            f"get_expiries{now}{h}".encode(), encoder=Base64Encoder
+        ).signature.decode(),
+    }
+    r = rpc.request(conns[1], 'get_expiries', [json.dumps(params).encode()]).get()
+    assert r[0] == b'400'
+

@@ -1512,7 +1512,7 @@ std::map<std::string, int64_t> Database::get_expiries(
     return result;
 }
 
-std::map<std::string, int64_t> Database::get_all_expiries(const user_pubkey& pubkey) {
+std::map<std::string, int64_t> Database::get_expiries(const user_pubkey& pubkey, namespace_id ns) {
     auto conn = db_->conn();
 
     std::map<std::string, int64_t> result;
@@ -1523,9 +1523,10 @@ std::map<std::string, int64_t> Database::get_all_expiries(const user_pubkey& pub
     if (!owner)
         return result;
 
-    auto st = conn.prepared_st("SELECT hash, expiry FROM messages WHERE owner = ? AND expiry > ?");
-    for (auto& [hash, exp] :
-         get_all<std::string, int64_t>(st, *owner, to_epoch_ms(std::chrono::system_clock::now())))
+    auto st = conn.prepared_st(
+            "SELECT hash, expiry FROM messages WHERE owner = ? AND namespace = ? AND expiry > ?");
+    for (auto& [hash, exp] : get_all<std::string, int64_t>(
+                 st, *owner, to_int(ns), to_epoch_ms(std::chrono::system_clock::now())))
         result.emplace(std::move(hash), exp);
 
     apply_deferred(result, *owner);

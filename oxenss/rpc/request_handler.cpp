@@ -1494,7 +1494,8 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
                 http::NOT_ACCEPTABLE, "get_expiries timestamp too far from current time"sv});
     }
 
-    if (!verify_signature(
+    auto verify = [&](const auto&... parts) {
+        return verify_signature(
                 *service_node_.db,
                 req.pubkey,
                 req.pubkey_ed25519,
@@ -1503,15 +1504,17 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
                 false,
                 req.signature,
                 "get_expiries",
-                req.sig_ts,
-                req.messages)) {
+                parts...);
+    };
+    if (!(req.msg_namespace ? verify("N", to_int(*req.msg_namespace), req.sig_ts)
+                            : verify(req.sig_ts, req.messages))) {
         log::debug(logcat, "get_expiries: signature verification failed");
         return cb(Response{http::UNAUTHORIZED, "get_expiries signature verification failed"sv});
     }
 
     json res = json::object();
-    res["expiries"] = req.messages.size() == 1 && req.messages.front() == "all"
-                            ? service_node_.db->get_all_expiries(req.pubkey)
+    res["expiries"] = req.msg_namespace
+                            ? service_node_.db->get_expiries(req.pubkey, *req.msg_namespace)
                             : service_node_.db->get_expiries(req.pubkey, req.messages);
     return cb(Response{http::OK, std::move(res)});
 }

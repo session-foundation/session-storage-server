@@ -1510,7 +1510,9 @@ void RequestHandler::process_client_req(rpc::get_expiries&& req, std::function<v
     }
 
     json res = json::object();
-    res["expiries"] = service_node_.db->get_expiries(req.pubkey, req.messages);
+    res["expiries"] = req.messages.size() == 1 && req.messages.front() == "all"
+                            ? service_node_.db->get_all_expiries(req.pubkey)
+                            : service_node_.db->get_expiries(req.pubkey, req.messages);
     return cb(Response{http::OK, std::move(res)});
 }
 

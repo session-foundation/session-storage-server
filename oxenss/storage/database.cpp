@@ -1296,6 +1296,15 @@ void Database::apply_deferred(std::span<message> msgs) {
             m.expiry = from_epoch_ms(it->second.expiry);
 }
 
+void Database::apply_deferred(std::map<std::string, int64_t>& expiries, int64_t owner) {
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return;
+    for (auto& [hash, exp] : expiries)
+        if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == owner)
+            exp = std::max(exp, it->second.expiry);
+}
+
 std::vector<std::pair<std::string, Database::deferred_expiry>> Database::take_deferred(
         int64_t owner) {
     // A linear scan, but only owner-wide expiry changes need it, and those are rare.
@@ -1499,12 +1508,27 @@ std::map<std::string, int64_t> Database::get_expiries(
 
     transaction.commit();
 
-    std::lock_guard lock{deferred_mutex_};
-    if (deferred_.empty())
+    apply_deferred(result, *owner);
+    return result;
+}
+
+std::map<std::string, int64_t> Database::get_all_expiries(const user_pubkey& pubkey) {
+    auto conn = db_->conn();
+
+    std::map<std::string, int64_t> result;
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
         return result;
-    for (auto& [hash, exp] : result)
-        if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == *owner)
-            exp = std::max(exp, it->second.expiry);
+
+    auto st = conn.prepared_st("SELECT hash, expiry FROM messages WHERE owner = ? AND expiry > ?");
+    for (auto& [hash, exp] :
+         get_all<std::string, int64_t>(st, *owner, to_epoch_ms(std::chrono::system_clock::now())))
+        result.emplace(std::move(hash), exp);
+
+    apply_deferred(result, *owner);
     return result;
 }
 

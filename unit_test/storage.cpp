@@ -469,6 +469,35 @@ TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]
     CHECK(updated == updates{{long1, now + 2h}, {long2, now + 2h}});
 }
 
+TEST_CASE("storage - all of an account's expiries", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    using expiries = std::map<std::string, int64_t>;
+    const auto now = std::chrono::system_clock::now();
+    const auto ns2 = namespace_id{2};
+
+    REQUIRE(storage.store({pk1, "a1", namespace_id::Default, now, now + 1h, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk1, "a2", ns2, now, now + 2h, "data"}) == StoreResult::New);
+    // Expired but not yet cleaned up
+    REQUIRE(storage.store({pk1, "gone", namespace_id::Default, now - 2h, now - 1min, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk2, "b1", namespace_id::Default, now, now + 3h, "data"}) ==
+            StoreResult::New);
+
+    CHECK(storage.get_all_expiries(pk1) ==
+          expiries{{"a1", to_epoch_ms(now + 1h)}, {"a2", to_epoch_ms(now + 2h)}});
+    CHECK(storage.get_all_expiries(pk2) == expiries{{"b1", to_epoch_ms(now + 3h)}});
+    CHECK(storage.get_all_expiries(nobody).empty());
+}
+
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     StorageDeleter fixture;
 
@@ -744,6 +773,8 @@ TEST_CASE("storage - deferred expiry extensions", "[storage][expiry]") {
         CHECK(stored("h1") == exp_ms(base));
         CHECK(storage.get_expiries(pk, hashes{"h1", "h2"}) ==
               expiries{{"h1", exp_ms(base + 5min)}, {"h2", exp_ms(base)}});
+        CHECK(storage.get_all_expiries(pk) ==
+              expiries{{"h1", exp_ms(base + 5min)}, {"h2", exp_ms(base)}, {"h3", exp_ms(base)}});
 
         // Repeats go into the same entry
         updated = storage.update_expiry(pk, hashes{"h1"}, std::array{base + 10min}, true);

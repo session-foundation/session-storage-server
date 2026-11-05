@@ -678,9 +678,9 @@ struct expire_msgs final : recursive {
 ///   convert to the given `pubkey` value (without the `05` prefix).
 /// - `subaccount`/`subaccount_sig` - see `store` for details.  Only subaccounts with the `read` bit
 ///   set in the token may invoke this endpoint.
-/// - `messages` -- array of message hash strings (as provided by the storage server) to update.
+/// - `messages` -- array of message hash strings (as provided by the storage server) to look up.
 ///   Messages can be from any namespace(s).  You may pass a single message id of "all" to retrieve
-///   the timestamps of all
+///   the expiries of all of the account's messages, in every namespace.
 /// - `timestamp` -- the timestamp at which this request was initiated, in milliseconds since unix;
 ///   must with ±60s of the current time (as with other signature timestamps, using the server time
 ///   is recommended).

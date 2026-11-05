@@ -1007,6 +1007,9 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
         return;
     }
 
+    if (w.failed_batch)
+        return;
+
     if (w.exhausted) {
         if (w.in_flight == 0)
             finish();
@@ -1082,26 +1085,37 @@ void ServiceNode::on_dump_batch_reply(
     auto& w = it->second;
     const auto& [pk, swarm] = key;
 
+    auto b = w.batches.find(last_id);
+    if (b == w.batches.end())
+        return;
     if (!ok) {
+        if (!w.failed_batch)
+            log::info(
+                    logcat,
+                    "Dump batch to {} failed; resuming once the rest of its window resolves",
+                    pk);
+        w.failed_batch = std::min(last_id, w.failed_batch.value_or(last_id));
+    }
+    if (--b->second > 0)
+        return;
+    w.in_flight--;
+
+    while (!w.batches.empty() && w.batches.begin()->second == 0 &&
+           !(w.failed_batch && w.batches.begin()->first >= *w.failed_batch)) {
+        w.next_id = w.batches.begin()->first + 1;
+        w.batches.erase(w.batches.begin());
+    }
+
+    if (w.failed_batch && w.in_flight == 0) {
         log::info(
                 logcat,
-                "Dump batch to {} failed; resuming from message id {} in {}",
+                "Resuming dump to {} from message id {} in {}",
                 pk,
                 w.next_id,
                 DUMP_RETRY_DELAY);
         db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
         dump_windows_.erase(it);
         return;
-    }
-
-    auto b = w.batches.find(last_id);
-    if (b == w.batches.end() || --b->second > 0)
-        return;
-    w.in_flight--;
-
-    while (!w.batches.empty() && w.batches.begin()->second == 0) {
-        w.next_id = w.batches.begin()->first + 1;
-        w.batches.erase(w.batches.begin());
     }
     db->update_dump(pk, swarm, w.next_id, {});
 
@@ -1627,15 +1641,10 @@ void ServiceNode::check_retry_requests() {
             return false;
 
         auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
-            // We cleanup the request in all situations except timeout (timeout
-            // indicating that the node was non-responsive, maybe offline). In an error
-            // state we don't know what state the recipient's storage server is in and
-            // we default to deleting it and ending the retry attempts.
-            rpc::SNStorageCCResult store_result =
-                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
-            if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+            // In an error state we don't know what state the recipient's storage server is in,
+            // so we default to deleting the request and ending the retry attempts.
+            if (!rpc::interpret_sn_storage_cc_response_parts(success, parts).retryable())
                 db->remove_node_retry_request(req_id);
-            }
         };
         sn_request(*ct, "storage_cc", {cmd, payload}, on_request_done, RETRY_REQUEST_TIMEOUT);
         return true;

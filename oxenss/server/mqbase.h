@@ -176,13 +176,18 @@ class MQBase {
     using sn_reply_callback = std::function<void(bool success, std::vector<std::string> parts)>;
     using sn_fallback = std::function<void(std::vector<std::string> parts)>;
 
+    // The failure part of a request refused without being sent because too much is already queued
+    // for the node; see sn_request.
+    static constexpr std::string_view SN_STREAM_FULL = "STREAMFULL";
+
     // Sends node-to-node request `cmd` ("data", "data_ready", "storage_cc" or "onion_request")
     // with the given message parts to `ct` over this transport, if this transport carries
     // node-to-node traffic with that node; otherwise hands the parts to `fallback`, which tries
     // the next transport (the default does only that: no such traffic).  The decision, and so
     // `fallback`, may happen later on another thread.  Whatever the transport, the reply reaches
-    // `cb` in oxenmq's shape: `success` is false on timeout (with parts {"TIMEOUT"}), otherwise
-    // the parts are the reply body, or [code, reason] for a refused storage_cc or a hop reply.
+    // `cb` in oxenmq's shape: `success` is false on failure, with parts {"TIMEOUT"} for a timeout
+    // or {SN_STREAM_FULL} for a request refused for the node's backlog; otherwise the parts are the
+    // reply body, or [code, reason] for a refused storage_cc or a hop reply.
     virtual void sn_request(
             const snode::contact&,
             std::string_view,

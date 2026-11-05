@@ -73,6 +73,8 @@ struct Response {
 enum class SNStorageCCResultStatus {
     Good,
     Timeout,
+    // Refused unsent because too much is already queued for the peer.
+    StreamFull,
     ErrorCodeReason,
     BadPeerResponse,
 };
@@ -83,6 +85,13 @@ struct SNStorageCCResult {
     SNStorageCCResultStatus status = {};
     std::string_view error_code;
     std::string_view error_reason;
+
+    // True if the request never reached the peer, or got no reply, so is worth sending again.
+    // Otherwise the peer refused it or answered unintelligibly, and would do the same again.
+    bool retryable() const {
+        return status == SNStorageCCResultStatus::Timeout ||
+               status == SNStorageCCResultStatus::StreamFull;
+    }
 };
 
 // Views the string or string_view body inside a Response.  Should only be called when the body

@@ -215,7 +215,10 @@ class ServiceNode {
     // Dumps of our messages to other nodes.  Each dump is a database row holding the persisted
     // cursor (see Database::pending_dump) plus, while it is being sent, one of these tracking the
     // batches in flight.  Batches are acknowledged individually and possibly out of order, so the
-    // persisted cursor advances only across the contiguous prefix of acknowledged batches.
+    // persisted cursor advances only across the contiguous prefix of acknowledged batches.  Once a
+    // batch fails the window sends nothing more, and only once every batch in flight has resolved
+    // does it end, for the dump to resume from the cursor after DUMP_RETRY_DELAY: resending
+    // sooner would queue a second copy behind batches that are still waiting to go out.
     struct dump_window {
         int64_t next_id;       // first id not yet acknowledged; mirrors the database row
         int64_t end_id;        // last id the dump covers
@@ -225,6 +228,8 @@ class ServiceNode {
         bool exhausted = false;            // nothing left to send before end_id
         uint64_t generation;               // tells acks for a discarded window from a restarted one
         int64_t sent_messages = 0;
+        // The lowest failed batch, if any; the cursor stops short of it.
+        std::optional<int64_t> failed_batch{};
     };
     using dump_key = std::pair<crypto::legacy_pubkey, swarm_id_t>;
     std::mutex dumps_mutex_;

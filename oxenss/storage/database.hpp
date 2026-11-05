@@ -98,6 +98,8 @@ class Database {
     void forget_deferred(std::span<const std::pair<namespace_id, std::string>> ns_hashes);
     // Replaces each message's expiry with its deferred extension, where there is one.
     void apply_deferred(std::span<message> msgs);
+    // The same for a hash -> expiry map of the given owner's messages.
+    void apply_deferred(std::map<std::string, int64_t>& expiries, int64_t owner);
     // Removes and returns every deferred extension for the given owner.
     std::vector<std::pair<std::string, deferred_expiry>> take_deferred(int64_t owner);
     // Writes the given (already removed) deferred extensions to the table, never lowering an
@@ -328,6 +330,10 @@ class Database {
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
+
+    // Retrieves the expiries of all of an account's unexpired messages, in every namespace, as a
+    // map of hash -> expiry.
+    std::map<std::string, int64_t> get_all_expiries(const user_pubkey& pubkey);
 
     // Writes the deferred expiry extensions that are due (see update_expiry) to the database, or
     // all of them if `all` is set.  The `Database` instance owner should call this periodically

@@ -125,6 +125,8 @@ QUIC::QUIC(
     omq.add_category("quic", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
     omq.add_category(
             "quicsn", oxenmq::AuthLevel::basic, 2 /*reserved threads*/, 1000 /*max queue*/);
+
+    omq.add_timer([this] { monitors_.remove_expired(); }, Monitors::EXPIRY_SWEEP_INTERVAL);
 }
 
 // A response over the stream's frame size limit would otherwise be dropped with nothing sent,

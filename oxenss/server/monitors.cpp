@@ -258,95 +258,63 @@ std::string Monitors::handle_monitor(std::string_view request, const connection_
     return result;
 }
 
-namespace {
-    // Merges sorted vectors a and b together, returns the sorted, combined vector (but without any
-    // duplicates).  We avoid reallocating the vectors when possible (i.e. if either is a subset of
-    // the other).
-    std::vector<namespace_id> merge_namespaces(
-            std::vector<namespace_id> a, std::vector<namespace_id> b) {
-        // If the first arg of b comes before a, then our only subset case can be b as a superset of
-        // a, so swap arguments so that the subset case always involves `a` as the superset.
-        if (!b.empty() && (a.empty() || b.front() < a.front()))
-            a.swap(b);
-        // Figure out if a is a superset of b (in which case we can just return a):
-        auto ita = a.begin(), itb = b.begin();
-        while (ita != a.end() && itb != b.end()) {
-            if (*itb > *ita)
-                ita++;  // We have an element only in a, which is fine, skip it
-            else if (*itb == *ita) {
-                ita++;  // The element is in both, which is fine.
-                itb++;
-            } else
-                break;  // We found a b that isn't in a, so we don't have a subset.
-        }
-        if (itb == b.end())
-            return a;  // We hit the end of b without any violations above, which means everything
-                       // in b is already in a.
-
-        // Otherwise we need to merge them into a new sorted container c:
-        std::vector<namespace_id> c;
-        ita = a.begin();
-        itb = b.begin();
-        while (ita != a.end() || itb != b.end()) {
-            if (itb == b.end())
-                c.push_back(*ita++);
-            else if (ita == a.end())
-                c.push_back(*itb++);
-            else if (*ita < *itb)
-                c.push_back(*ita++);
-            else if (*ita == *itb) {
-                c.push_back(*ita++);
-                itb++;  // Value is in both vectors, but we only want it once
-            } else
-                c.push_back(*itb++);
-        }
-        return c;
-    }
-}  // namespace
-
 void Monitors::update_monitors(std::vector<subscription>& subs, const connection_id& conn) {
     std::unique_lock lock{monitoring_mutex_};
-    for (auto& [pubkey, pubkey_hex, namespaces, want_data] : subs) {
-        bool found = false;
-        for (auto [it, end] = monitoring_.equal_range(pubkey); it != end; ++it) {
-            auto& mon_data = it->second;
-            if (mon_data.conn == conn) {
-                mon_data.namespaces =
-                        merge_namespaces(std::move(mon_data.namespaces), std::move(namespaces));
-                log::debug(
-                        logcat,
-                        "sub renewed for {} monitoring namespace(s) {}",
-                        pubkey_hex,
-                        fmt::join(mon_data.namespaces, ", "));
-                mon_data.reset_expiry();
-                mon_data.want_data |= want_data;
-                found = true;
-                break;
-            }
-        }
-        if (not found) {
+    for (auto& sub : subs) {
+        auto& [pubkey, pubkey_hex, namespaces, want_data] = sub;
+        if (auto* mon_data = find_monitor(sub, conn)) {
             log::debug(
                     logcat,
-                    "new subscription for {} monitoring namespace(s) {}",
+                    "sub renewed for {} monitoring namespace(s) {}",
                     pubkey_hex,
-                    fmt::join(namespaces, ", "));
-            monitoring_conns_[conn].push_back(pubkey);
-            monitoring_.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(std::move(pubkey)),
-                    std::forward_as_tuple(std::move(namespaces), want_data, conn));
+                    fmt::join(mon_data->namespaces, ", "));
+            mon_data->reset_expiry();
+            continue;
         }
+        log::debug(
+                logcat,
+                "new subscription for {} monitoring namespace(s) {}",
+                pubkey_hex,
+                fmt::join(namespaces, ", "));
+        monitoring_conns_[conn].insert(pubkey);
+        monitoring_.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(std::move(pubkey)),
+                std::forward_as_tuple(std::move(namespaces), want_data, conn));
     }
 }
 
-void Monitors::unindex_monitor(const connection_id& conn, const std::string& account) {
-    auto it = monitoring_conns_.find(conn);
-    if (it == monitoring_conns_.end())
-        return;
-    auto& accounts = it->second;
-    std::erase(accounts, account);
-    if (accounts.empty())
-        monitoring_conns_.erase(it);
+MonitorData* Monitors::find_monitor(const subscription& sub, const connection_id& conn) {
+    for (auto [it, end] = monitoring_.equal_range(sub.pubkey); it != end; ++it) {
+        auto& mon = it->second;
+        if (mon.conn == conn && mon.namespaces == sub.namespaces && mon.want_data == sub.want_data)
+            return &mon;
+    }
+    return nullptr;
+}
+
+bool Monitors::has_monitor(const std::string& account, const connection_id& conn) {
+    for (auto [it, end] = monitoring_.equal_range(account); it != end; ++it)
+        if (it->second.conn == conn)
+            return true;
+    return false;
+}
+
+std::unordered_multimap<std::string, MonitorData>::iterator Monitors::erase_monitor(
+        std::unordered_multimap<std::string, MonitorData>::iterator it) {
+    // Copied: both outlive the erase, which the account only leaves its connection's index after,
+    // and then only if that was the connection's last monitor of it.
+    auto account = it->first;
+    auto conn = it->second.conn;
+    auto next = monitoring_.erase(it);
+
+    if (!has_monitor(account, conn))
+        if (auto cit = monitoring_conns_.find(conn); cit != monitoring_conns_.end()) {
+            cit->second.erase(account);
+            if (cit->second.empty())
+                monitoring_conns_.erase(cit);
+        }
+    return next;
 }
 
 void Monitors::remove_monitors_for(const connection_id& conn) {
@@ -372,6 +340,23 @@ void Monitors::remove_monitors_for(const connection_id& conn) {
     }
 
     monitoring_conns_.erase(conn_it);
+}
+
+void Monitors::remove_expired() {
+    std::unique_lock lock{monitoring_mutex_};
+    auto now = std::chrono::steady_clock::now();
+
+    size_t expired = 0;
+    for (auto it = monitoring_.begin(); it != monitoring_.end();) {
+        if (it->second.expiry < now) {
+            it = erase_monitor(it);
+            ++expired;
+        } else
+            ++it;
+    }
+
+    if (expired)
+        log::debug(logcat, "removed {} expired monitor(s)", expired);
 }
 
 std::vector<std::pair<user_pubkey, std::vector<connection_id>>> Monitors::extract_foreign_monitors(
@@ -411,9 +396,11 @@ std::vector<std::pair<user_pubkey, std::vector<connection_id>>> Monitors::extrac
             auto [it, end] = monitoring_.equal_range(account);
             while (it != end) {
                 conns.push_back(it->second.conn);
-                unindex_monitor(it->second.conn, account);
-                it = monitoring_.erase(it);
+                it = erase_monitor(it);
             }
+            // A connection with several monitors of the account is told once.
+            std::ranges::sort(conns);
+            conns.erase(std::unique(conns.begin(), conns.end()), conns.end());
             if (!conns.empty())
                 dropped.emplace_back(std::move(pk), std::move(conns));
         }
@@ -458,20 +445,25 @@ void Monitors::drop_foreign_monitors() {
 
 void Monitors::notify_message(const message& m) {
     auto pubkey = m.pubkey.prefixed_raw();
-    std::vector<connection_id> relay_to, relay_to_with_data;
+    // Each connection gets one notification however many of its monitors match: with data if any
+    // of them wants it.
+    std::map<connection_id, bool> to_conns;
     {
         auto now = std::chrono::steady_clock::now();
         std::shared_lock lock{monitoring_mutex_};
 
         for (auto [it, end] = monitoring_.equal_range(pubkey); it != end; ++it) {
             const auto& mon_data = it->second;
-            auto& vec = mon_data.want_data ? relay_to_with_data : relay_to;
             if (mon_data.expiry >= now &&
                 std::binary_search(
                         mon_data.namespaces.begin(), mon_data.namespaces.end(), m.msg_namespace))
-                vec.push_back(mon_data.conn);
+                to_conns[mon_data.conn] |= mon_data.want_data;
         }
     }
+
+    std::vector<connection_id> relay_to, relay_to_with_data;
+    for (const auto& [conn, want_data] : to_conns)
+        (want_data ? relay_to_with_data : relay_to).push_back(conn);
 
     if (relay_to.empty() && relay_to_with_data.empty())
         return;

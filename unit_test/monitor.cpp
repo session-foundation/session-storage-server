@@ -14,16 +14,22 @@
 #include <oxenc/hex.h>
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <string>
+#include <unordered_set>
 
 using namespace std::literals;
 
+using nlohmann::json;
 using oxenss::namespace_id;
 using oxenss::user_pubkey;
 using oxenss::server::connection_id;
 using oxenss::server::subscription;
 using oxenss::snode::contact;
 using oxenss::snode::Contacts;
+using oxenss::snode::swarm_id_t;
+using oxenss::snode::swarm_membership;
 
 namespace {
 
@@ -32,6 +38,23 @@ namespace {
 class TestMQ : public oxenss::server::Monitors {
   public:
     TestMQ() : Monitors{nullptr} {}
+
+    static constexpr swarm_id_t OUR_SWARM = 0x1000;
+
+    // Accounts that belong to some other swarm, and which; everything else is ours.
+    std::map<std::string, swarm_id_t> elsewhere;
+
+    oxenmq::OxenMQ omq;
+    Contacts contacts_{omq};
+
+    swarm_membership swarm_for(const user_pubkey& pk) const override {
+        auto it = elsewhere.find(pk.prefixed_raw());
+        return std::pair{
+                it == elsewhere.end() ? OUR_SWARM : it->second,
+                std::set<oxenss::crypto::legacy_pubkey>{}};
+    }
+    swarm_id_t our_swarm_id() const override { return OUR_SWARM; }
+    const Contacts& contacts() const override { return contacts_; }
 
     struct sent {
         std::vector<connection_id> conns;
@@ -48,6 +71,7 @@ class TestMQ : public oxenss::server::Monitors {
     }
 
     using Monitors::extract_foreign_monitors;
+    using Monitors::monitoring_;
     using Monitors::monitoring_conns_;
     using Monitors::update_monitors;
 };
@@ -74,10 +98,62 @@ std::vector<connection_id> notifiers(TestMQ& mq, const std::string& acct) {
     return to;
 }
 
-void subscribe(TestMQ& mq, const std::string& acct, connection_id c) {
+void subscribe(
+        TestMQ& mq,
+        const std::string& acct,
+        connection_id c,
+        bool want_data = false,
+        std::vector<namespace_id> namespaces = {namespace_id::Default}) {
     std::vector<subscription> subs;
-    subs.push_back({acct, oxenc::to_hex(acct), {namespace_id::Default}, false});
+    subs.push_back({acct, oxenc::to_hex(acct), std::move(namespaces), want_data});
     mq.update_monitors(subs, c);
+}
+
+std::vector<namespace_id> ns(std::initializer_list<int16_t> ids) {
+    std::vector<namespace_id> v;
+    for (auto i : ids)
+        v.push_back(namespace_id{i});
+    return v;
+}
+
+// The decoded notifications pushed to `c`.
+std::vector<json> notifications(const TestMQ& mq, const connection_id& c) {
+    std::vector<json> got;
+    for (auto& p : mq.pushed)
+        if (p.command == "notify" && std::ranges::count(p.conns, c))
+            got.push_back(oxenss::bt_to_json(oxenc::bt_dict_consumer{p.body}));
+    return got;
+}
+
+// "Stores" a message for `acct`, pushing its notifications.
+oxenss::message store(
+        TestMQ& mq,
+        const std::string& acct,
+        std::string hash,
+        std::string data = "data",
+        namespace_id ns = namespace_id::Default) {
+    auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now());
+    oxenss::message m;
+    m.pubkey.load(acct);
+    m.hash = std::move(hash);
+    m.msg_namespace = ns;
+    m.timestamp = now;
+    m.expiry = now + 1h;
+    m.data = std::move(data);
+    mq.notify_message(m);
+    return m;
+}
+
+// The hashes of the notifications pushed to `c`, in order, clearing what was pushed.
+std::vector<std::string> notified_hashes(TestMQ& mq, const connection_id& c) {
+    std::vector<std::string> hashes;
+    for (auto& p : mq.pushed)
+        if (p.command == "notify" && std::ranges::count(p.conns, c))
+            hashes.push_back(
+                    oxenss::bt_to_json(oxenc::bt_dict_consumer{p.body}).at("h").get<std::string>());
+    mq.pushed.clear();
+    return hashes;
 }
 
 // Returns the accounts still in the monitoring table, by running an extraction that keeps
@@ -203,7 +279,7 @@ TEST_CASE("monitor - renewing a subscription doesn't duplicate its index entry",
     subscribe(mq, a, q1);
     subscribe(mq, a, q1);
 
-    CHECK(mq.monitoring_conns_[q1] == std::vector{a});
+    CHECK(mq.monitoring_conns_[q1] == std::unordered_set{a});
 }
 
 TEST_CASE("monitor - the connection index follows swarm-change removals", "[monitor]") {
@@ -220,7 +296,7 @@ TEST_CASE("monitor - the connection index follows swarm-change removals", "[moni
     REQUIRE(dropped.size() == 1);
 
     REQUIRE(mq.monitoring_conns_.count(q1) == 1);
-    CHECK(mq.monitoring_conns_[q1] == std::vector{ours});
+    CHECK(mq.monitoring_conns_[q1] == std::unordered_set{ours});
 
     // Losing the last of a connection's accounts takes the connection out of the index rather than
     // leaving an empty entry behind.
@@ -269,4 +345,125 @@ TEST_CASE("monitor - swarm encodings for an unknown swarm", "[monitor][swarm]") 
     CHECK(as_bt == as_json);
     CHECK(as_json["snodes"].empty());
     CHECK(as_json["swarm"] == "ffffffffffffffff");
+}
+
+TEST_CASE("monitor - renewal matches only the identical subscription", "[monitor]") {
+    TestMQ mq;
+    auto a = account(0x11);
+    auto monitors = [&] {
+        std::vector<std::pair<std::vector<namespace_id>, bool>> v;
+        for (auto& [acct, mon] : mq.monitoring_)
+            v.emplace_back(mon.namespaces, mon.want_data);
+        std::ranges::sort(v);
+        return v;
+    };
+
+    // Same account, connection, namespaces and data flag: a renewal.
+    subscribe(mq, a, conn(1), true);
+    subscribe(mq, a, conn(1), true);
+    CHECK(monitors() == decltype(monitors()){{ns({0}), true}});
+
+    // A different data flag, namespace set or connection is another monitor alongside.
+    subscribe(mq, a, conn(1));
+    subscribe(mq, a, conn(1), true, ns({0, 1}));
+    subscribe(mq, a, conn(2), true);
+    CHECK(mq.monitoring_.size() == 4);
+    CHECK(monitors() ==
+          decltype(monitors()){
+                  {ns({0}), false}, {ns({0}), true}, {ns({0}), true}, {ns({0, 1}), true}});
+}
+
+TEST_CASE("monitor - a superseded namespace set expires on its own", "[monitor]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    subscribe(mq, a, conn(1), false, ns({0}));
+    for (auto& [acct, mon] : mq.monitoring_)
+        mon.expiry = std::chrono::steady_clock::now() + 1min;
+    subscribe(mq, a, conn(1), false, ns({0, 1}));
+    REQUIRE(mq.monitoring_.size() == 2);
+
+    // Nothing is unioned into the old one: it keeps its namespaces and its sooner expiry.
+    for (auto& [acct, mon] : mq.monitoring_)
+        if (mon.namespaces == ns({0}))
+            mon.expiry = std::chrono::steady_clock::now() - 1s;
+    mq.remove_expired();
+    REQUIRE(mq.monitoring_.size() == 1);
+    CHECK(mq.monitoring_.begin()->second.namespaces == ns({0, 1}));
+    // The connection still has a monitor of the account, so the account stays in its index.
+    CHECK(mq.monitoring_conns_[conn(1)] == std::unordered_set{a});
+    store(mq, a, "h", "data", namespace_id{1});
+    CHECK(notified_hashes(mq, conn(1)) == std::vector<std::string>{"h"});
+}
+
+TEST_CASE("monitor - monitors with disjoint namespaces deliver each their own", "[monitor][body]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    subscribe(mq, a, conn(1), false, ns({1, 2, 3}));
+    subscribe(mq, a, conn(1), true, ns({4, 5, 6}));
+
+    store(mq, a, "in 2", "two", namespace_id{2});
+    auto got = notifications(mq, conn(1));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("h") == "in 2");
+    CHECK_FALSE(got[0].contains("~"));
+    mq.pushed.clear();
+
+    store(mq, a, "in 5", "five", namespace_id{5});
+    got = notifications(mq, conn(1));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("~") == "five");
+    mq.pushed.clear();
+
+    store(mq, a, "in 7", "seven", namespace_id{7});
+    CHECK(mq.pushed.empty());
+}
+
+TEST_CASE("monitor - a swarm change tells each connection once", "[monitor]") {
+    TestMQ mq;
+    auto moved = account(0x22);
+    subscribe(mq, moved, conn(1), false, ns({0}));
+    subscribe(mq, moved, conn(1), false, ns({1}));
+    subscribe(mq, moved, conn(2));
+    mq.elsewhere[moved] = 0x2000;
+    mq.drop_foreign_monitors();
+    REQUIRE(mq.pushed.size() == 1);
+    CHECK(mq.pushed[0].conns == std::vector{conn(1), conn(2)});
+    CHECK(mq.monitoring_.empty());
+    CHECK(mq.monitoring_conns_.empty());
+}
+
+TEST_CASE(
+        "monitor - overlapping monitors give one notification per connection", "[monitor][body]") {
+    auto a = account(0x11);
+    auto body_for = [&](std::vector<bool> data) {
+        TestMQ m;
+        int16_t i = 0;
+        // Distinct namespace sets, all including 0, so that each is its own monitor.
+        for (bool d : data)
+            subscribe(m, a, conn(1), d, ns({0, ++i}));
+        REQUIRE(m.monitoring_.size() == data.size());
+        store(m, a, "h", "0123456789");
+        auto got = notifications(m, conn(1));
+        REQUIRE(got.size() == 1);
+        return got[0];
+    };
+
+    // Data if any of them wants it.
+    CHECK(body_for({false, true}).at("~") == "0123456789");
+    CHECK(body_for({true, false}).at("~") == "0123456789");
+    CHECK_FALSE(body_for({false, false}).contains("~"));
+
+    // Other connections are on their own.
+    TestMQ mq;
+    subscribe(mq, a, conn(1), true, ns({0}));
+    subscribe(mq, a, conn(1), false, ns({0, 1}));
+    subscribe(mq, a, conn(2), false, ns({0}));
+    store(mq, a, "h", "x");
+    auto one = notifications(mq, conn(1)), two = notifications(mq, conn(2));
+    REQUIRE(one.size() == 1);
+    REQUIRE(two.size() == 1);
+    CHECK(one[0].contains("~"));
+    CHECK_FALSE(two[0].contains("~"));
 }

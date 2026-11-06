@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -81,9 +82,16 @@ class Monitors {
     // Handles a `monitor` request arriving on `conn`, returning the reply body.  See
     // QUIC::handle_monitor_message for the request and reply formats.
     //
-    // `conn` is used to uniquely identify the connection: if we get a subsequent subscription
-    // request from the same `conn`, we merge it into the existing subscription(s).
+    // `conn` identifies the connection: a subscription identical to one it already has renews that
+    // monitor, and any other adds one.
     std::string handle_monitor(std::string_view request, const connection_id& conn);
+
+    // How often `remove_expired` should be called.
+    static constexpr auto EXPIRY_SWEEP_INTERVAL = 1min;
+
+    // Removes expired monitors.  A connection can hold any number of them, as each distinct
+    // subscription is a monitor of its own, so those it stops renewing have to be swept away.
+    void remove_expired();
 
     // Removes every monitor subscription belonging to `conn`, for a connection that has gone away.
     void remove_monitors_for(const connection_id& conn);
@@ -115,9 +123,19 @@ class Monitors {
 
     void update_monitors(std::vector<subscription>& subs, const connection_id& conn);
 
-    // Drops `account` from `conn`'s entry in `monitoring_conns_`.  Must be called with
-    // `monitoring_mutex_` held for writing.
-    void unindex_monitor(const connection_id& conn, const std::string& account);
+    // These three must be called with `monitoring_mutex_` held for writing.
+
+    // Erases a monitor from `monitoring_`, keeping its connection's reverse index up to date;
+    // returns the iterator following it.
+    std::unordered_multimap<std::string, MonitorData>::iterator erase_monitor(
+            std::unordered_multimap<std::string, MonitorData>::iterator it);
+
+    // The monitor that `sub` renews for `conn`, if any: the one with the same account,
+    // connection, namespaces and data flag.
+    MonitorData* find_monitor(const subscription& sub, const connection_id& conn);
+
+    // True if `conn` has any monitor of `account`.
+    bool has_monitor(const std::string& account, const connection_id& conn);
 
     // Removes every monitor subscription whose account `still_ours` rejects, returning the dropped
     // accounts along with the connections that had been subscribed to each.
@@ -141,7 +159,7 @@ class Monitors {
     //
     // Guarded by `monitoring_mutex_` along with `monitoring_` itself so that the two cannot drift
     // apart.
-    std::map<connection_id, std::vector<std::string>> monitoring_conns_;
+    std::map<connection_id, std::unordered_set<std::string>> monitoring_conns_;
 
     mutable std::shared_mutex monitoring_mutex_;
 

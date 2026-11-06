@@ -319,24 +319,19 @@ class QUIC : public MQBase {
     /// - z -- the expiry (milliseconds since unix epoch) of the message.
     /// - ~ -- the message data, if requested.
     ///
-    /// Note: if the same connection submits multiple simultaneous subscriptions then the subsequent
-    /// subscriptions add to earlier subscriptions.  This has some implications:
+    /// Each subscription is a monitor of its own, identified by its account, the connection it
+    /// belongs to, its namespace list and its data flag (`d`).  A subscription identical in all
+    /// four to an existing monitor renews it, resetting its expiry.  Any other subscription creates
+    /// a new monitor alongside the existing ones.  Monitors are never merged: one whose namespace
+    /// list has been superseded by a later subscription keeps its own namespaces and expiry, and
+    /// simply expires if not renewed.  All pubkey/subaccount/ed25519 pubkeys that access the same
+    /// account count as the same account.
     ///
-    /// - The caller only receives one notification on the connection for a matching message from
-    ///   any of the matching subscription requests on that same connection.
-    /// - All pubkey/subaccount/ed25519 pubkeys that access the same account are treated as the same
-    ///   subscription.
-    /// - The data key (`~`) will be present in a notification if *any* subscription request for the
-    ///   same account on the same connection requested data.  Same a flag only expires when the
-    ///   subscription itself expires, but, like namespaces, persists as long as the subscription is
-    ///   renewed (even if the renewals no longer request data).
-    /// - Subscription renewal will renew all subscribed namespaces for that connection.  This *may*
-    ///   extend the subscription of some namespaces (e.g. if you subscribe to namespaces 0 and 1,
-    ///   then stop subscribing to namespace 1 but keep renewing a subscription to ns 0 on the same
-    ///   connection for the same account).
-    ///
-    /// Thus any code that is managing subscriptions for multiple end clients should take care to
-    /// check the namespace/data values and only pass it on if actually desired by a client.
+    /// A message is delivered once per connection, however many of its monitors match it (that is,
+    /// are for the message's account and include its namespace).  The notification carries data
+    /// (`~`) if any of the matching monitors wants data.  Thus any code that is managing
+    /// subscriptions for multiple end clients should take care to check the namespace/data values
+    /// and only pass it on if actually desired by a client.
     ///
     /// A subscription can also be terminated by the service node before it expires, which happens
     /// when the account stops being one that this node stores (because this node moved swarm, or

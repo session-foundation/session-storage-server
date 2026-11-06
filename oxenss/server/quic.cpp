@@ -42,7 +42,8 @@ QUIC::QUIC(
         const transport_options& opts) :
         tls_creds{quic::GNUTLSCreds::make_from_ed_seckey(sk.str())},
         congestion_control{opts.congestion_control},
-        request_handler{rh} {
+        request_handler{rh},
+        monitors_{*this, snode} {
     service_node_ = &snode;
     request_handler_ = &rh;
     rate_limiter_ = &rl;
@@ -331,7 +332,7 @@ void QUIC::on_conn_established(quic::Connection& c) {
 void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
     // A closed connection never comes back, so its monitor subscriptions can never deliver
     // anything again.
-    remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+    monitors_.remove_monitors_for(std::pair{ep_idx, c.reference_id()});
 
     auto pk = sn_key(c);
     if (!pk)
@@ -674,12 +675,8 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
 
 void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
 
-    auto body = msg.body();
-    auto refid = msg.stream()->reference_id;
-    handle_monitor(
-            body,
-            [msg = std::move(msg)](std::string response) { msg.respond(std::move(response)); },
-            std::pair{ep_idx, refid});
+    msg.respond(
+            monitors_.handle_monitor(msg.body(), std::pair{ep_idx, msg.stream()->reference_id}));
 }
 
 void QUIC::handle_ping(quic::message msg) {
@@ -913,7 +910,9 @@ nlohmann::json QUIC::wrap_response(
 }
 
 void QUIC::send_notification(
-        std::vector<connection_id>& conns, std::string command, std::string_view notification) {
+        const std::vector<connection_id>& conns,
+        std::string command,
+        std::string_view notification) {
     if (conns.empty())
         return;
 
@@ -935,12 +934,12 @@ void QUIC::send_notification(
     });
 }
 
-void QUIC::notify(std::vector<connection_id>& conns, std::string_view notification) {
-    send_notification(conns, "notify", notification);
+void QUIC::notify_message(const message& m) {
+    monitors_.notify_message(m);
 }
 
-void QUIC::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
-    send_notification(conns, "monitor_ended", notification);
+void QUIC::drop_foreign_monitors() {
+    monitors_.drop_foreign_monitors();
 }
 
 void QUIC::reachability_test(std::shared_ptr<snode::sn_test> test) {

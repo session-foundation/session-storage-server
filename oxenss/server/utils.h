@@ -19,9 +19,6 @@ namespace oxenss {
 // place this here so we can use it in oxenss::*
 using namespace std::literals;
 
-// {pubkey (bytes), pubkey (hex), namespaces, want_data}
-using sub_info = std::tuple<std::string, std::string, std::vector<namespace_id>, bool>;
-
 oxenc::bt_value json_to_bt(nlohmann::json j);
 
 nlohmann::json bt_to_json(oxenc::bt_dict_consumer d);

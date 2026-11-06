@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utils.h"
+#include "monitors.h"
 #include "mqbase.h"
 
 #include <oxenss/crypto/keys.h>
@@ -113,9 +114,9 @@ class QUIC : public MQBase {
     // Anything asked of this object after this is dropped, without a reply or fallback.
     void shutdown();
 
-    void notify(std::vector<connection_id>&, std::string_view notification) override;
+    void notify_message(const message& m) override;
 
-    void notify_monitor_ended(std::vector<connection_id>&, std::string_view notification) override;
+    void drop_foreign_monitors() override;
 
     void reachability_test(std::shared_ptr<snode::sn_test> test) override;
 
@@ -139,7 +140,9 @@ class QUIC : public MQBase {
     // Fire-and-forget push of `notification` to each quic connection in `conns`, as a `command`
     // on the connection's stream 0.
     void send_notification(
-            std::vector<connection_id>& conns, std::string command, std::string_view notification);
+            const std::vector<connection_id>& conns,
+            std::string command,
+            std::string_view notification);
 
     std::shared_ptr<quic::TLSCreds> tls_creds;
     std::vector<std::shared_ptr<quic::Endpoint>> endpoints;
@@ -148,6 +151,22 @@ class QUIC : public MQBase {
     quic::opt::congestion_control congestion_control;
 
     rpc::RequestHandler& request_handler;
+
+    class QUICMonitors final : public Monitors {
+        QUIC& quic_;
+
+        void send(
+                const std::vector<connection_id>& conns,
+                std::string_view command,
+                std::string_view body) override {
+            quic_.send_notification(conns, std::string{command}, body);
+        }
+
+      public:
+        QUICMonitors(QUIC& quic, snode::ServiceNode& sn) : Monitors{&sn}, quic_{quic} {}
+    };
+
+    QUICMonitors monitors_;
 
     // Close codes for connections we close deliberately, so that the closed callback can tell them
     // from failures.

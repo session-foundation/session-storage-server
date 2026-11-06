@@ -5,7 +5,7 @@
 #include <oxenss/common/message.h>
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
-#include <oxenss/server/mqbase.h>
+#include <oxenss/server/monitors.h>
 #include <oxenss/server/utils.h>
 #include <oxenss/snode/contacts.h>
 #include <oxenss/snode/swarm.h>
@@ -19,34 +19,37 @@
 using namespace std::literals;
 
 using oxenss::namespace_id;
-using oxenss::sub_info;
 using oxenss::user_pubkey;
 using oxenss::server::connection_id;
+using oxenss::server::subscription;
 using oxenss::snode::contact;
 using oxenss::snode::Contacts;
 
 namespace {
 
-// Exposes just enough of MQBase to drive the monitoring table without a ServiceNode or any
-// transport behind it; `notify_monitor_ended` records what would have gone out on the wire.
-class TestMQ : public oxenss::server::MQBase {
+// Drives the monitoring table without a ServiceNode or any transport behind it: `send` records
+// what would have gone out on the wire.
+class TestMQ : public oxenss::server::Monitors {
   public:
-    std::vector<std::pair<std::vector<connection_id>, std::string>> ended;
+    TestMQ() : Monitors{nullptr} {}
 
-    void notify(std::vector<connection_id>&, std::string_view) override {}
+    struct sent {
+        std::vector<connection_id> conns;
+        std::string command;
+        std::string body;
+    };
+    std::vector<sent> pushed;
 
-    void notify_monitor_ended(
-            std::vector<connection_id>& conns, std::string_view notification) override {
-        ended.emplace_back(conns, std::string{notification});
+    void send(
+            const std::vector<connection_id>& conns,
+            std::string_view command,
+            std::string_view body) override {
+        pushed.push_back({conns, std::string{command}, std::string{body}});
     }
 
-    void reachability_test(std::shared_ptr<oxenss::snode::sn_test>) override {}
-
-    using MQBase::extract_foreign_monitors;
-    using MQBase::handle_monitor;
-    using MQBase::monitoring_conns_;
-    using MQBase::remove_monitors_for;
-    using MQBase::update_monitors;
+    using Monitors::extract_foreign_monitors;
+    using Monitors::monitoring_conns_;
+    using Monitors::update_monitors;
 };
 
 std::string account(unsigned char fill) {
@@ -62,15 +65,18 @@ std::vector<connection_id> notifiers(TestMQ& mq, const std::string& acct) {
     oxenss::message m;
     m.pubkey.load(acct);
     m.msg_namespace = namespace_id::Default;
-    std::vector<connection_id> to, with_data;
-    mq.get_notifiers(m, to, with_data);
+    mq.pushed.clear();
+    mq.notify_message(m);
+    std::vector<connection_id> to;
+    for (auto& p : mq.pushed)
+        to.insert(to.end(), p.conns.begin(), p.conns.end());
+    mq.pushed.clear();
     return to;
 }
 
 void subscribe(TestMQ& mq, const std::string& acct, connection_id c) {
-    std::vector<sub_info> subs;
-    subs.emplace_back(
-            acct, oxenc::to_hex(acct), std::vector<namespace_id>{namespace_id::Default}, false);
+    std::vector<subscription> subs;
+    subs.push_back({acct, oxenc::to_hex(acct), {namespace_id::Default}, false});
     mq.update_monitors(subs, c);
 }
 
@@ -145,7 +151,7 @@ TEST_CASE("monitor - extraction keeps everything when nothing is foreign", "[mon
 
     CHECK(dropped.empty());
     CHECK(remaining(mq).size() == 2);
-    CHECK(mq.ended.empty());
+    CHECK(mq.pushed.empty());
 }
 
 TEST_CASE("monitor - a wrong-sized p= pubkey is rejected outright", "[monitor]") {
@@ -159,8 +165,7 @@ TEST_CASE("monitor - a wrong-sized p= pubkey is rejected outright", "[monitor]")
     req.append("p", "too short");
     auto request = std::move(req).str();
 
-    std::string reply;
-    mq.handle_monitor(request, [&reply](std::string r) { reply = std::move(r); }, conn(1));
+    auto reply = mq.handle_monitor(request, conn(1));
 
     // The error must be the only thing in the response: carrying on past a bad pubkey reaches the
     // signature check with a short key, and appends a second errcode to this same dict.

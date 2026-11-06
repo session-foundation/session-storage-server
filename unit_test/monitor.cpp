@@ -6,6 +6,7 @@
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
 #include <oxenss/server/monitors.h>
+#include <oxenss/server/serial_runs.h>
 #include <oxenss/server/utils.h>
 #include <oxenss/snode/contacts.h>
 #include <oxenss/snode/swarm.h>
@@ -542,4 +543,38 @@ TEST_CASE("monitor - a successful subscription reports its expiry", "[monitor]")
     CHECK(r[0] == json{{"success", 1}, {"x", 3900}});
     CHECK(r[1] == json{{"errcode", 2}, {"error", "Provided p= pubkey must be 33 bytes"}});
     CHECK(r[2] == json{{"success", 1}, {"x", 3900}});
+}
+
+TEST_CASE("serial runs - a key's items run one after another in order", "[monitor]") {
+    using runs = oxenss::server::serial_runs<int, std::string>;
+    runs r;
+    std::string first = "first", second = "second", third = "third", other = "other";
+
+    CHECK_FALSE(r.running(1));
+    CHECK(r.add(1, first) == runs::added::run);
+    CHECK(r.running(1));
+    CHECK(r.add(1, second) == runs::added::queued);
+    CHECK(r.add(1, third) == runs::added::queued);
+    // Other keys are independent.
+    CHECK(r.add(2, other) == runs::added::run);
+
+    CHECK(r.next(1) == std::deque<std::string>{"second", "third"});
+    CHECK(r.running(1));
+    CHECK(r.next(1).empty());
+    CHECK_FALSE(r.running(1));
+    CHECK(r.running(2));
+
+    // Only so many can wait.
+    std::string x = "x";
+    CHECK(r.add(3, x) == runs::added::run);
+    for (size_t i = 0; i < runs::MAX_WAITING; i++) {
+        std::string item = "item";
+        CHECK(r.add(3, item) == runs::added::queued);
+    }
+    CHECK(r.add(3, x) == runs::added::full);
+
+    // A forgotten key's run is over, whatever was waiting.
+    r.forget(3);
+    CHECK_FALSE(r.running(3));
+    CHECK(r.next(3).empty());
 }

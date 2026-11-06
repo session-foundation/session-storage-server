@@ -32,8 +32,16 @@ const snode::Contacts& Monitors::contacts() const {
     return std::as_const(*service_node_).contacts();
 }
 
-void Monitors::handle_monitor_message_single(
-        oxenc::bt_dict_consumer d, oxenc::bt_dict_producer& out, std::vector<subscription>& subs) {
+namespace {
+    // The encoded reply dict for a monitor subscription that failed.
+    std::string error_reply(MonitorResponse r, std::string message) {
+        oxenc::bt_dict_producer out;
+        monitor_error(out, r, std::move(message));
+        return std::move(out).str();
+    }
+}  // namespace
+
+std::variant<subscription, std::string> Monitors::parse_subscription(oxenc::bt_dict_consumer d) {
 
     // Values we receive, in bt-dict order:
     std::string_view ed_pk;                         // P (ed25519 pubkey only for session ids)
@@ -50,8 +58,7 @@ void Monitors::handle_monitor_message_single(
         if (d.skip_until("P")) {
             ed_pk = d.consume_string_view();
             if (ed_pk.size() != 32)
-                return monitor_error(
-                        out,
+                return error_reply(
                         MonitorResponse::BAD_PUBKEY,
                         "Provided P= Session Ed25519 pubkey must be 32 bytes");
         }
@@ -62,8 +69,7 @@ void Monitors::handle_monitor_message_single(
             if (auto sig = d.consume_string_view(); sig.size() == subacc->signature.size())
                 std::memcpy(subacc->signature.data(), sig.data(), sig.size());
             else
-                return monitor_error(
-                        out,
+                return error_reply(
                         MonitorResponse::BAD_PUBKEY,
                         "Provided S subaccount signature must be {} bytes"_format(
                                 subacc->signature.size()));
@@ -72,8 +78,7 @@ void Monitors::handle_monitor_message_single(
                 token.size() == SUBACCOUNT_TOKEN_LENGTH)
                 std::memcpy(subacc->token.token.data(), token.data(), token.size());
             else
-                return monitor_error(
-                        out,
+                return error_reply(
                         MonitorResponse::BAD_PUBKEY,
                         "Provided T subaccount token must be {} bytes"_format(
                                 SUBACCOUNT_TOKEN_LENGTH));
@@ -91,8 +96,7 @@ void Monitors::handle_monitor_message_single(
             if (nsi > namespaces.back())
                 namespaces.push_back(nsi);
             else
-                return monitor_error(
-                        out,
+                return error_reply(
                         MonitorResponse::BAD_NS,
                         "Invalid n= namespace list: namespaces must be ascending");
         }
@@ -104,31 +108,29 @@ void Monitors::handle_monitor_message_single(
                 throw std::runtime_error{"Cannot provide both p= and P= pubkey values"};
             pubkey = d.consume_string();
             if (pubkey.size() != 33)
-                return monitor_error(
-                        out, MonitorResponse::BAD_PUBKEY, "Provided p= pubkey must be 33 bytes");
+                return error_reply(
+                        MonitorResponse::BAD_PUBKEY, "Provided p= pubkey must be 33 bytes");
         } else if (ed_pk.empty()) {
             throw std::runtime_error{"Either p= or P= must be given"};
         }
 
         signature = d.require<std::string_view>("s");
         if (signature.size() != 64)
-            return monitor_error(
-                    out, MonitorResponse::BAD_SIG, "Provided s= signature must be 64 bytes");
+            return error_reply(MonitorResponse::BAD_SIG, "Provided s= signature must be 64 bytes");
 
         if (!d.skip_until("t"))
             throw std::runtime_error{"required signature timestamp is missing"};
         timestamp = std::chrono::seconds{d.consume_integer<int64_t>()};
 
     } catch (const std::exception& ex) {
-        return monitor_error(out, MonitorResponse::BAD_ARGS, "Invalid arguments: "s + ex.what());
+        return error_reply(MonitorResponse::BAD_ARGS, "Invalid arguments: "s + ex.what());
     }
 
     // Make sure the sig timestamp isn't too old or too new
     auto now = std::chrono::system_clock::now();
     auto ts = std::chrono::system_clock::time_point(timestamp);
     if (bool too_old = ts < now - 14 * 24h; too_old || ts > now + 24h) {
-        return monitor_error(
-                out,
+        return error_reply(
                 MonitorResponse::BAD_TS,
                 "Invalid t= signature timestamp: timestamp is "s +
                         (too_old ? "too old" : "in the future"));
@@ -142,7 +144,7 @@ void Monitors::handle_monitor_message_single(
                     reinterpret_cast<unsigned char*>(pubkey.data() + 1),
                     reinterpret_cast<const unsigned char*>(ed_pk.data()));
             rc != 0)
-            return monitor_error(out, MonitorResponse::BAD_PUBKEY, "Invalid P= ed25519 public key");
+            return error_reply(MonitorResponse::BAD_PUBKEY, "Invalid P= ed25519 public key");
     } else {
         // No Session Ed25519, so assume the pubkey (without prefix byte) is Ed25519
         ed_pk = pubkey;
@@ -159,7 +161,7 @@ void Monitors::handle_monitor_message_single(
         } catch (const std::exception& ex) {
             auto m = "Subaccount verification failed: {}"_format(ex.what());
             log::warning(logcat, "{}", m);
-            return monitor_error(out, MonitorResponse::BAD_SIG, m);
+            return error_reply(MonitorResponse::BAD_SIG, m);
         }
         auto sub_pk = subacc->token.pubkey();
         verify_key = std::string_view{reinterpret_cast<const char*>(sub_pk.data()), sub_pk.size()};
@@ -181,13 +183,13 @@ void Monitors::handle_monitor_message_single(
                      sig_msg.size(),
                      reinterpret_cast<const unsigned char*>(verify_key.data()))) {
         log::debug(logcat, "monitor signature verification failed");
-        return monitor_error(out, MonitorResponse::BAD_SIG, "Signature verification failed");
+        return error_reply(MonitorResponse::BAD_SIG, "Signature verification failed");
     }
 
     user_pubkey account;
     if (!account.load(pubkey))
-        return monitor_error(
-                out, MonitorResponse::BAD_PUBKEY, "Provided p= pubkey is not a valid account");
+        return error_reply(
+                MonitorResponse::BAD_PUBKEY, "Provided p= pubkey is not a valid account");
 
     // Knowing no swarms at all is not the same as knowing the account is someone else's: we have
     // no swarm to redirect the subscriber to, and this is most likely a transient gap in our oxend
@@ -196,8 +198,7 @@ void Monitors::handle_monitor_message_single(
     auto swarm = swarm_for(account);
     if (!swarm) {
         log::debug(logcat, "monitor: no swarms known, cannot place {}", pubkey_hex);
-        return monitor_error(
-                out,
+        return error_reply(
                 MonitorResponse::NO_SWARM_INFO,
                 "Service node does not currently know the swarm list");
     }
@@ -206,60 +207,83 @@ void Monitors::handle_monitor_message_single(
     // hand back the swarm that does store it (the same information a 421 would carry).
     if (swarm->first != our_swarm_id()) {
         log::debug(logcat, "monitor: {} is not stored by this swarm", pubkey_hex);
+        oxenc::bt_dict_producer out;
         monitor_error(
                 out,
                 MonitorResponse::WRONG_SWARM,
                 "Account is not stored by this service node's swarm");
         snode::swarm_to_bt(out, swarm, contacts());
-        return;
+        return std::move(out).str();
     }
 
-    subs.emplace_back(std::move(pubkey), std::move(pubkey_hex), std::move(namespaces), want_data);
-    out.append("success", 1);
-}
-
-void Monitors::handle_monitor_message_single(
-        oxenc::bt_dict_consumer d, oxenc::bt_dict_producer&& out, std::vector<subscription>& subs) {
-    handle_monitor_message_single(d, out, subs);
+    return subscription{std::move(pubkey), std::move(pubkey_hex), std::move(namespaces), want_data};
 }
 
 std::string Monitors::handle_monitor(std::string_view request, const connection_id& conn) {
     if (request.size() < 2 || !(request.front() == 'd' || request.front() == 'l') ||
         request.back() != 'e')
-        return oxenc::bt_serialize(oxenc::bt_dict{
-                {"errcode", static_cast<int>(MonitorResponse::BAD_ARGS)},
-                {"error",
-                 "Invalid arguments: monitor request takes a single bencoded dict or list "
-                 "parameter"}});
+        return error_reply(
+                MonitorResponse::BAD_ARGS,
+                "Invalid arguments: monitor request takes a single bencoded dict or list "
+                "parameter");
 
-    std::string result;
+    // For each subscription in the request, in order: its error reply if it failed, otherwise its
+    // index in `subs`.
+    std::vector<std::variant<std::string, size_t>> results;
     std::vector<subscription> subs;
+    const bool single = request.front() == 'd';
     try {
-        if (request.front() == 'd') {
-            oxenc::bt_dict_producer out;
-            handle_monitor_message_single(oxenc::bt_dict_consumer{request}, out, subs);
-            result = std::move(out).str();
-        } else {
-            oxenc::bt_list_producer out;
-            oxenc::bt_list_consumer l{request};
-            while (!l.is_finished())
-                handle_monitor_message_single(l.consume_dict_consumer(), out.append_dict(), subs);
-            result = std::move(out).str();
-        }
+        auto parse = [&](oxenc::bt_dict_consumer d) {
+            auto parsed = parse_subscription(std::move(d));
+            if (auto* sub = std::get_if<subscription>(&parsed)) {
+                results.emplace_back(subs.size());
+                subs.push_back(std::move(*sub));
+            } else
+                results.emplace_back(std::move(std::get<std::string>(parsed)));
+        };
+        if (single)
+            parse(oxenc::bt_dict_consumer{request});
+        else
+            for (oxenc::bt_list_consumer l{request}; !l.is_finished();)
+                parse(l.consume_dict_consumer());
     } catch (const std::exception& e) {
-        return oxenc::bt_serialize(oxenc::bt_dict{
-                {"errcode", static_cast<int>(MonitorResponse::BAD_ARGS)},
-                {"error", "Invalid arguments: Failed to parse monitor data value"}});
+        return error_reply(
+                MonitorResponse::BAD_ARGS, "Invalid arguments: Failed to parse monitor data value");
     }
 
+    std::vector<std::chrono::seconds> expiries;
     if (!subs.empty())
-        update_monitors(subs, conn);
+        expiries = update_monitors(subs, conn);
 
-    return result;
+    auto reply = [&](std::variant<std::string, size_t>& result) {
+        if (auto* err = std::get_if<std::string>(&result))
+            return std::move(*err);
+        oxenc::bt_dict_producer out;
+        out.append("success", 1);
+        out.append("x", expiries[std::get<size_t>(result)].count());
+        return std::move(out).str();
+    };
+
+    if (single)
+        return reply(results.front());
+    oxenc::bt_list_producer out;
+    for (auto& result : results)
+        out.append_encoded(reply(result));
+    return std::move(out).str();
 }
 
-void Monitors::update_monitors(std::vector<subscription>& subs, const connection_id& conn) {
+std::vector<std::chrono::seconds> Monitors::update_monitors(
+        std::vector<subscription>& subs, const connection_id& conn) {
+    std::vector<std::chrono::seconds> expiries;
+    expiries.reserve(subs.size());
     std::unique_lock lock{monitoring_mutex_};
+    // Taken before any expiry is set, so that a freshly renewed monitor counts as the whole
+    // MONITOR_EXPIRY_TIME rather than a second short of it.
+    const auto now = std::chrono::steady_clock::now();
+    auto until = [&now](const MonitorData& mon) {
+        return std::chrono::duration_cast<std::chrono::seconds>(mon.expiry - now);
+    };
+
     for (auto& sub : subs) {
         auto& [pubkey, pubkey_hex, namespaces, want_data] = sub;
         if (auto* mon_data = find_monitor(sub, conn)) {
@@ -269,6 +293,7 @@ void Monitors::update_monitors(std::vector<subscription>& subs, const connection
                     pubkey_hex,
                     fmt::join(mon_data->namespaces, ", "));
             mon_data->reset_expiry();
+            expiries.push_back(until(*mon_data));
             continue;
         }
         log::debug(
@@ -277,11 +302,13 @@ void Monitors::update_monitors(std::vector<subscription>& subs, const connection
                 pubkey_hex,
                 fmt::join(namespaces, ", "));
         monitoring_conns_[conn].insert(pubkey);
-        monitoring_.emplace(
+        auto it = monitoring_.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(std::move(pubkey)),
                 std::forward_as_tuple(std::move(namespaces), want_data, conn));
+        expiries.push_back(until(it->second));
     }
+    return expiries;
 }
 
 MonitorData* Monitors::find_monitor(const subscription& sub, const connection_id& conn) {

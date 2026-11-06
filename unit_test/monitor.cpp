@@ -11,6 +11,7 @@
 #include <oxenss/snode/swarm.h>
 
 #include <oxenc/bt.h>
+#include <sodium.h>
 #include <oxenc/hex.h>
 
 #include <algorithm>
@@ -123,6 +124,43 @@ std::vector<json> notifications(const TestMQ& mq, const connection_id& c) {
         if (p.command == "notify" && std::ranges::count(p.conns, c))
             got.push_back(oxenss::bt_to_json(oxenc::bt_dict_consumer{p.body}));
     return got;
+}
+
+// A signing key and the 0x03-prefixed account it owns.
+struct test_key {
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES], sk[crypto_sign_SECRETKEYBYTES];
+    test_key() { crypto_sign_keypair(pk, sk); }
+    std::string account() const {
+        return "\x03"s + std::string{reinterpret_cast<const char*>(pk), sizeof(pk)};
+    }
+};
+
+// A signed `monitor` subscription dict for namespace 0, with `extra` keys merged in.
+std::string signed_monitor_request(
+        const test_key& key, bool data, std::map<std::string, oxenc::bt_value> extra = {}) {
+    auto ts = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    auto account = key.account();
+    auto sig_msg = "MONITOR{}{}{}0"_format(oxenc::to_hex(account), ts, data ? 1 : 0);
+    std::string sig(crypto_sign_BYTES, '\0');
+    crypto_sign_detached(
+            reinterpret_cast<unsigned char*>(sig.data()),
+            nullptr,
+            reinterpret_cast<const unsigned char*>(sig_msg.data()),
+            sig_msg.size(),
+            key.sk);
+    oxenc::bt_dict req{
+            {"n", oxenc::bt_list{0}},
+            {"p", account},
+            {"s", sig},
+            {"t", ts},
+    };
+    if (data)
+        req["d"] = 1;
+    for (auto& [k, v] : extra)
+        req[k] = std::move(v);
+    return oxenc::bt_serialize(req);
 }
 
 // "Stores" a message for `acct`, pushing its notifications.
@@ -347,6 +385,15 @@ TEST_CASE("monitor - swarm encodings for an unknown swarm", "[monitor][swarm]") 
     CHECK(as_json["swarm"] == "ffffffffffffffff");
 }
 
+TEST_CASE("monitor - unknown subscription keys are ignored", "[monitor]") {
+    TestMQ mq;
+    test_key key;
+
+    auto reply = mq.handle_monitor(
+            signed_monitor_request(key, false, {{"a", 1}, {"e", "x"}, {"zz", 2}}), conn(1));
+    CHECK(reply == "d7:successi1e1:xi3900ee");
+}
+
 TEST_CASE("monitor - renewal matches only the identical subscription", "[monitor]") {
     TestMQ mq;
     auto a = account(0x11);
@@ -466,4 +513,33 @@ TEST_CASE(
     REQUIRE(two.size() == 1);
     CHECK(one[0].contains("~"));
     CHECK_FALSE(two[0].contains("~"));
+}
+
+TEST_CASE("monitor - a successful subscription reports its expiry", "[monitor]") {
+    TestMQ mq;
+    test_key key, other;
+
+    auto decode = [](const std::string& r) {
+        return r.front() == 'l' ? oxenss::bt_to_json(oxenc::bt_list_consumer{r})
+                                : oxenss::bt_to_json(oxenc::bt_dict_consumer{r});
+    };
+
+    auto r = decode(mq.handle_monitor(signed_monitor_request(key, false), conn(1)));
+    CHECK(r == json{{"success", 1}, {"x", 3900}});
+
+    // A renewal pushes the expiry back out to the full time.
+    for (auto& [acct, mon] : mq.monitoring_)
+        mon.expiry = std::chrono::steady_clock::now() + 100s;
+    r = decode(mq.handle_monitor(signed_monitor_request(key, true), conn(1)));
+    CHECK(r == json{{"success", 1}, {"x", 3900}});
+
+    // In a list each entry gets its own result, and only the successful ones an expiry.
+    oxenc::bt_dict bad_pubkey{{"n", oxenc::bt_list{0}}, {"p", "too short"}};
+    auto list = "l" + signed_monitor_request(other, false) + oxenc::bt_serialize(bad_pubkey) +
+                signed_monitor_request(key, false) + "e";
+    r = decode(mq.handle_monitor(list, conn(2)));
+    REQUIRE(r.size() == 3);
+    CHECK(r[0] == json{{"success", 1}, {"x", 3900}});
+    CHECK(r[1] == json{{"errcode", 2}, {"error", "Provided p= pubkey must be 33 bytes"}});
+    CHECK(r[2] == json{{"success", 1}, {"x", 3900}});
 }

@@ -286,6 +286,9 @@ class QUIC : public MQBase {
     /// list will be the same length with the ith element corresponding to the ith element of the
     /// input.
     /// - success -- included on successful subscription and set to the integer 1
+    /// - x -- included on successful subscription: the number of seconds until the subscription
+    ///   (as renewed by this request) expires, so that the subscriber need not assume the 65
+    ///   minutes.
     /// - errcode -- a numeric error value indicating the failure.  Currently implemented are:
     ///   - 1 -- invalid arguments -- called for invalid data (e.g. wrong encoding, wrong value
     ///     type, or a missing required parameter)

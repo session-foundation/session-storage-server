@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <oxen/quic/connection_ids.hpp>
@@ -121,7 +122,10 @@ class Monitors {
     virtual snode::swarm_id_t our_swarm_id() const;
     virtual const snode::Contacts& contacts() const;
 
-    void update_monitors(std::vector<subscription>& subs, const connection_id& conn);
+    // Adds or renews a monitor for each of `subs`, returning how long each one now has until it
+    // expires.
+    std::vector<std::chrono::seconds> update_monitors(
+            std::vector<subscription>& subs, const connection_id& conn);
 
     // These three must be called with `monitoring_mutex_` held for writing.
 
@@ -166,14 +170,9 @@ class Monitors {
   private:
     snode::ServiceNode* service_node_;
 
-    void handle_monitor_message_single(
-            oxenc::bt_dict_consumer d,
-            oxenc::bt_dict_producer& out,
-            std::vector<subscription>& subs);
-    void handle_monitor_message_single(
-            oxenc::bt_dict_consumer d,
-            oxenc::bt_dict_producer&& out,
-            std::vector<subscription>& subs);
+    // Validates one subscription dict of a `monitor` request, returning either the subscription or
+    // the encoded reply dict saying why it failed.
+    std::variant<subscription, std::string> parse_subscription(oxenc::bt_dict_consumer d);
 };
 
 }  // namespace oxenss::server

@@ -6,6 +6,7 @@
 #include <oxenss/common/namespace.h>
 #include <oxenss/common/pubkey.h>
 #include <oxenss/server/monitors.h>
+#include <oxenss/server/replay_owners.h>
 #include <oxenss/server/serial_runs.h>
 #include <oxenss/server/utils.h>
 #include <oxenss/snode/contacts.h>
@@ -577,4 +578,30 @@ TEST_CASE("serial runs - a key's items run one after another in order", "[monito
     r.forget(3);
     CHECK_FALSE(r.running(3));
     CHECK(r.next(3).empty());
+}
+
+TEST_CASE("replay owners - only the newest replay paces a connection", "[monitor]") {
+    oxenss::server::replay_owners<int> owners;
+
+    // Replay 1 paces connection 7, and finishing turns its pacing off.
+    CHECK(owners.claim(7, 1));
+    CHECK(owners.claim(7, 1));
+    CHECK(owners.release(7, 1));
+    CHECK_FALSE(owners.release(7, 1));
+
+    // Replay 3 starts while replay 2 is still going: 2 is superseded, and its chunks and its end
+    // touch nothing of 3's.
+    CHECK(owners.claim(7, 2));
+    CHECK(owners.claim(7, 3));
+    CHECK_FALSE(owners.claim(7, 2));
+    CHECK_FALSE(owners.release(7, 2));
+    CHECK(owners.claim(7, 3));
+    CHECK(owners.release(7, 3));
+    // Even after 3 is done, 2 stays superseded.
+    CHECK_FALSE(owners.claim(7, 2));
+
+    // Connections are independent, and a forgotten one starts afresh.
+    CHECK(owners.claim(8, 2));
+    owners.forget(7);
+    CHECK(owners.claim(7, 2));
 }

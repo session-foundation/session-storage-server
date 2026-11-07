@@ -577,9 +577,9 @@ void ServiceNode::check_new_members() {
     }
 }
 
-void ServiceNode::send_notifies(const message& msg) {
+void ServiceNode::send_notifies(const message& msg, int64_t id) {
     for (auto* s : mq_servers_)
-        s->notify_message(msg);
+        s->notify_message(msg, id);
 }
 
 bool ServiceNode::process_store(
@@ -598,12 +598,13 @@ bool ServiceNode::process_store(
     all_stats_.bump_store_requests();
 
     /// store in the database (if not already present)
-    const auto result = db->store(msg, expiry);
+    int64_t id = 0;
+    const auto result = db->store(msg, expiry, &id);
     if (new_msg)
         *new_msg = result == StoreResult::New;
 
     if (result == StoreResult::New)
-        send_notifies(msg);
+        send_notifies(msg, id);
 
     return result != StoreResult::Full;
 }

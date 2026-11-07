@@ -60,9 +60,10 @@ class MQBase {
     }
 
   public:
-    /// Pushes a notification for the newly stored message `m` to the subscribers monitoring its
-    /// account.  The default does nothing: only the QUIC server carries monitors.
-    virtual void notify_message(const message&) {}
+    /// Pushes a notification for the newly stored message `m`, whose database row id is `id`, to
+    /// the subscribers monitoring its account.  The default does nothing: only the QUIC server
+    /// carries monitors.
+    virtual void notify_message(const message&, int64_t /*id*/) {}
 
     /// Terminates every monitor subscription for an account this node no longer serves; see
     /// Monitors::drop_foreign_monitors.  Must be called after a swarm update has taken effect.  The

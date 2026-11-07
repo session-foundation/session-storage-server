@@ -3,6 +3,8 @@
 #include "utils.h"
 #include "monitors.h"
 #include "mqbase.h"
+#include "replay_owners.h"
+#include "serial_runs.h"
 
 #include <oxenss/crypto/keys.h>
 #include <oxenss/logging/oxen_logger.h>
@@ -12,6 +14,7 @@
 #include <oxen/quic/btstream.hpp>
 #include <oxen/quic/endpoint.hpp>
 
+#include <atomic>
 #include <unordered_map>
 
 namespace oxenss::rpc {
@@ -114,7 +117,7 @@ class QUIC : public MQBase {
     // Anything asked of this object after this is dropped, without a reply or fallback.
     void shutdown();
 
-    void notify_message(const message& m) override;
+    void notify_message(const message& m, int64_t id) override;
 
     void drop_foreign_monitors() override;
 
@@ -137,6 +140,20 @@ class QUIC : public MQBase {
     quic::Loop loop{};
 
   private:
+    // Pushes `notify` with each of `bodies` to `conn` for replay `replay`, then posts `on_drained`
+    // (if given) to a worker once the stream has written them all into packets: it waits on the
+    // stream's unsent buffer watermarks, which this alone uses on a client stream (and switches off
+    // when given no `on_drained`).  Nothing is sent or posted if the connection is gone, or a
+    // newer replay has started on it (see replay_owners).
+    void send_paced(
+            const connection_id& conn,
+            uint64_t replay,
+            std::vector<std::string> bodies,
+            std::function<void()> on_drained);
+
+    // Which of `conns` no longer exist, asked of the loop (so not to be called on it).
+    std::vector<connection_id> gone_connections(std::vector<connection_id> conns);
+
     // Fire-and-forget push of `notification` to each quic connection in `conns`, as a `command`
     // on the connection's stream 0.
     void send_notification(
@@ -161,6 +178,20 @@ class QUIC : public MQBase {
                 std::string_view body) override {
             quic_.send_notification(conns, std::string{command}, body);
         }
+
+        void send_paced(
+                const connection_id& conn,
+                uint64_t replay,
+                std::vector<std::string> bodies,
+                std::function<void()> on_drained) override {
+            quic_.send_paced(conn, replay, std::move(bodies), std::move(on_drained));
+        }
+
+        std::vector<connection_id> gone_connections(std::vector<connection_id> conns) override {
+            return quic_.gone_connections(std::move(conns));
+        }
+
+        void run_later(std::function<void()> f) override;
 
       public:
         QUICMonitors(QUIC& quic, snode::ServiceNode& sn) : Monitors{&sn}, quic_{quic} {}
@@ -206,6 +237,24 @@ class QUIC : public MQBase {
     std::unordered_map<crypto::ed25519_pubkey, std::chrono::steady_clock::time_point> sn_bidir_;
     // Outbound connections being established, with the callbacks waiting for them.
     std::unordered_map<crypto::ed25519_pubkey, std::vector<sn_conn_callback>> pending_sn_conns_;
+
+    // Each connection's monitor_session requests, and the monitor ones arriving behind them, run
+    // one at a time in arrival order; see handle_request.
+    serial_runs<connection_id, quic::message> session_runs_;
+
+    // Which replay paces each client connection's notifications; see send_paced.
+    replay_owners<connection_id> replay_owners_;
+
+    // Session request jobs queued but not yet started, across all connections, and the most there
+    // may be: oxenmq jobs are never dropped, so beyond this requests are answered with an error
+    // instead of queueing without bound.  (Each connection can also have at most
+    // serial_runs::MAX_WAITING waiting behind the one it has queued.)
+    std::atomic<size_t> session_jobs_{0};
+    static constexpr size_t MAX_SESSION_JOBS = 10'000;
+
+    // Hands `msgs`, monitor and monitor_session requests of `conn`, to a worker to handle in order,
+    // then carries on with any that have arrived on it meanwhile.
+    void run_session_requests(const connection_id& conn, std::deque<quic::message> reqs);
 
     bool has_sn_conn(const crypto::ed25519_pubkey& pk) const;
 
@@ -279,7 +328,11 @@ class QUIC : public MQBase {
     ///
     /// If the request validates then the connection is subscribed (for 65 minutes) to new incoming
     /// messages in the given namespace(s).  A caller should renew subscriptions periodically by
-    /// re-submitting the subscription request (with at most 1h between re-subscriptions).
+    /// re-submitting the subscription request (with at most 1h between re-subscriptions).  The
+    /// subscription ends when the connection closes, unless the connection is bound to a session
+    /// (see `handle_monitor_session`), in which case it is attached to the session instead: it then
+    /// outlives the connection, and its notifications go to whichever connection the session is
+    /// bound to.
     ///
     /// The reply to the subscription request is either a bencoded dict or list of dicts containing
     /// the following keys.  In the case of a list of subscriptions in the request, the returned
@@ -315,26 +368,32 @@ class QUIC : public MQBase {
     /// - @ -- the account pubkey, in bytes (33).  This is the actual account value, regardless of
     ///   which of `p`/`P`/`S` was used in the request.  (The dict key is a symbol so that it sorts
     ///   first in the encoded data).
+    /// - L -- the full size of the message data, in bytes; included only when `~` was cut short or
+    ///   left out because of a session's `b` limit (see `handle_monitor_session`), so its presence
+    ///   signals that `~` is not the whole message.  When the data fits the notification is the
+    ///   same as without a limit.
     /// - h -- the message hash
     /// - n -- the message namespace (-32768 to 32767)
     /// - t -- the message timestamp (milliseconds since unix epoch), as provided by the client who
     ///   deposited the message.
     /// - z -- the expiry (milliseconds since unix epoch) of the message.
-    /// - ~ -- the message data, if requested.
+    /// - ~ -- the message data, if requested (and as much of it as a session's `b` allows).
     ///
-    /// Each subscription is a monitor of its own, identified by its account, the connection it
-    /// belongs to, its namespace list and its data flag (`d`).  A subscription identical in all
-    /// four to an existing monitor renews it, resetting its expiry.  Any other subscription creates
-    /// a new monitor alongside the existing ones.  Monitors are never merged: one whose namespace
-    /// list has been superseded by a later subscription keeps its own namespaces and expiry, and
-    /// simply expires if not renewed.  All pubkey/subaccount/ed25519 pubkeys that access the same
-    /// account count as the same account.
+    /// Each subscription is a monitor of its own, identified by its account, the connection (or
+    /// session) it belongs to, its namespace list and its data flag (`d`).  A subscription
+    /// identical in all four to an existing monitor renews it, resetting its expiry.  Any other
+    /// subscription creates a new monitor alongside the existing ones.  Monitors are never
+    /// merged: one whose namespace list has been superseded by a later subscription keeps its own
+    /// namespaces and expiry, and simply expires if not renewed.  All pubkey/subaccount/ed25519
+    /// pubkeys that access the same account count as the same account.
     ///
-    /// A message is delivered once per connection, however many of its monitors match it (that is,
-    /// are for the message's account and include its namespace).  The notification carries data
-    /// (`~`) if any of the matching monitors wants data.  Thus any code that is managing
-    /// subscriptions for multiple end clients should take care to check the namespace/data values
-    /// and only pass it on if actually desired by a client.
+    /// A message is delivered once per connection (or session), however many of its monitors match
+    /// it (that is, are for the message's account and include its namespace).  The notification
+    /// carries data (`~`) if any of the matching monitors wants data: in full to a connection, and
+    /// limited by the session's `b` (see `handle_monitor_session`) through a session.  A `b` key in
+    /// a subscription is ignored, like any other key not listed above.  Thus any code that is
+    /// managing subscriptions for multiple end clients should take care to check the namespace/data
+    /// values and only pass it on if actually desired by a client.
     ///
     /// A subscription can also be terminated by the service node before it expires, which happens
     /// when the account stops being one that this node stores (because this node moved swarm, or
@@ -352,9 +411,121 @@ class QUIC : public MQBase {
     ///
     /// No notification is sent for a subscription that simply expires, nor when this node no
     /// longer knows of any swarms at all (in which case it has nowhere to redirect the client).
+    /// A session subscription that ends while no connection is bound to the session is not
+    /// notified either: it is kept, and reported as ended when the session is next resumed (unless
+    /// it has expired by then, in which case it is simply gone).
     ///
     /// Note that the client should accept (and ignore) unknown keys, to allow for future expansion.
     void handle_monitor_message(quic::message msg, size_t ep_idx);
+
+    /// Handles a `monitor_session` request, which starts or resumes a monitor session.  A session
+    /// is for a bulk subscriber that wants its monitors kept across connections: it holds monitors
+    /// (attached by `monitor` requests on a connection bound to it) that outlive any one
+    /// connection, so that a subscriber whose connection drops can reconnect and resume the session
+    /// rather than resubscribing to every account.  A subscriber wanting a session calls this
+    /// before its first `monitor` on each connection, but need not wait for the reply: a
+    /// `monitor_session`, and every `monitor` or `monitor_session` arriving on the connection while
+    /// one is being handled, are handled one at a time in the order they arrive, so a `monitor`
+    /// sent after it on the same stream is attached to the session.  Requests on different streams
+    /// are not ordered with respect to each other (they need not arrive in the order sent), so a
+    /// `monitor` sent on another stream must wait for the reply.  At most 64 such requests can wait
+    /// behind one being handled; any more get an error response, as do requests arriving while
+    /// the node has 10,000 connections' worth of them queued.  It should be sent on the
+    /// connection's first stream, the one notifications arrive on, as only there is the reply
+    /// ordered ahead of the replayed notifications that follow it.
+    ///
+    /// The request body is a bt-encoded dict with keys:
+    /// - b -- (optional) the most bytes of message data to send in any notification through this
+    ///   session (for monitors that want data at all).  A message whose data is larger has it cut
+    ///   to its first `b` bytes, or left out entirely when `b` is 0, and its notification then also
+    ///   carries `L`.  Without it there is no limit.  Like `m`, each request sets it afresh: a
+    ///   resume without `b` lifts the limit.
+    /// - l -- (optional) 1 (the default) to list the session's live monitors in the reply, 0 to
+    ///   list only the ones that have ended.  A bulk subscriber that keeps its own record of what
+    ///   it subscribed to, and when it last renewed each, can get everything else it needs from
+    ///   that and save the listing's 100 or so bytes per monitor.
+    /// - m -- (optional) the most missed notifications (see below) to replay for any one account,
+    ///   at least 1: on a resume, only each account's newest `m` (across all of its namespaces) are
+    ///   replayed, and the rest reported in the reply's `m`.  It applies only to the request that
+    ///   gives it; without it everything missed is replayed.
+    /// - t -- (optional) a session token previously issued by this node.
+    ///
+    /// If `t` names a live session, the session is resumed: the token is the only credential, so
+    /// this works from any connection, whatever QUIC key (if any) it presents.  Any other
+    /// connection still bound to it is unbound from it (it stays open, but no longer receives the
+    /// session's notifications), and this one is bound to it. Otherwise a new session with no
+    /// monitors is created and bound to this connection; omitting `t` is how a subscriber
+    /// deliberately starts clean.  In either case any
+    /// other session that was bound to this connection is unbound from it, as a connection is bound
+    /// to at most one session.  Every reply issues a new token: the one given in `t` is no longer
+    /// valid.
+    ///
+    /// The reply is a bt-encoded dict with keys:
+    /// - t -- the session's new 32-byte token.
+    /// - r -- 1 if an existing session was resumed, 0 if a new one was created.
+    /// - s -- a list (empty when `r` is 0) of the accounts whose monitors ended while the session
+    ///   had no connection, followed, unless `l` was 0, by the session's live monitors, as one dict
+    ///   each:
+    ///   - for an account whose monitors ended because the account is no longer stored by this
+    ///     node (listed once, however many monitors it had): `@`, the account, in bytes (33), and
+    ///     `errcode`, `error`, `snodes` and `swarm`, as in a `monitor_ended` notification.  It is
+    ///     forgotten once reported.
+    ///   - for each live monitor (so an account with several appears several times): `@`, and
+    ///     - x -- seconds until the monitor expires.  Resuming does not extend it: monitors are
+    ///       only renewed by `monitor` requests.
+    ///     - d, n -- the monitor's data flag (0 or 1) and namespace list, as subscribed.
+    /// - m -- a dict of the accounts for which the request's `m` cut missed notifications from the
+    ///   replay, keyed by account (in bytes, so in byte order), each holding a list of one dict per
+    ///   namespace that had any cut, in namespace order, with keys `n` (the namespace) and `o` (how
+    ///   many were cut there).  Always present; empty when nothing was cut.
+    ///
+    /// A request that cannot be met gets a dict with `errcode` and `error` instead (as `monitor`
+    /// does for a subscription), and changes nothing:
+    /// - 1 -- the request is malformed (anything other than a bt-encoded dict of the keys above).
+    ///
+    /// A reply too large for a single response frame (a session of more than about 100,000
+    /// monitors, listed with `l` 1) is replaced by an error response; the session is resumed (and
+    /// its token rotated) all the same.
+    ///
+    /// The session is changed (started or resumed, bound to this connection and its token rotated)
+    /// all at once.  If the connection has closed by the time the request is handled, nothing is
+    /// changed and no reply is sent, so the token given still resumes the session.  A reply lost in
+    /// transit after that (the connection failing just then) orphans the session: the
+    /// subscriber's token is no longer valid, and it treats the node as it would a new session.
+    ///
+    /// While no connection is bound to a session, each message that would have been notified to it
+    /// is noted instead, as where the replay of its account's namespace has to start: the session
+    /// keeps, for each (account, namespace) with a missed message, the lowest place in this node's
+    /// database to replay from, so what it holds does not grow with the number of messages.  And
+    /// as a connection can die some time before this node notices (at most an idle timeout, 63
+    /// seconds), the notifications sent through it in the 90 seconds before the session lost it
+    /// are noted the same way, as possibly never received; likewise when a session is resumed on
+    /// another connection while still bound to the old one.  So a resume can repeat notifications
+    /// that did arrive, but never leaves out one that might not have: subscribers should expect
+    /// duplicates, and recognise them by message hash.
+    ///
+    /// After the reply to a resume, the messages from those places on that are still stored are
+    /// sent, each account's namespace in turn and oldest first (the order across them is
+    /// unspecified), as ordinary `notify` commands as they would have been sent live: with data if
+    /// the session's monitors matching the message wanted it, and limited by the `b` given in the
+    /// resuming request.  This includes messages that arrived after the subscriber went, and
+    /// messages of accounts reported as ended in the reply.  Messages that have since expired or
+    /// been deleted are not sent, nor counted in `m`. The replay goes 64 messages at a time, each
+    /// batch only once the connection has sent the one before on, so a long replay does not crowd
+    /// out the connection.  What it has sent counts as sent through the connection (so is replayed
+    /// again if the connection turns out to have died), and what it has yet to send stays with the
+    /// session: if the connection closes, or the session is resumed again, the next resume carries
+    /// on from there. The session is bound to the connection as the reply is composed, so
+    /// notifications for messages arriving from then on are sent as they arrive, and may be
+    /// delivered before the reply as well as before replayed ones; likewise a `monitor_ended` for
+    /// one of the session's monitors, which is then not listed in `s`.
+    ///
+    /// A session lives while it is bound to a connection, and for 10 minutes after
+    /// (SESSION_DETACHED_LIFETIME) once it is not: a session that has had no connection for that
+    /// long is removed whole (its monitors, what it missed, and its token).  Its monitors do not
+    /// expire while it has no connection, as its subscriber cannot renew them while away; while it
+    /// is bound they expire as any do, unless renewed, and the session lives on without them.
+    void handle_monitor_session(quic::message msg, size_t ep_idx);
 
     void handle_ping(quic::message msg);
 

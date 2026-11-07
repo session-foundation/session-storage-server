@@ -210,6 +210,8 @@ void QUIC::shutdown() {
         // Streams are deleted through their endpoint's job queue, so the registry, which holds
         // them directly and through its connections, has to go before the endpoints do.
         pending_sn_conns_.clear();
+        session_runs_.clear();
+        replay_owners_.clear();
         sn_bidir_.clear();
         sn_streams_.clear();
         sn_conns_.clear();
@@ -332,9 +334,13 @@ void QUIC::on_conn_established(quic::Connection& c) {
 }
 
 void QUIC::on_conn_closed(quic::Connection& c, uint64_t ec, size_t ep_idx) {
-    // A closed connection never comes back, so its monitor subscriptions can never deliver
-    // anything again.
-    monitors_.remove_monitors_for(std::pair{ep_idx, c.reference_id()});
+    // A closed connection never comes back, so its own monitor subscriptions can never deliver
+    // anything again; a session bound to it waits for its subscriber to resume it elsewhere.  On a
+    // worker, as this takes the monitoring lock, which the loop must never wait for.
+    const connection_id closed{ep_idx, c.reference_id()};
+    session_runs_.forget(closed);
+    replay_owners_.forget(closed);
+    service_node_->omq_server()->job([this, closed] { monitors_.connection_closed(closed); });
 
     auto pk = sn_key(c);
     if (!pk)
@@ -676,9 +682,53 @@ std::shared_ptr<quic::BTRequestStream> QUIC::sn_stream(
 }
 
 void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
-
     msg.respond(
             monitors_.handle_monitor(msg.body(), std::pair{ep_idx, msg.stream()->reference_id}));
+}
+
+void QUIC::handle_monitor_session(quic::message msg, size_t ep_idx) {
+    monitors_.handle_monitor_session(
+            msg.body(),
+            std::pair{ep_idx, msg.stream()->reference_id},
+            [this, &msg](std::string reply) {
+                // Via the loop's main queue, which the replayed notifications that follow also go
+                // through: responding directly would queue the reply on the stream's own job queue,
+                // which the loop runs in no particular order relative to the main one.
+                loop.call([msg, reply = std::move(reply)] { respond_within_limit(msg, reply); });
+            });
+}
+
+void QUIC::run_session_requests(const connection_id& conn, std::deque<quic::message> reqs) {
+    if (session_jobs_ >= MAX_SESSION_JOBS) {
+        log::debug(logcat, "Refusing {} monitor request(s): too many queued", reqs.size());
+        for (auto& m : reqs)
+            m.respond("Too many monitor session requests queued; try again later", true);
+        // We are on the loop, where the connection's run continues.
+        if (auto more = session_runs_.next(conn); !more.empty())
+            run_session_requests(conn, std::move(more));
+        return;
+    }
+    ++session_jobs_;
+    // A job rather than an injected task, which is dropped when its category's queue is full: that
+    // would leave the subscriber without a reply and the connection's run waiting forever.
+    service_node_->omq_server()->job(
+            [this, conn, reqs = std::make_shared<std::deque<quic::message>>(std::move(reqs))] {
+                --session_jobs_;
+                for (auto& m : *reqs) {
+                    try {
+                        if (m.endpoint() == "monitor_session")
+                            handle_monitor_session(std::move(m), conn.first);
+                        else
+                            handle_monitor_message(std::move(m), conn.first);
+                    } catch (const std::exception& e) {
+                        log::error(logcat, "Exception handling a monitor request: {}", e.what());
+                    }
+                }
+                loop.call([this, conn] {
+                    if (auto more = session_runs_.next(conn); !more.empty())
+                        run_session_requests(conn, std::move(more));
+                });
+            });
 }
 
 void QUIC::handle_ping(quic::message msg) {
@@ -704,9 +754,26 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
         if (!peer || !(name == "snode_ping" || name == "data" || name == "data_ready" ||
                        name == "storage_cc" || name == "onion_request"))
             throw quic::no_such_endpoint{};
-    } else if (!(name == "snode_ping" || name == "monitor" || name == "onion_req" ||
-                 rpc::RequestHandler::client_rpc_endpoints.contains(name)))
+    } else if (!(name == "snode_ping" || name == "monitor" || name == "monitor_session" ||
+                 name == "onion_req" || rpc::RequestHandler::client_rpc_endpoints.contains(name)))
         throw quic::no_such_endpoint{};
+
+    // The stream hands us its requests in order, but the tasks below run concurrently, and a
+    // `monitor` sent right behind `monitor_session` must land in the session.  So a connection's
+    // monitor_session, and every monitor or monitor_session arriving while one is being handled,
+    // are handled one at a time in arrival order instead; anything else stays concurrent.
+    if (!peer && (name == "monitor_session" || name == "monitor")) {
+        const connection_id cid{ep_idx, msg.stream()->reference_id};
+        if (name == "monitor_session" || session_runs_.running(cid)) {
+            switch (session_runs_.add(cid, msg)) {
+                case decltype(session_runs_)::added::run:
+                    return run_session_requests(cid, {std::move(msg)});
+                case decltype(session_runs_)::added::queued: return;
+                case decltype(session_runs_)::added::full:
+                    return msg.respond("Too many monitor requests waiting", true);
+            }
+        }
+    }
 
     // We handle everything inside an inject task because if we do *anything* that requires
     // `sn_mutex_` we could deadlock (because the `open_stream` we do in reachability testing is
@@ -936,8 +1003,69 @@ void QUIC::send_notification(
     });
 }
 
-void QUIC::notify_message(const message& m) {
-    monitors_.notify_message(m);
+void QUIC::send_paced(
+        const connection_id& conn,
+        uint64_t replay,
+        std::vector<std::string> bodies,
+        std::function<void()> on_drained) {
+    loop.call([this,
+               conn,
+               replay,
+               bodies = std::move(bodies),
+               on_drained = std::move(on_drained)]() mutable {
+        if (endpoints.empty())
+            return;  // shut down; see shutdown()
+        auto c = endpoints[conn.first]->get_conn(conn.second);
+        auto str = c ? c->get_stream<quic::BTRequestStream>(0) : nullptr;
+        if (!str)
+            return;
+        // A superseded replay still sends what it has (taken as sent when it took it), but leaves
+        // the newer one's pacing alone.
+        const bool pacing = (!bodies.empty() || on_drained) && replay_owners_.claim(conn, replay);
+        for (const auto& body : bodies)
+            str->command("notify", body);
+        if ((!bodies.empty() || on_drained) && !pacing)
+            return;
+        if (!on_drained) {
+            if (replay_owners_.release(conn, replay))
+                str->disable_watermarks();
+            return;
+        }
+
+        auto next = [this, on_drained = std::move(on_drained)] {
+            service_node_->omq_server()->job(on_drained);
+        };
+        if (str->unsent() == 0)
+            return next();
+        // The alarm sounds at once (there is something unsent), and clears once everything is
+        // written into packets.  Live notifications can sound it again after that, so the next
+        // chunk is posted only the first time; the next chunk's call replaces the callback.
+        str->enable_watermarks(
+                1, nullptr, 0, [next = std::move(next), posted = false](quic::Stream&) mutable {
+                    if (!std::exchange(posted, true))
+                        next();
+                });
+    });
+}
+
+void QUIC::QUICMonitors::run_later(std::function<void()> f) {
+    quic_.service_node_->omq_server()->job(std::move(f));
+}
+
+std::vector<connection_id> QUIC::gone_connections(std::vector<connection_id> conns) {
+    return loop.call_get([this, &conns] {
+        std::vector<connection_id> gone;
+        if (endpoints.empty())
+            return gone;  // shut down; see shutdown()
+        for (const auto& c : conns)
+            if (c.first >= endpoints.size() || !endpoints[c.first]->get_conn(c.second))
+                gone.push_back(c);
+        return gone;
+    });
+}
+
+void QUIC::notify_message(const message& m, int64_t id) {
+    monitors_.notify_message(m, id);
 }
 
 void QUIC::drop_foreign_monitors() {

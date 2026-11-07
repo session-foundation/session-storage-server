@@ -11,6 +11,7 @@
 #include <oxenss/server/utils.h>
 #include <oxenss/snode/contacts.h>
 #include <oxenss/snode/swarm.h>
+#include <oxenss/utils/time.hpp>
 
 #include <oxenc/bt.h>
 #include <sodium.h>
@@ -18,7 +19,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <map>
+#include <span>
 #include <string>
 #include <unordered_set>
 
@@ -42,6 +45,29 @@ class TestMQ : public oxenss::server::Monitors {
   public:
     TestMQ() : Monitors{nullptr} {}
 
+    // How many (account, namespace) pairs sessions have noted as missed, and still to replay.
+    size_t missed_pairs() const {
+        size_t n = 0;
+        for (auto& [token, s] : sessions_)
+            n += s->missed.size();
+        return n;
+    }
+
+    // Makes every session's recently sent notifications look sent `by` earlier than they were.
+    void age_recent(std::chrono::seconds by) {
+        std::lock_guard lock{missed_mutex_};
+        for (auto& [token, s] : sessions_)
+            for (auto& r : s->recent)
+                r.sent -= by;
+    }
+
+    // Makes the session with token `token`, if detached, look detached `by` longer than it has.
+    void age_session(const std::string& token, std::chrono::seconds by) {
+        auto& s = *sessions_.at(token);
+        REQUIRE(s.detached_since);
+        *s.detached_since -= by;
+    }
+
     static constexpr swarm_id_t OUR_SWARM = 0x1000;
 
     // Accounts that belong to some other swarm, and which; everything else is ours.
@@ -50,7 +76,11 @@ class TestMQ : public oxenss::server::Monitors {
     oxenmq::OxenMQ omq;
     Contacts contacts_{omq};
 
+    // How many times a swarm has been looked up.
+    mutable int swarm_lookups = 0;
+
     swarm_membership swarm_for(const user_pubkey& pk) const override {
+        ++swarm_lookups;
         auto it = elsewhere.find(pk.prefixed_raw());
         return std::pair{
                 it == elsewhere.end() ? OUR_SWARM : it->second,
@@ -58,6 +88,97 @@ class TestMQ : public oxenss::server::Monitors {
     }
     swarm_id_t our_swarm_id() const override { return OUR_SWARM; }
     const Contacts& contacts() const override { return contacts_; }
+
+    // Connections the "transport" no longer has.
+    std::set<connection_id> dead;
+
+    std::vector<connection_id> gone_connections(std::vector<connection_id> conns) override {
+        std::vector<connection_id> gone;
+        for (const auto& c : conns)
+            if (dead.contains(c))
+                gone.push_back(c);
+        return gone;
+    }
+
+    // The messages "in the database", by row id, for missed notification replays.  (Unlike the
+    // database, expiry is not checked: some tests' messages have none.)
+    std::map<int64_t, oxenss::message> rows;
+    int64_t next_id = 1;
+    int lookups = 0;
+
+    // Stores `m` as a new row, returning its id.
+    int64_t add_row(const oxenss::message& m) {
+        rows[next_id] = m;
+        return next_id++;
+    }
+
+    // Deletes the row holding the message with hash `hash`.
+    void delete_message(const std::string& hash) {
+        std::erase_if(rows, [&hash](const auto& r) { return r.second.hash == hash; });
+    }
+
+    size_t largest_lookup = 0;
+
+    std::vector<std::pair<int64_t, oxenss::message>> retrieve_from_id(
+            const user_pubkey& pubkey,
+            namespace_id ns,
+            int64_t from_id,
+            size_t limit,
+            bool newest_first) override {
+        ++lookups;
+        std::vector<std::pair<int64_t, oxenss::message>> found;
+        auto take = [&](const auto& row) {
+            auto& [id, m] = row;
+            if (id >= from_id && m.pubkey == pubkey && m.msg_namespace == ns)
+                found.emplace_back(id, m);
+            return found.size() < limit;
+        };
+        if (newest_first) {
+            for (auto it = rows.rbegin(); it != rows.rend() && take(*it); ++it) {
+            }
+        } else {
+            for (auto it = rows.begin(); it != rows.end() && take(*it); ++it) {
+            }
+        }
+        largest_lookup = std::max(largest_lookup, found.size());
+        return found;
+    }
+
+    int64_t count_id_range(
+            const user_pubkey& pubkey,
+            namespace_id ns,
+            int64_t from_id,
+            int64_t before_id) override {
+        int64_t n = 0;
+        for (auto& [id, m] : rows)
+            if (id >= from_id && id < before_id && m.pubkey == pubkey && m.msg_namespace == ns)
+                ++n;
+        return n;
+    }
+
+    // With `manual_later`, the steps of a paced pass wait here for `run_later_queue()`;
+    // otherwise they run at once.
+    bool manual_later = false;
+    std::deque<std::function<void()>> later;
+
+    void run_later(std::function<void()> f) override {
+        if (manual_later)
+            later.push_back(std::move(f));
+        else
+            f();
+    }
+
+    // Runs the queued steps of paced passes, and any they queue in turn, returning how many ran.
+    int run_later_queue() {
+        int n = 0;
+        while (!later.empty()) {
+            auto f = std::move(later.front());
+            later.pop_front();
+            f();
+            ++n;
+        }
+        return n;
+    }
 
     struct sent {
         std::vector<connection_id> conns;
@@ -73,9 +194,42 @@ class TestMQ : public oxenss::server::Monitors {
         pushed.push_back({conns, std::string{command}, std::string{body}});
     }
 
+    // With `manual_drain`, a paced send's continuation waits here for `drain()`, as for a stream
+    // still sending; otherwise it runs at once, as for one that sends instantly.
+    bool manual_drain = false;
+    std::deque<std::function<void()>> waiting;
+    int paced_ends = 0;
+
+    std::vector<uint64_t> replays;  // the replay id of each paced send
+
+    void send_paced(
+            const connection_id& conn,
+            uint64_t replay,
+            std::vector<std::string> bodies,
+            std::function<void()> on_drained) override {
+        replays.push_back(replay);
+        for (auto& body : bodies)
+            pushed.push_back({{conn}, "notify", std::move(body)});
+        if (!on_drained)
+            ++paced_ends;
+        else if (manual_drain)
+            waiting.push_back(std::move(on_drained));
+        else
+            on_drained();
+    }
+
+    void drain() {
+        REQUIRE(!waiting.empty());
+        auto next = std::move(waiting.front());
+        waiting.pop_front();
+        next();
+    }
+
+    using Monitors::closed_conns_;
     using Monitors::extract_foreign_monitors;
     using Monitors::monitoring_;
     using Monitors::monitoring_conns_;
+    using Monitors::sessions_;
     using Monitors::update_monitors;
 };
 
@@ -93,7 +247,9 @@ std::vector<connection_id> notifiers(TestMQ& mq, const std::string& acct) {
     m.pubkey.load(acct);
     m.msg_namespace = namespace_id::Default;
     mq.pushed.clear();
-    mq.notify_message(m);
+    // An id with no row behind it: only the destinations matter here, and nothing should be
+    // replayed from it.
+    mq.notify_message(m, mq.next_id++);
     std::vector<connection_id> to;
     for (auto& p : mq.pushed)
         to.insert(to.end(), p.conns.begin(), p.conns.end());
@@ -181,7 +337,7 @@ oxenss::message store(
     m.timestamp = now;
     m.expiry = now + 1h;
     m.data = std::move(data);
-    mq.notify_message(m);
+    mq.notify_message(m, mq.add_row(m));
     return m;
 }
 
@@ -206,6 +362,45 @@ std::vector<std::string> remaining(TestMQ& mq) {
     });
     std::ranges::sort(seen);
     return seen;
+}
+
+// Sends a `monitor_session` request on `c`, returning the decoded reply.
+json session_request(TestMQ& mq, connection_id c, std::string_view token = "") {
+    oxenc::bt_dict_producer req;
+    if (!token.empty())
+        req.append("t", token);
+    std::string reply;
+    mq.handle_monitor_session(
+            std::move(req).str(), c, [&reply](std::string r) { reply = std::move(r); });
+    return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+}
+
+// Sends a `monitor_session` request with the given keys on `c`, returning the decoded reply.
+json session_with(TestMQ& mq, connection_id c, oxenc::bt_dict req) {
+    std::string reply;
+    mq.handle_monitor_session(
+            oxenc::bt_serialize(req), c, [&reply](std::string r) { reply = std::move(r); });
+    return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+}
+
+// The `m` dict of a reply, as account -> namespace -> count.
+using discards = std::map<std::string, std::map<int, int>>;
+discards discards_of(const json& r) {
+    discards got;
+    for (auto& [account, list] : r.at("m").items())
+        for (auto& e : list)
+            got[account][e.at("n").get<int>()] = e.at("o").get<int>();
+    return got;
+}
+
+std::string token_of(const json& reply) {
+    return reply.at("t").get<std::string>();
+}
+
+// Makes every monitor in the table look like it expired a second ago.
+void expire_all(TestMQ& mq) {
+    for (auto& [account, mon] : mq.monitoring_)
+        mon.expiry = std::chrono::steady_clock::now() - 1s;
 }
 
 contact dummy_contact(unsigned char fill, uint16_t https_port, uint16_t omq_port) {
@@ -300,7 +495,7 @@ TEST_CASE("monitor - closing a connection drops its subscriptions", "[monitor]")
     subscribe(mq, b, q2);
     subscribe(mq, a, q3);
 
-    mq.remove_monitors_for(q1);
+    mq.connection_closed(q1);
 
     // Both of q1's subscriptions go, and nothing else: not the same account on another
     // connection, nor another connection's subscription to an account q1 was also watching.
@@ -387,6 +582,345 @@ TEST_CASE("monitor - swarm encodings for an unknown swarm", "[monitor][swarm]") 
     CHECK(as_json["swarm"] == "ffffffffffffffff");
 }
 
+TEST_CASE("monitor session - a new session is empty and bound", "[monitor][session]") {
+    TestMQ mq;
+
+    auto r = session_request(mq, conn(1));
+    CHECK(r.at("r") == 0);
+    CHECK(r.at("m").empty());
+    CHECK_FALSE(r.contains("o"));
+    CHECK(r.at("s").empty());
+    CHECK(token_of(r).size() == 32);
+
+    // Monitors requested on the bound connection go to it.
+    subscribe(mq, account(0x11), conn(1));
+    CHECK(notifiers(mq, account(0x11)) == std::vector{conn(1)});
+    CHECK(mq.monitoring_conns_.empty());
+}
+
+TEST_CASE(
+        "monitor session - monitors survive the connection and resume elsewhere",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    subscribe(mq, b, conn(1));
+
+    mq.connection_closed(conn(1));
+    CHECK(notifiers(mq, a).empty());
+    REQUIRE(mq.monitoring_.size() == 2);
+
+    auto r = session_request(mq, conn(2), token);
+    CHECK(r.at("r") == 1);
+    auto new_token = token_of(r);
+    CHECK(new_token.size() == 32);
+    CHECK(new_token != token);
+
+    REQUIRE(r.at("s").size() == 2);
+    std::map<std::string, json> listed;
+    for (auto& m : r.at("s"))
+        listed[m.at("@").get<std::string>()] = m;
+    REQUIRE(listed.count(a));
+    REQUIRE(listed.count(b));
+    CHECK(listed[a].at("d") == 0);
+    CHECK(listed[a].at("n") == json::array({0}));
+    CHECK_FALSE(listed[a].contains("errcode"));
+    auto x = listed[a].at("x").get<int64_t>();
+    CHECK(x > 3890);
+    CHECK(x <= 3900);
+
+    CHECK(notifiers(mq, a) == std::vector{conn(2)});
+    CHECK(notifiers(mq, b) == std::vector{conn(2)});
+}
+
+TEST_CASE("monitor session - resuming rotates the token", "[monitor][session]") {
+    TestMQ mq;
+
+    auto first = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    auto second = token_of(session_request(mq, conn(2), first));
+
+    // The old token is now unknown, so presenting it starts a new, empty session.
+    auto r = session_request(mq, conn(3), first);
+    CHECK(r.at("r") == 0);
+    CHECK(r.at("s").empty());
+
+    // ... but the current one still resumes (taking it back from conn 2, which is still bound).
+    auto r2 = session_request(mq, conn(4), second);
+    CHECK(r2.at("r") == 1);
+    CHECK(r2.at("s").size() == 1);
+}
+
+TEST_CASE(
+        "monitor session - resuming takes over from a connection still bound",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+
+    CHECK(session_request(mq, conn(2), token).at("r") == 1);
+    CHECK(notifiers(mq, a) == std::vector{conn(2)});
+
+    // conn 1 is no longer bound, so what it subscribes to now is its own.
+    subscribe(mq, account(0x22), conn(1));
+    CHECK(mq.monitoring_conns_.count(conn(1)) == 1);
+
+    // And its closing leaves the session alone.
+    mq.connection_closed(conn(1));
+    CHECK(notifiers(mq, a) == std::vector{conn(2)});
+    CHECK(notifiers(mq, account(0x22)).empty());
+}
+
+TEST_CASE("monitor session - the token alone resumes a session", "[monitor][session]") {
+    TestMQ mq;
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    mq.connection_closed(conn(1));
+
+    // Nothing but the token: a wrong one starts a new session, the right one from any connection
+    // resumes this one.
+    CHECK(session_request(mq, conn(2), std::string(32, 'x')).at("r") == 0);
+    auto r = session_request(mq, conn(3), token);
+    CHECK(r.at("r") == 1);
+    CHECK(r.at("s").size() == 1);
+}
+
+TEST_CASE(
+        "monitor session - a detached session lasts its lifetime, whatever its monitors",
+        "[monitor][session]") {
+    TestMQ mq;
+    constexpr auto LIFETIME = oxenss::server::Monitors::SESSION_DETACHED_LIFETIME;
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    mq.connection_closed(conn(1));
+
+    SECTION("one whose monitors' expiries have passed is still resumed, and they then go") {
+        expire_all(mq);
+        // Its subscriber cannot renew them while away, so the sweep leaves them for now.
+        mq.remove_expired();
+        CHECK(mq.monitoring_.size() == 1);
+        mq.age_session(token, LIFETIME - 1min);
+        mq.remove_expired();
+        auto r = session_request(mq, conn(2), token);
+        CHECK(r.at("r") == 1);
+        CHECK(r.at("s").empty());
+        mq.remove_expired();
+        CHECK(mq.monitoring_.empty());
+    }
+    SECTION("but not past its lifetime, even with live monitors") {
+        mq.age_session(token, LIFETIME);
+        SECTION("when swept") {
+            mq.remove_expired();
+            CHECK(mq.sessions_.empty());
+            CHECK(mq.monitoring_.empty());
+        }
+        SECTION("or when a resume finds it so before the sweep") {}
+        auto r = session_request(mq, conn(2), token);
+        CHECK(r.at("r") == 0);
+        CHECK(r.at("s").empty());
+    }
+}
+
+TEST_CASE("monitor session - a bound session outlives its monitors", "[monitor][session]") {
+    TestMQ mq;
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    expire_all(mq);
+    mq.remove_expired();
+
+    CHECK(mq.monitoring_.empty());
+    REQUIRE(mq.sessions_.size() == 1);
+    // A new monitor on the connection still goes to the session.
+    subscribe(mq, account(0x22), conn(1));
+    CHECK(mq.monitoring_conns_.empty());
+    mq.connection_closed(conn(1));
+    CHECK(session_request(mq, conn(2), token).at("r") == 1);
+}
+
+TEST_CASE(
+        "monitor session - the sweep removes expired connection monitors too",
+        "[monitor][session]") {
+    TestMQ mq;
+
+    subscribe(mq, account(0x11), conn(1));
+    expire_all(mq);
+    mq.remove_expired();
+    CHECK(mq.monitoring_.empty());
+    CHECK(mq.monitoring_conns_.empty());
+}
+
+TEST_CASE(
+        "monitor session - an account that moved swarm is reported at resume",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto ours = account(0x11), moved = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, ours, conn(1));
+    subscribe(mq, moved, conn(1));
+    mq.connection_closed(conn(1));
+
+    mq.elsewhere[moved] = 0x2000;
+
+    // With nobody bound to tell, the swarm change removes the monitor and keeps a note of it...
+    mq.drop_foreign_monitors();
+    CHECK(mq.pushed.empty());
+    CHECK(mq.monitoring_.size() == 1);
+
+    // ... for the resume to report, against the swarm state at the time of the resume.
+    auto r = session_request(mq, conn(2), token);
+    REQUIRE(r.at("s").size() == 2);
+    json ended;
+    for (auto& m : r.at("s"))
+        if (m.at("@") == moved)
+            ended = m;
+    REQUIRE(ended.is_object());
+    CHECK(ended.at("errcode") == 6);
+    CHECK(ended.at("error") == "Account is no longer stored by this service node's swarm");
+    CHECK(ended.at("swarm") == "2000");
+    CHECK(ended.at("snodes").empty());
+    CHECK_FALSE(ended.contains("x"));
+    CHECK_FALSE(ended.contains("n"));
+
+    // Once reported it is gone, not kept as a marker.
+    CHECK(mq.monitoring_.size() == 1);
+    CHECK(notifiers(mq, moved).empty());
+    mq.connection_closed(conn(2));
+    auto r2 = session_request(mq, conn(3), token_of(r));
+    REQUIRE(r2.at("s").size() == 1);
+    CHECK(r2.at("s")[0].at("@") == ours);
+}
+
+TEST_CASE("monitor session - a swarm change ends a bound session's monitor", "[monitor][session]") {
+    TestMQ mq;
+    auto moved = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, moved, conn(1));
+    mq.elsewhere[moved] = 0x2000;
+    mq.drop_foreign_monitors();
+
+    REQUIRE(mq.pushed.size() == 1);
+    CHECK(mq.pushed[0].command == "monitor_ended");
+    CHECK(mq.pushed[0].conns == std::vector{conn(1)});
+    CHECK(mq.monitoring_.empty());
+
+    // The session itself carries on, and outlasts its connection like any other.
+    mq.connection_closed(conn(1));
+    CHECK(session_request(mq, conn(2), token).at("r") == 1);
+}
+
+TEST_CASE("monitor session - a malformed request is refused", "[monitor][session]") {
+    TestMQ mq;
+    std::string reply;
+    mq.handle_monitor_session("l1:te", conn(1), [&reply](std::string r) { reply = std::move(r); });
+    auto r = oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+    CHECK(r.at("errcode") == 1);
+    CHECK(mq.sessions_.empty());
+}
+
+TEST_CASE(
+        "monitor session - missed notifications are replayed on resume",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1), true);
+    subscribe(mq, b, conn(1));
+
+    // Sent just before the connection went: it may not have arrived, so it is replayed too.
+    store(mq, a, "live", "zero");
+    CHECK(notified_hashes(mq, conn(1)) == std::vector<std::string>{"live"});
+
+    mq.connection_closed(conn(1));
+    auto m1 = store(mq, a, "m1", "first");
+    store(mq, b, "m2");
+    store(mq, a, "unmonitored ns", "x", namespace_id{42});
+    store(mq, a, "m3", "third");
+    store(mq, b, "deleted");
+    mq.delete_message("deleted");
+    store(mq, a, "m4");
+    CHECK(mq.pushed.empty());
+    // One entry per account and namespace, whatever the number of messages.
+    CHECK(mq.missed_pairs() == 2);
+
+    // The reply goes out before any replayed notification.
+    size_t pushed_before_reply = 99;
+    oxenc::bt_dict_producer req;
+    req.append("t", token);
+    std::string reply;
+    mq.handle_monitor_session(std::move(req).str(), conn(2), [&](std::string r) {
+        pushed_before_reply = mq.pushed.size();
+        reply = std::move(r);
+    });
+    CHECK(pushed_before_reply == 0);
+    auto r = oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+    CHECK(r.at("r") == 1);
+    CHECK(r.at("m").empty());
+
+    // Each account's oldest first; a message since deleted is simply not found.
+    auto got = notifications(mq, conn(2));
+    REQUIRE(got.size() == 5);
+    std::vector<std::string> hashes;
+    for (auto& n : got)
+        hashes.push_back(n.at("h"));
+    CHECK(hashes == std::vector<std::string>{"live", "m1", "m3", "m4", "m2"});
+    // A replayed notification is exactly what would have been sent live, data included.
+    CHECK(got[1] == json{{"@", a},
+                         {"h", "m1"},
+                         {"n", 0},
+                         {"t", oxenss::to_epoch_ms(m1.timestamp)},
+                         {"z", oxenss::to_epoch_ms(m1.expiry)},
+                         {"~", "first"}});
+    CHECK_FALSE(got[4].contains("~"));
+    CHECK(mq.missed_pairs() == 0);
+    mq.pushed.clear();
+
+    // Once replayed, and past the window in which they may yet have been lost, nothing is left.
+    mq.age_recent(oxenss::server::Monitors::RECENT_WINDOW + 1s);
+    mq.remove_expired();
+    mq.connection_closed(conn(2));
+    auto r2 = session_request(mq, conn(3), token_of(r));
+    CHECK(r2.at("r") == 1);
+    CHECK(mq.pushed.empty());
+}
+TEST_CASE(
+        "monitor session - a bound session notes what it sent, not what it missed",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    session_request(mq, conn(1));
+    subscribe(mq, account(0x11), conn(1));
+    store(mq, account(0x11), "h");
+    CHECK(mq.missed_pairs() == 0);
+    CHECK(mq.sessions_.begin()->second->recent.size() == 1);
+    CHECK(notified_hashes(mq, conn(1)) == std::vector<std::string>{"h"});
+}
+
+TEST_CASE(
+        "monitor session - a removed session's missed notifications go with it",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    session_request(mq, conn(1));
+    subscribe(mq, account(0x11), conn(1));
+    mq.connection_closed(conn(1));
+    store(mq, account(0x11), "h");
+    CHECK(mq.missed_pairs() == 1);
+
+    mq.age_session(
+            mq.sessions_.begin()->first, oxenss::server::Monitors::SESSION_DETACHED_LIFETIME);
+    mq.remove_expired();
+    CHECK(mq.sessions_.empty());
+    CHECK(mq.missed_pairs() == 0);
+}
+
 TEST_CASE("monitor - unknown subscription keys are ignored", "[monitor]") {
     TestMQ mq;
     test_key key;
@@ -394,6 +928,157 @@ TEST_CASE("monitor - unknown subscription keys are ignored", "[monitor]") {
     auto reply = mq.handle_monitor(
             signed_monitor_request(key, false, {{"a", 1}, {"e", "x"}, {"zz", 2}}), conn(1));
     CHECK(reply == "d7:successi1e1:xi3900ee");
+}
+
+TEST_CASE("monitor session - b limits the body of notifications", "[monitor][session][body]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    subscribe(mq, a, conn(1), true);  // connection-bound: never limited
+    session_with(mq, conn(2), {});
+    subscribe(mq, a, conn(2), true);  // session without b: no limit
+    session_with(mq, conn(3), {{"b", 5}});
+    subscribe(mq, a, conn(3), true);  // up to 5 bytes
+    session_with(mq, conn(4), {{"b", 0}});
+    subscribe(mq, a, conn(4), true);  // none of it
+    session_with(mq, conn(5), {{"b", 3}});
+    subscribe(mq, a, conn(5));  // a limit means nothing without data
+
+    SECTION("a body over the limit") {
+        store(mq, a, "h", "0123456789");
+        auto conn_full = notifications(mq, conn(1)), full = notifications(mq, conn(2)),
+             cut = notifications(mq, conn(3)), omitted = notifications(mq, conn(4)),
+             none = notifications(mq, conn(5));
+        REQUIRE(conn_full.size() == 1);
+        CHECK(conn_full[0].at("~") == "0123456789");
+        CHECK_FALSE(conn_full[0].contains("L"));
+        CHECK(full == conn_full);
+        REQUIRE(cut.size() == 1);
+        CHECK(cut[0].at("~") == "01234");
+        CHECK(cut[0].at("L") == 10);
+        REQUIRE(omitted.size() == 1);
+        CHECK_FALSE(omitted[0].contains("~"));
+        CHECK(omitted[0].at("L") == 10);
+        REQUIRE(none.size() == 1);
+        CHECK_FALSE(none[0].contains("~"));
+        CHECK_FALSE(none[0].contains("L"));
+
+        // Apart from those two keys the notifications are all the same.
+        cut[0].erase("~");
+        cut[0].erase("L");
+        omitted[0].erase("L");
+        CHECK(cut[0] == none[0]);
+        CHECK(omitted[0] == none[0]);
+    }
+    SECTION("a body within the limit is untouched") {
+        store(mq, a, "h", "01234");
+        // So the unlimited and limited subscribers get the very same notification, built once.
+        bool shared = false;
+        for (auto& p : mq.pushed)
+            if (std::ranges::count(p.conns, conn(1)) && std::ranges::count(p.conns, conn(3)))
+                shared = true;
+        CHECK(shared);
+        auto cut = notifications(mq, conn(3));
+        REQUIRE(cut.size() == 1);
+        CHECK(cut[0].at("~") == "01234");
+        CHECK_FALSE(cut[0].contains("L"));
+    }
+}
+
+TEST_CASE(
+        "monitor session - b is set afresh by every monitor_session", "[monitor][session][body]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_with(mq, conn(1), {{"b", 2}}));
+    subscribe(mq, a, conn(1), true);
+    store(mq, a, "h1", "hello");
+    auto got = notifications(mq, conn(1));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("~") == "he");
+    mq.pushed.clear();
+
+    // Resuming (here on the same connection) without b lifts the limit.
+    session_with(mq, conn(1), {{"t", token}});
+    store(mq, a, "h2", "hello");
+    got = notifications(mq, conn(1));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("~") == "hello");
+    CHECK_FALSE(got[0].contains("L"));
+}
+
+TEST_CASE("monitor session - a replay uses the resume's b", "[monitor][session][body]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_with(mq, conn(1), {{"b", 2}}));
+    subscribe(mq, a, conn(1), true);
+    subscribe(mq, account(0x22), conn(1));
+    mq.connection_closed(conn(1));
+    store(mq, a, "h", "hello");
+    store(mq, account(0x22), "nodata", "hello");
+
+    auto r = session_with(mq, conn(2), {{"b", 3}, {"t", token}});
+    // Not whatever applied when the message arrived.
+    auto got = notifications(mq, conn(2));
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].at("~") == "hel");
+    CHECK(got[0].at("L") == 5);
+    // A monitor without data gets no body (nor L) whatever the limit.
+    CHECK_FALSE(got[1].contains("~"));
+    CHECK_FALSE(got[1].contains("L"));
+
+    // The listing has no b of its own.
+    REQUIRE(r.at("s").size() == 2);
+    for (auto& m : r.at("s"))
+        CHECK_FALSE(m.contains("b"));
+}
+
+TEST_CASE("monitor session - an invalid b is refused", "[monitor][session][body]") {
+    TestMQ mq;
+    for (auto bad : {"d1:bi-1ee"s, "d1:b1:5e"s}) {
+        std::string reply;
+        mq.handle_monitor_session(bad, conn(1), [&reply](std::string r) { reply = std::move(r); });
+        CHECK(oxenss::bt_to_json(oxenc::bt_dict_consumer{reply}).at("errcode") == 1);
+    }
+    CHECK(mq.sessions_.empty());
+}
+
+TEST_CASE("monitor - L sorts into the notification dict", "[monitor][body]") {
+    TestMQ mq;
+    auto a = account(0x11);
+    session_with(mq, conn(1), {{"b", 2}});
+    subscribe(mq, a, conn(1), true);
+    store(mq, a, "h", "abc");
+    REQUIRE(mq.pushed.size() == 1);
+    // bt dict keys are in byte order, so the capital L lands between @ and h.
+    CHECK(mq.pushed[0].body.starts_with("d1:@33:"));
+    CHECK(mq.pushed[0].body.substr(7 + 33, 9) == "1:Li3e1:h");
+    CHECK(mq.pushed[0].body.ends_with("1:~2:abe"));
+}
+
+TEST_CASE("monitor - b in a subscription is ignored", "[monitor][body]") {
+    TestMQ mq;
+    test_key key;
+
+    session_with(mq, conn(1), {});
+    // Any value, even one a session would refuse, as for any key the parser does not know.
+    CHECK(mq.handle_monitor(signed_monitor_request(key, true, {{"b", 2}}), conn(1)) ==
+          "d7:successi1e1:xi3900ee");
+    CHECK(mq.handle_monitor(signed_monitor_request(key, false, {{"b", -1}}), conn(1)) ==
+          "d7:successi1e1:xi3900ee");
+    CHECK(mq.monitoring_.size() == 2);
+
+    oxenss::message m;
+    m.pubkey.load(key.account());
+    m.hash = "h";
+    m.msg_namespace = namespace_id::Default;
+    m.data = "hello";
+    mq.notify_message(m, mq.add_row(m));
+    auto got = notifications(mq, conn(1));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("~") == "hello");
+    CHECK_FALSE(got[0].contains("L"));
 }
 
 TEST_CASE("monitor - renewal matches only the identical subscription", "[monitor]") {
@@ -486,8 +1171,10 @@ TEST_CASE("monitor - a swarm change tells each connection once", "[monitor]") {
 TEST_CASE(
         "monitor - overlapping monitors give one notification per connection", "[monitor][body]") {
     auto a = account(0x11);
-    auto body_for = [&](std::vector<bool> data) {
+    auto body_for = [&](std::vector<bool> data, std::optional<int> b) {
         TestMQ m;
+        if (b)
+            session_with(m, conn(1), {{"b", *b}});
         int16_t i = 0;
         // Distinct namespace sets, all including 0, so that each is its own monitor.
         for (bool d : data)
@@ -499,21 +1186,28 @@ TEST_CASE(
         return got[0];
     };
 
-    // Data if any of them wants it.
-    CHECK(body_for({false, true}).at("~") == "0123456789");
-    CHECK(body_for({true, false}).at("~") == "0123456789");
-    CHECK_FALSE(body_for({false, false}).contains("~"));
+    // Data if any of them wants it ...
+    auto r = body_for({false, true}, std::nullopt);
+    CHECK(r.at("~") == "0123456789");
+    CHECK_FALSE(body_for({false, false}, std::nullopt).contains("~"));
 
-    // Other connections are on their own.
+    // ... limited by the session's b.
+    r = body_for({false, true, true}, 5);
+    CHECK(r.at("~") == "01234");
+    CHECK(r.at("L") == 10);
+
+    // A connection's own monitors (made before it was bound to the session) have no limit, so one
+    // of them matching lifts the session's.
     TestMQ mq;
     subscribe(mq, a, conn(1), true, ns({0}));
-    subscribe(mq, a, conn(1), false, ns({0, 1}));
+    session_with(mq, conn(1), {{"b", 3}});
+    subscribe(mq, a, conn(1), true, ns({0, 1}));
     subscribe(mq, a, conn(2), false, ns({0}));
-    store(mq, a, "h", "x");
+    store(mq, a, "h", "0123456789");
     auto one = notifications(mq, conn(1)), two = notifications(mq, conn(2));
     REQUIRE(one.size() == 1);
     REQUIRE(two.size() == 1);
-    CHECK(one[0].contains("~"));
+    CHECK(one[0].at("~") == "0123456789");
     CHECK_FALSE(two[0].contains("~"));
 }
 
@@ -546,6 +1240,292 @@ TEST_CASE("monitor - a successful subscription reports its expiry", "[monitor]")
     CHECK(r[2] == json{{"success", 1}, {"x", 3900}});
 }
 
+TEST_CASE(
+        "monitor session - requests from a closed connection bind nothing", "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    mq.connection_closed(conn(1));
+    store(mq, a, "missed");
+
+    // A request from conn 2 that was handed over after conn 2 had closed.
+    mq.connection_closed(conn(2));
+    oxenc::bt_dict_producer req;
+    req.append("t", token);
+    bool replied = false;
+    mq.handle_monitor_session(
+            std::move(req).str(), conn(2), [&replied](std::string) { replied = true; });
+    CHECK_FALSE(replied);
+    CHECK(mq.pushed.empty());
+    subscribe(mq, account(0x22), conn(2));
+    CHECK(mq.monitoring_conns_.empty());
+
+    // The session is untouched: still detached, with its token and missed notification.
+    auto r = session_request(mq, conn(3), token);
+    CHECK(r.at("r") == 1);
+    CHECK(notified_hashes(mq, conn(3)) == std::vector<std::string>{"missed"});
+
+    // The record of closed connections is swept in time.
+    for (auto& [c, when] : mq.closed_conns_)
+        when -= 2min;
+    mq.remove_expired();
+    CHECK(mq.closed_conns_.empty());
+}
+
+TEST_CASE("monitor session - the listing has one entry per monitor", "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11), moved = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1), false, ns({1, 2}));
+    subscribe(mq, a, conn(1), true, ns({3}));
+    subscribe(mq, moved, conn(1), false, ns({0}));
+    subscribe(mq, moved, conn(1), true, ns({0}));
+    // Monitors, not accounts, are what the missed notification limit scales with.
+    REQUIRE(mq.sessions_.size() == 1);
+    auto& session = *mq.sessions_.begin()->second;
+    CHECK(session.monitor_count == 4);
+    mq.connection_closed(conn(1));
+    mq.elsewhere[moved] = 0x2000;
+    mq.drop_foreign_monitors();
+
+    auto r = session_request(mq, conn(2), token);
+    REQUIRE(r.at("s").size() == 3);
+    std::vector<json> of_a, of_moved;
+    for (auto& m : r.at("s"))
+        (m.at("@") == a ? of_a : of_moved).push_back(m);
+    REQUIRE(of_a.size() == 2);
+    std::ranges::sort(of_a, [](auto& x, auto& y) { return x.at("n") < y.at("n"); });
+    CHECK(of_a[0].at("n") == json::array({1, 2}));
+    CHECK(of_a[0].at("d") == 0);
+    CHECK_FALSE(of_a[0].contains("b"));
+    CHECK(of_a[0].contains("x"));
+    CHECK(of_a[1].at("n") == json::array({3}));
+    CHECK(of_a[1].at("d") == 1);
+    CHECK_FALSE(of_a[1].contains("b"));
+    CHECK(of_a[1].contains("x"));
+
+    // The moved account is reported ended once, however many monitors it had, and they are gone.
+    REQUIRE(of_moved.size() == 1);
+    CHECK(of_moved[0].at("errcode") == 6);
+    CHECK_FALSE(of_moved[0].contains("x"));
+    CHECK(mq.monitoring_.size() == 2);
+    CHECK(session.monitor_count == 2);
+    CHECK(session.accounts == std::unordered_set{a});
+}
+
+TEST_CASE(
+        "monitor session - overlapping monitors record one missed notification",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_with(mq, conn(1), {{"b", 2}}));
+    subscribe(mq, a, conn(1), true, ns({0}));
+    subscribe(mq, a, conn(1), false, ns({0, 1}));
+    mq.connection_closed(conn(1));
+    store(mq, a, "h", "hello");
+    CHECK(mq.missed_pairs() == 1);
+
+    session_with(mq, conn(2), {{"b", 2}, {"t", token}});
+    auto got = notifications(mq, conn(2));
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].at("~") == "he");
+    CHECK(got[0].at("L") == 5);
+}
+
+TEST_CASE("monitor session - l=0 lists only the ended monitors", "[monitor][session]") {
+    auto setup = [](TestMQ& mq) {
+        auto token = token_of(session_request(mq, conn(1)));
+        subscribe(mq, account(0x11), conn(1), {}, ns({0}));
+        subscribe(mq, account(0x11), conn(1), true, ns({0, 10}));
+        subscribe(mq, account(0x22), conn(1));
+        mq.connection_closed(conn(1));
+        store(mq, account(0x11), "missed", "data");
+        mq.elsewhere[account(0x22)] = 0x2000;
+        mq.drop_foreign_monitors();
+        return token;
+    };
+    auto resume = [](TestMQ& mq, const std::string& token, std::optional<int> l) {
+        oxenc::bt_dict_producer req;
+        if (l)
+            req.append("l", *l);
+        req.append("t", token);
+        std::string reply;
+        mq.handle_monitor_session(
+                std::move(req).str(), conn(2), [&reply](std::string r) { reply = std::move(r); });
+        return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+    };
+
+    TestMQ mq;
+    auto token = setup(mq);
+    // Nor does it look anything up in the swarm but for the ended account it reports.
+    mq.swarm_lookups = 0;
+    auto r = resume(mq, token, 0);
+    CHECK(mq.swarm_lookups == 1);
+    CHECK(r.at("r") == 1);
+    CHECK(token_of(r).size() == 32);
+    REQUIRE(r.at("s").size() == 1);
+    CHECK(r.at("s")[0].at("@") == account(0x22));
+    CHECK(r.at("s")[0].at("errcode") == 6);
+    CHECK(r.at("s")[0].contains("swarm"));
+    CHECK(r.at("s")[0].contains("snodes"));
+    // The replay is unaffected, and the unlisted monitors are still there.
+    CHECK(notified_hashes(mq, conn(2)) == std::vector<std::string>{"missed"});
+    CHECK(mq.monitoring_.size() == 2);
+    store(mq, account(0x11), "live", "data", namespace_id{10});
+    CHECK(notified_hashes(mq, conn(2)) == std::vector<std::string>{"live"});
+
+    // l=1 is the same as leaving it out: the full listing.
+    TestMQ with_1, without;
+    auto r1 = resume(with_1, setup(with_1), 1);
+    auto r0 = resume(without, setup(without), std::nullopt);
+    CHECK(r1.at("s").size() == 3);
+    CHECK(r0.at("s").size() == 3);
+    r1.erase("t");
+    r0.erase("t");
+    for (auto* x : {&r0, &r1})
+        for (auto& m : x->at("s"))
+            m.erase("x");
+    auto by_n = [](const json& a, const json& b) { return a.dump() < b.dump(); };
+    std::sort(r1["s"].begin(), r1["s"].end(), by_n);
+    std::sort(r0["s"].begin(), r0["s"].end(), by_n);
+    CHECK(r1 == r0);
+}
+
+TEST_CASE("monitor session - l=0 on a new session", "[monitor][session]") {
+    TestMQ mq;
+    oxenc::bt_dict_producer req;
+    req.append("l", 0);
+    req.append("t", std::string(32, 'x'));
+    std::string reply;
+    mq.handle_monitor_session(
+            std::move(req).str(), conn(1), [&reply](std::string r) { reply = std::move(r); });
+    auto r = oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+    CHECK(r.at("r") == 0);
+    CHECK(r.at("s").empty());
+    CHECK(mq.sessions_.size() == 1);
+}
+
+TEST_CASE("monitor session - an invalid l is refused", "[monitor][session]") {
+    TestMQ mq;
+    for (auto bad : {"d1:l1:xe"s, "d1:li2ee"s, "d1:li-1ee"s}) {
+        std::string reply;
+        mq.handle_monitor_session(bad, conn(1), [&reply](std::string r) { reply = std::move(r); });
+        CHECK(oxenss::bt_to_json(oxenc::bt_dict_consumer{reply}).at("errcode") == 1);
+    }
+    CHECK(mq.sessions_.empty());
+}
+
+TEST_CASE(
+        "monitor session - m replays each account's newest missed notifications",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    subscribe(mq, b, conn(1));
+    mq.connection_closed(conn(1));
+
+    store(mq, a, "a1");
+    store(mq, b, "b1");
+    store(mq, a, "a2");
+    store(mq, a, "a3");
+    store(mq, b, "b2");
+    store(mq, a, "a4");
+
+    auto r = session_with(mq, conn(2), {{"m", 2}, {"t", token}});
+    CHECK(discards_of(r) == discards{{a, {{0, 2}}}});
+
+    // Each account's newest two, oldest first within the account.
+    CHECK(notified_hashes(mq, conn(2)) == std::vector<std::string>{"a3", "a4", "b1", "b2"});
+    CHECK(mq.missed_pairs() == 0);
+}
+TEST_CASE("monitor session - without m the m dict is empty", "[monitor][session][missed]") {
+    TestMQ mq;
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    mq.connection_closed(conn(1));
+    for (int i = 0; i < 5; i++)
+        store(mq, account(0x11), "h{}"_format(i));
+    auto r = session_request(mq, conn(2), token);
+    REQUIRE(r.contains("m"));
+    CHECK(r.at("m").empty());
+    CHECK(notified_hashes(mq, conn(2)).size() == 5);
+}
+TEST_CASE("monitor session - m applies to the resume that gives it", "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+    uint64_t current = 1;
+    auto away = [&](std::vector<std::string> hashes) {
+        // What the last connection was sent is past the window in which it might have been lost.
+        mq.age_recent(oxenss::server::Monitors::RECENT_WINDOW + 1s);
+        mq.remove_expired();
+        mq.connection_closed(conn(current++));
+        for (auto& h : hashes)
+            store(mq, a, h);
+    };
+
+    // Given when the session is created, m means nothing for later resumes.
+    auto token = token_of(session_with(mq, conn(1), {{"m", 1}}));
+    subscribe(mq, a, conn(1));
+    away({"x1", "x2", "x3"});
+    auto r = session_with(mq, conn(current), {{"t", token}});
+    CHECK(r.at("m").empty());
+    CHECK(notified_hashes(mq, conn(current)) == std::vector<std::string>{"x1", "x2", "x3"});
+
+    away({"y1", "y2", "y3"});
+    r = session_with(mq, conn(current), {{"m", 2}, {"t", token_of(r)}});
+    CHECK(discards_of(r) == discards{{a, {{0, 1}}}});
+    CHECK(notified_hashes(mq, conn(current)) == std::vector<std::string>{"y2", "y3"});
+}
+TEST_CASE("monitor session - an invalid m is refused", "[monitor][session]") {
+    TestMQ mq;
+    for (auto bad : {"d1:mi0ee"s, "d1:mi-3ee"s, "d1:m1:2e"s}) {
+        std::string reply;
+        mq.handle_monitor_session(bad, conn(1), [&reply](std::string r) { reply = std::move(r); });
+        CHECK(oxenss::bt_to_json(oxenc::bt_dict_consumer{reply}).at("errcode") == 1);
+    }
+    CHECK(mq.sessions_.empty());
+}
+
+TEST_CASE("monitor session - a resume's m bounds the replay", "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    SECTION("per account") {
+        auto token = token_of(session_with(mq, conn(1), {}));
+        subscribe(mq, a, conn(1));
+        subscribe(mq, b, conn(1));
+        mq.connection_closed(conn(1));
+        for (auto h : {"a1", "a2", "b1", "a3", "a4"})
+            store(mq, h[0] == 'a' ? a : b, h);
+
+        auto r = session_with(mq, conn(2), {{"m", 2}, {"t", token}});
+        CHECK(discards_of(r) == discards{{a, {{0, 2}}}});
+        CHECK(notified_hashes(mq, conn(2)) == std::vector<std::string>{"a3", "a4", "b1"});
+    }
+    SECTION("across an account's namespaces, counted per namespace") {
+        auto token = token_of(session_with(mq, conn(1), {}));
+        subscribe(mq, a, conn(1), false, ns({0, 5}));
+        mq.connection_closed(conn(1));
+        store(mq, a, "ns0 first", "data", namespace_id{0});
+        store(mq, a, "ns5 first", "data", namespace_id{5});
+        store(mq, a, "ns0 second", "data", namespace_id{0});
+        store(mq, a, "ns5 second", "data", namespace_id{5});
+        store(mq, a, "ns0 third", "data", namespace_id{0});
+
+        // The newest three of the account: one cut in each namespace.
+        auto r = session_with(mq, conn(2), {{"m", 3}, {"t", token}});
+        CHECK(discards_of(r) == discards{{a, {{0, 1}, {5, 1}}}});
+        CHECK(notified_hashes(mq, conn(2)) ==
+              std::vector<std::string>{"ns0 second", "ns0 third", "ns5 second"});
+    }
+    CHECK(mq.missed_pairs() == 0);
+}
 TEST_CASE("serial runs - a key's items run one after another in order", "[monitor]") {
     using runs = oxenss::server::serial_runs<int, std::string>;
     runs r;
@@ -580,6 +1560,275 @@ TEST_CASE("serial runs - a key's items run one after another in order", "[monito
     CHECK(r.next(3).empty());
 }
 
+TEST_CASE(
+        "monitor session - a message stored over another is replayed in its place",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+    const auto outbox = namespace_id{-21};
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1), false, ns({-21, 0}));
+    auto old = store(mq, a, "old", "data", outbox);
+    // Long enough ago that it is past the window of recent sends.
+    mq.age_recent(oxenss::server::Monitors::RECENT_WINDOW + 1s);
+    mq.remove_expired();
+    mq.connection_closed(conn(1));
+    store(mq, a, "other", "data", namespace_id{0});
+
+    // A newer message replacing the old one keeps the old one's row id, below anything else
+    // missed: that it is still replayed is what keeping the lowest id per namespace is for.
+    int64_t old_id = 0;
+    for (auto& [id, m] : mq.rows)
+        if (m.hash == "old")
+            old_id = id;
+    auto replacement = old;
+    replacement.hash = "replacement";
+    mq.rows[old_id] = replacement;
+    mq.notify_message(replacement, old_id);
+
+    session_request(mq, conn(2), token);
+    auto got = notified_hashes(mq, conn(2));
+    std::ranges::sort(got);
+    CHECK(got == std::vector<std::string>{"other", "replacement"});
+}
+TEST_CASE(
+        "monitor session - a detached session's monitors do not expire",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1), true);
+    subscribe(mq, b, conn(1));
+    mq.connection_closed(conn(1));
+
+    // A subscriber away cannot renew: a's monitor passes its expiry while it is gone, but still
+    // notes what it misses, and the sweep leaves it.
+    for (auto& [acct, mon] : mq.monitoring_)
+        if (acct == a)
+            mon.expiry = std::chrono::steady_clock::now() - 1s;
+    mq.remove_expired();
+    REQUIRE(mq.monitoring_.size() == 2);
+    store(mq, a, "from a", "data");
+    store(mq, b, "from b", "data");
+
+    session_request(mq, conn(2), token);
+    auto got = notifications(mq, conn(2));
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].at("h") == "from a");
+    // With data as the monitor wanted when the message arrived.
+    CHECK(got[0].at("~") == "data");
+    CHECK(got[1].at("h") == "from b");
+    CHECK_FALSE(got[1].contains("~"));
+
+    // Bound again, the lapsed one goes with the next sweep.
+    mq.remove_expired();
+    CHECK(mq.monitoring_.size() == 1);
+}
+TEST_CASE("monitor session - a replay goes a chunk at a time", "[monitor][session][missed]") {
+    TestMQ mq;
+    mq.manual_drain = true;
+    constexpr size_t CHUNK = oxenss::server::Monitors::REPLAY_CHUNK;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    mq.connection_closed(conn(1));
+    const size_t total = 2 * CHUNK + 10;
+    std::vector<std::string> stored;
+    for (size_t i = 0; i < total; i++) {
+        stored.push_back("h{}"_format(i));
+        store(mq, a, stored.back());
+    }
+
+    SECTION("each waiting for the one before to be sent on") {
+        auto r = session_request(mq, conn(2), token);
+        // The reply, and the first chunk only.
+        CHECK(mq.pushed.size() == CHUNK);
+        REQUIRE(mq.waiting.size() == 1);
+        mq.drain();
+        CHECK(mq.pushed.size() == 2 * CHUNK);
+        mq.drain();
+        CHECK(mq.pushed.size() == total);
+        // The last chunk's drain finds nothing more, and ends the replay.
+        CHECK(mq.paced_ends == 0);
+        mq.drain();
+        CHECK(mq.waiting.empty());
+        CHECK(mq.paced_ends == 1);
+        CHECK(mq.largest_lookup == CHUNK);
+        CHECK(notified_hashes(mq, conn(2)) == stored);
+    }
+    SECTION("and stopped, losing nothing, if the connection closes meanwhile") {
+        auto token2 = token_of(session_request(mq, conn(2), token));
+        CHECK(mq.pushed.size() == CHUNK);
+        mq.connection_closed(conn(2));
+        mq.drain();
+        CHECK(mq.pushed.size() == CHUNK);
+        CHECK(mq.waiting.empty());
+        CHECK(mq.lookups == 1);
+        mq.pushed.clear();
+
+        // What was sent may never have arrived, so a resume replays it all again.
+        mq.manual_drain = false;
+        session_request(mq, conn(3), token2);
+        CHECK(notified_hashes(mq, conn(3)) == stored);
+    }
+}
+TEST_CASE(
+        "monitor session - nothing missed is discarded, however much",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    mq.connection_closed(conn(1));
+    for (size_t i = 1; i <= 1000; i++)
+        store(mq, a, "h{}"_format(i));
+    CHECK(mq.missed_pairs() == 1);
+
+    session_request(mq, conn(2), token);
+    auto got = notified_hashes(mq, conn(2));
+    REQUIRE(got.size() == 1000);
+    CHECK(got.front() == "h1");
+    CHECK(got.back() == "h1000");
+}
+TEST_CASE(
+        "monitor session - the sweep detaches a session from a connection gone unnoticed",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11), b = account(0x22);
+
+    // Connection 5 closed so long before its monitor_session was handled that the record of its
+    // closing is gone, so the request binds a session to it.
+    mq.connection_closed(conn(5));
+    for (auto& [c, when] : mq.closed_conns_)
+        when -= 2min;
+    mq.remove_expired();
+    REQUIRE(mq.closed_conns_.empty());
+    auto token = token_of(session_request(mq, conn(5)));
+    subscribe(mq, a, conn(5));
+    // Likewise a connection's own monitor.
+    subscribe(mq, b, conn(6));
+    CHECK(notifiers(mq, a) == std::vector{conn(5)});
+
+    // Still bound while the transport has the connection...
+    mq.remove_expired();
+    CHECK(notifiers(mq, a) == std::vector{conn(5)});
+    CHECK(mq.sessions_.at(token)->conn);
+
+    // ... but once it is gone the sweep treats it as closed: the session is detached (recording,
+    // and with its lifetime running) and the connection's own monitor removed.
+    mq.dead = {conn(5), conn(6)};
+    mq.remove_expired();
+    CHECK_FALSE(mq.sessions_.at(token)->conn);
+    CHECK(mq.sessions_.at(token)->detached_since);
+    CHECK(notifiers(mq, b).empty());
+    store(mq, a, "missed");
+    CHECK(mq.missed_pairs() == 1);
+    auto r = session_request(mq, conn(7), token);
+    CHECK(r.at("r") == 1);
+    CHECK(notified_hashes(mq, conn(7)) == std::vector<std::string>{"missed"});
+}
+
+TEST_CASE(
+        "monitor session - notifications sent just before a connection is lost are replayed",
+        "[monitor][session][missed]") {
+    constexpr auto WINDOW = oxenss::server::Monitors::RECENT_WINDOW;
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    store(mq, a, "long ago");
+    mq.age_recent(WINDOW + 1s);
+    store(mq, a, "lately");
+    mq.age_recent(WINDOW - 10s);
+    store(mq, a, "just now");
+    mq.pushed.clear();
+
+    // The sweep prunes what is past the window, which would have been noticed lost by now...
+    mq.remove_expired();
+    CHECK(mq.sessions_.at(token)->recent.size() == 2);
+
+    // ... and the rest is replayed after the connection goes, as it may have been dead already.
+    mq.connection_closed(conn(1));
+    CHECK(mq.missed_pairs() == 1);
+    store(mq, a, "while away");
+    session_request(mq, conn(2), token);
+    CHECK(notified_hashes(mq, conn(2)) ==
+          std::vector<std::string>{"lately", "just now", "while away"});
+}
+
+TEST_CASE(
+        "monitor session - a resume elsewhere replays what the old connection was sent lately",
+        "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    store(mq, a, "sent on 1");
+    mq.pushed.clear();
+
+    // The subscriber resumes on another connection while the old one still looks open: it would
+    // not, were the old one working, so what went out on it is replayed.
+    session_request(mq, conn(2), token);
+    CHECK(notified_hashes(mq, conn(2)) == std::vector<std::string>{"sent on 1"});
+    CHECK(notifiers(mq, a) == std::vector{conn(2)});
+}
+
+TEST_CASE(
+        "monitor session - a resume looks nothing up in the swarm without ended monitors",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto token = token_of(session_request(mq, conn(1)));
+    for (unsigned char i = 0; i < 50; i++)
+        subscribe(mq, account(0x40 + i), conn(1));
+    mq.connection_closed(conn(1));
+
+    mq.swarm_lookups = 0;
+    auto r = session_with(mq, conn(2), {{"l", 0}, {"t", token}});
+    CHECK(r.at("r") == 1);
+    CHECK(r.at("s").empty());
+    CHECK(mq.swarm_lookups == 0);
+}
+
+TEST_CASE("monitor - the sweep is paced, and one at a time", "[monitor]") {
+    TestMQ mq;
+    mq.manual_later = true;
+    // More accounts than a step covers buckets of the table.
+    const size_t n = oxenss::server::Monitors::PASS_BATCH + 1000;
+    for (size_t i = 0; i < n; i++) {
+        auto acct = account(0x11);
+        std::memcpy(acct.data() + 1, &i, sizeof(i));
+        subscribe(mq, acct, conn(1));
+    }
+    REQUIRE(mq.monitoring_.size() == n);
+    expire_all(mq);
+
+    mq.remove_expired();
+    // The first step sweeps part of the table, leaving the rest to a queued step.
+    CHECK(mq.monitoring_.size() > 0);
+    CHECK(mq.monitoring_.size() < n);
+    REQUIRE(mq.later.size() == 1);
+    // A sweep started meanwhile does nothing.
+    mq.remove_expired();
+    CHECK(mq.later.size() == 1);
+
+    mq.run_later_queue();
+    CHECK(mq.monitoring_.empty());
+    CHECK(mq.monitoring_conns_.empty());
+
+    // Once it is done another can start.
+    subscribe(mq, account(0x11), conn(1));
+    expire_all(mq);
+    mq.remove_expired();
+    mq.run_later_queue();
+    CHECK(mq.monitoring_.empty());
+}
+
 TEST_CASE("replay owners - only the newest replay paces a connection", "[monitor]") {
     oxenss::server::replay_owners<int> owners;
 
@@ -604,4 +1853,21 @@ TEST_CASE("replay owners - only the newest replay paces a connection", "[monitor
     CHECK(owners.claim(8, 2));
     owners.forget(7);
     CHECK(owners.claim(7, 2));
+}
+
+TEST_CASE("monitor session - each replay has its own increasing id", "[monitor][session][missed]") {
+    TestMQ mq;
+    auto a = account(0x11);
+    auto token = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+    mq.connection_closed(conn(1));
+    store(mq, a, "one");
+    auto r = session_request(mq, conn(2), token);
+    REQUIRE_FALSE(mq.replays.empty());
+    auto first = mq.replays.back();
+    mq.connection_closed(conn(2));
+    store(mq, a, "two");
+    session_request(mq, conn(3), token_of(r));
+    CHECK(mq.replays.back() > first);
+    CHECK(std::ranges::is_sorted(mq.replays));
 }

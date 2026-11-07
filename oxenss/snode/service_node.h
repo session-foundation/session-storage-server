@@ -185,7 +185,7 @@ class ServiceNode {
 
     mutable std::recursive_mutex sn_mutex_;
 
-    void send_notifies(const message& m);
+    void send_notifies(const message& m, int64_t id);
 
     // Save multiple messages to the database at once (i.e. in a single transaction).  Returns
     // false if they could not be saved.

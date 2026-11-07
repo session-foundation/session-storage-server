@@ -15,7 +15,10 @@ takes at most one.
 
 Transports with `monitor` set also carry message monitoring: `rpc.monitor(conn, body)` sends a
 subscription request (bt body, bt reply in the same shape as above), and `rpc.on_notify(conn, cb)`
-has `cb(body)` called with each notification the node pushes down that connection.
+has `cb(body)` called with each notification the node pushes down that connection.  They also
+start and resume monitor sessions with `rpc.monitor_session(conn, body)`, whose future gives the bt
+reply body, or None from a node without session support; and `rpc.disconnect(conn)` closes a
+connection, as a session's subscriber losing it would.
 """
 
 import json
@@ -197,6 +200,23 @@ class _QuicReply:
         return [body]
 
 
+class _MonitorSessionReply:
+    """A monitor_session reply: the bt body, or None if the node does not know the command."""
+
+    def __init__(self, fut):
+        self._fut = fut
+
+    def get(self):
+        import seshquic
+
+        try:
+            return self._fut.result()
+        except seshquic.RequestError as e:
+            if e.body.startswith(b"Invalid endpoint"):
+                return None
+            raise
+
+
 class QUIC:
     """Storage RPC over QUIC, via the seshquic bindings for libquic: a bt-request stream on a
     connection with the storage server's client ALPN, where the request name is the RPC method.
@@ -216,6 +236,7 @@ class QUIC:
         sk = SigningKey.generate()
         self._creds = seshquic.Credentials.from_ed_keys(sk.encode(), sk.verify_key.encode())
         self._endpoint = seshquic.Endpoint("0.0.0.0:0")
+        self._conns = {}
 
     def close(self):
         self._endpoint.close()
@@ -227,7 +248,13 @@ class QUIC:
             creds=self._creds,
             alpns=[self.ALPN],
         )
-        return conn.open_bt_stream()
+        # The node pushes notifications down a connection's first stream, which is this one.
+        stream = conn.open_bt_stream()
+        self._conns[id(stream)] = conn
+        return stream
+
+    def disconnect(self, stream):
+        self._conns.pop(id(stream)).close()
 
     def request(self, conn, method, payload=b'', *, timeout=DEFAULT_TIMEOUT):
         return _QuicReply(
@@ -236,6 +263,11 @@ class QUIC:
 
     def monitor(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
         return _QuicReply(conn.request('monitor', body, timeout=timeout.total_seconds()))
+
+    def monitor_session(self, conn, body, *, timeout=DEFAULT_TIMEOUT):
+        return _MonitorSessionReply(
+            conn.request('monitor_session', body, timeout=timeout.total_seconds())
+        )
 
     def on_notify(self, conn, cb):
         conn.register_handler('notify', lambda m: cb(m.body))

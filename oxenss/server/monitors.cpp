@@ -1,6 +1,7 @@
 #include "monitors.h"
 
 #include <sodium/crypto_sign.h>
+#include <sodium/randombytes.h>
 
 #include <algorithm>
 #include <cassert>
@@ -30,6 +31,47 @@ snode::swarm_id_t Monitors::our_swarm_id() const {
 
 const snode::Contacts& Monitors::contacts() const {
     return std::as_const(*service_node_).contacts();
+}
+
+std::vector<connection_id> Monitors::gone_connections(std::vector<connection_id>) {
+    return {};
+}
+
+std::vector<std::pair<int64_t, message>> Monitors::retrieve_from_id(
+        const user_pubkey& pubkey,
+        namespace_id ns,
+        int64_t from_id,
+        size_t limit,
+        bool newest_first) {
+    return service_node_->db->retrieve_from_id(pubkey, ns, from_id, limit, newest_first);
+}
+
+int64_t Monitors::count_id_range(
+        const user_pubkey& pubkey, namespace_id ns, int64_t from_id, int64_t before_id) {
+    return service_node_->db->count_id_range(pubkey, ns, from_id, before_id);
+}
+
+void Monitors::run_later(std::function<void()> f) {
+    f();
+}
+
+void body_limit::merge(const body_limit& other) {
+    if (!other.data)
+        return;
+    if (!data)
+        *this = other;
+    else if (!max || !other.max)
+        max.reset();
+    else
+        max = std::max(*max, *other.max);
+}
+
+body_limit body_limit::applied(size_t size) const {
+    if (!data)
+        return {};
+    if (!max || (*max > 0 && size <= *max))
+        return {true, std::nullopt};
+    return *this;
 }
 
 namespace {
@@ -272,6 +314,59 @@ std::string Monitors::handle_monitor(std::string_view request, const connection_
     return std::move(out).str();
 }
 
+namespace {
+    // The bt-encoded body of a `notify` for `m`, for a subscriber with body limit `limit`, which
+    // is a dict with keys (in order):
+    // - @ pubkey
+    // - L full size of the msg data (only if `~` is cut short or left out because of the limit)
+    // - h msg hash
+    // - n msg namespace
+    // - t msg timestamp
+    // - z msg expiry
+    // - ~ msg data (if wanted, and only as much of it as wanted)
+    std::string notify_body(const message& m, const body_limit& limit) {
+        auto body = limit.applied(m.data.size());
+        // A limit that survives being applied is one the body exceeds.
+        const bool cut = body.max.has_value();
+        const bool with_data = body.data && body.max != 0;
+        std::string_view data{m.data};
+        if (cut)
+            data = data.substr(0, *body.max);
+
+        constexpr size_t metadata_size = 2       // d...e
+                                       + 3 + 36  // 1:@ and 33:[33-byte pubkey]
+                                       + 3 + 46  // 1:h and 43:[43-byte base64 unpadded hash]
+                                       + 3 + 8   // 1:n and i-32768e
+                                       + 3 + 16  // 1:t and i1658784776010e plus a byte to grow
+                                       + 3 + 16  // 1:z and i1658784776010e plus a byte to grow
+                                       + 10;     // safety margin
+
+        oxenc::bt_dict_producer d;
+        d.reserve(
+                metadata_size + (cut ? 3 + 10 : 0)         // 1:L and i76800e plus bytes to grow
+                + (with_data ? 3 + 8 + data.size() : 0));  // 1:~ and 76800: plus bytes to grow
+
+        d.append("@", m.pubkey.prefixed_raw());
+        if (cut)
+            d.append("L", m.data.size());
+        d.append("h", m.hash);
+        d.append("n", to_int(m.msg_namespace));
+        d.append("t", to_epoch_ms(m.timestamp));
+        d.append("z", to_epoch_ms(m.expiry));
+        if (with_data)
+            d.append("~", data);
+        return std::move(d).str();
+    }
+
+    // The body limit of a monitor's owner: a session's `b`; a connection has none.
+    std::optional<uint64_t> body_max_of(const monitor_owner& owner) {
+        if (auto* s = std::get_if<MonitorSession*>(&owner))
+            return (*s)->body_max;
+        return std::nullopt;
+    }
+
+}  // namespace
+
 std::vector<std::chrono::seconds> Monitors::update_monitors(
         std::vector<subscription>& subs, const connection_id& conn) {
     std::vector<std::chrono::seconds> expiries;
@@ -284,9 +379,20 @@ std::vector<std::chrono::seconds> Monitors::update_monitors(
         return std::chrono::duration_cast<std::chrono::seconds>(mon.expiry - now);
     };
 
+    if (closed_conns_.contains(conn)) {
+        log::debug(logcat, "ignoring monitor request from a connection that has since closed");
+        expiries.resize(subs.size(), std::chrono::seconds{0});
+        return expiries;
+    }
+
+    monitor_owner owner = conn;
+    MonitorSession* session = nullptr;
+    if (auto it = session_conns_.find(conn); it != session_conns_.end())
+        owner = session = it->second;
+
     for (auto& sub : subs) {
         auto& [pubkey, pubkey_hex, namespaces, want_data] = sub;
-        if (auto* mon_data = find_monitor(sub, conn)) {
+        if (auto* mon_data = find_monitor(sub, owner)) {
             log::debug(
                     logcat,
                     "sub renewed for {} monitoring namespace(s) {}",
@@ -298,54 +404,458 @@ std::vector<std::chrono::seconds> Monitors::update_monitors(
         }
         log::debug(
                 logcat,
-                "new subscription for {} monitoring namespace(s) {}",
+                "new {}subscription for {} monitoring namespace(s) {}",
+                session ? "session " : "",
                 pubkey_hex,
                 fmt::join(namespaces, ", "));
-        monitoring_conns_[conn].insert(pubkey);
+        if (session) {
+            session->accounts.insert(pubkey);
+            ++session->monitor_count;
+        } else
+            monitoring_conns_[conn].insert(pubkey);
         auto it = monitoring_.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(std::move(pubkey)),
-                std::forward_as_tuple(std::move(namespaces), want_data, conn));
+                std::forward_as_tuple(std::move(namespaces), want_data, owner));
         expiries.push_back(until(it->second));
     }
     return expiries;
 }
 
-MonitorData* Monitors::find_monitor(const subscription& sub, const connection_id& conn) {
+MonitorData* Monitors::find_monitor(const subscription& sub, const monitor_owner& owner) {
     for (auto [it, end] = monitoring_.equal_range(sub.pubkey); it != end; ++it) {
         auto& mon = it->second;
-        if (mon.conn == conn && mon.namespaces == sub.namespaces && mon.want_data == sub.want_data)
+        if (mon.owner == owner && mon.namespaces == sub.namespaces &&
+            mon.want_data == sub.want_data)
             return &mon;
     }
     return nullptr;
 }
 
-bool Monitors::has_monitor(const std::string& account, const connection_id& conn) {
+bool Monitors::has_monitor(const std::string& account, const monitor_owner& owner) {
     for (auto [it, end] = monitoring_.equal_range(account); it != end; ++it)
-        if (it->second.conn == conn)
+        if (it->second.owner == owner)
             return true;
     return false;
 }
 
 std::unordered_multimap<std::string, MonitorData>::iterator Monitors::erase_monitor(
         std::unordered_multimap<std::string, MonitorData>::iterator it) {
-    // Copied: both outlive the erase, which the account only leaves its connection's index after,
-    // and then only if that was the connection's last monitor of it.
+    // Copied: both outlive the erase, which the account only leaves its owner's index after, and
+    // then only if that was the owner's last monitor of it.
     auto account = it->first;
-    auto conn = it->second.conn;
+    auto owner = it->second.owner;
     auto next = monitoring_.erase(it);
 
-    if (!has_monitor(account, conn))
+    if (auto* s = std::get_if<MonitorSession*>(&owner)) {
+        --(*s)->monitor_count;
+        if (!has_monitor(account, owner))
+            (*s)->accounts.erase(account);
+    } else if (!has_monitor(account, owner)) {
+        auto& conn = std::get<connection_id>(owner);
         if (auto cit = monitoring_conns_.find(conn); cit != monitoring_conns_.end()) {
             cit->second.erase(account);
             if (cit->second.empty())
                 monitoring_conns_.erase(cit);
         }
+    }
     return next;
 }
 
-void Monitors::remove_monitors_for(const connection_id& conn) {
+void Monitors::detach(MonitorSession& s, std::chrono::steady_clock::time_point now) {
+    if (s.conn) {
+        // Only if still its: the connection may already be bound to the session replacing it.
+        if (auto it = session_conns_.find(*s.conn); it != session_conns_.end() && it->second == &s)
+            session_conns_.erase(it);
+        s.conn.reset();
+    }
+    s.detached_since = now;
+    std::lock_guard lock{missed_mutex_};
+    fold_recent(s);
+}
+
+void Monitors::bind(MonitorSession& s, const connection_id& conn) {
+    if (s.detached_since) {
+        s.detached_since.reset();
+    } else if (s.conn && *s.conn != conn) {
+        log::debug(logcat, "monitor session moved off a connection still open");
+        if (auto it = session_conns_.find(*s.conn); it != session_conns_.end() && it->second == &s)
+            session_conns_.erase(it);
+        std::lock_guard lock{missed_mutex_};
+        fold_recent(s);
+    }
+    s.conn = conn;
+    session_conns_[conn] = &s;
+}
+
+bool Monitors::session_live(const MonitorSession& s, std::chrono::steady_clock::time_point now) {
+    return s.conn || !s.detached_since || now < *s.detached_since + SESSION_DETACHED_LIFETIME;
+}
+
+void Monitors::remove_session(MonitorSession& s) {
+    log::debug(logcat, "removing monitor session with {} monitor(s)", s.monitor_count);
+    // Copied, because erasing the monitors removes them from `accounts`.
+    auto accounts = s.accounts;
+    for (const auto& account : accounts) {
+        auto [it, end] = monitoring_.equal_range(account);
+        while (it != end)
+            it = it->second.owner == monitor_owner{&s} ? erase_monitor(it) : std::next(it);
+    }
+    if (s.conn)
+        if (auto it = session_conns_.find(*s.conn); it != session_conns_.end() && it->second == &s)
+            session_conns_.erase(it);
+    // Last, as this may destroy `s` (so by iterator: erasing by key would use `s.token` as it
+    // goes).
+    sessions_.erase(sessions_.find(s.token));
+}
+
+void Monitors::rotate_token(MonitorSession& s) {
+    std::string token(MonitorSession::TOKEN_SIZE, '\0');
+    do {
+        randombytes_buf(token.data(), token.size());
+    } while (sessions_.contains(token));
+
+    auto node = sessions_.extract(s.token);
+    s.token = token;
+    if (node) {
+        node.key() = std::move(token);
+        sessions_.insert(std::move(node));
+    }
+}
+
+void Monitors::handle_monitor_session(
+        std::string_view request,
+        const connection_id& conn,
+        const std::function<void(std::string)>& reply) {
+    std::optional<uint64_t> body_max, account_limit;
+    bool list_live = true;
+    std::optional<std::string> token;
+    try {
+        oxenc::bt_dict_consumer d{request};
+        if (d.skip_until("b"))
+            body_max = d.consume_integer<uint64_t>();
+        if (d.skip_until("l"))
+            list_live = d.consume_integer<bool>();
+        if (d.skip_until("m"))
+            if (account_limit = d.consume_integer<uint64_t>(); *account_limit < 1)
+                throw std::invalid_argument{"m must be at least 1"};
+        if (d.skip_until("t"))
+            token = d.consume_string();
+    } catch (const std::exception& e) {
+        oxenc::bt_dict_producer out;
+        monitor_error(
+                out,
+                MonitorResponse::BAD_ARGS,
+                "Invalid arguments: monitor_session takes a single bencoded dict parameter, with "
+                "optional integers b (0 or more), l (0 or 1) and m (1 or more) and string t");
+        return reply(std::move(out).str());
+    }
+
+    // Everything that changes the session, at once: nothing changes (and the token given still
+    // resumes the session) unless the connection is still open.  Nothing here walks the session's
+    // monitors or accounts, so a resume costs the same under the lock however big the session.
+    std::shared_ptr<MonitorSession> session;
+    bool resumed = false;
+    std::string issued;
+    std::set<std::string> ended;
+    uint64_t replay_id = 0;
+    {
+        std::unique_lock lock{monitoring_mutex_};
+        auto now = std::chrono::steady_clock::now();
+
+        if (closed_conns_.contains(conn)) {
+            log::debug(logcat, "ignoring monitor_session from a connection that has since closed");
+            return;
+        }
+
+        if (token)
+            if (auto it = sessions_.find(*token);
+                it != sessions_.end() && session_live(*it->second, now))
+                session = it->second;
+
+        // A connection is bound to at most one session, so starting or resuming another
+        // detaches whatever this one had.
+        MonitorSession* previous = nullptr;
+        if (auto it = session_conns_.find(conn);
+            it != session_conns_.end() && it->second != session.get())
+            previous = it->second;
+
+        resumed = session != nullptr;
+        if (resumed) {
+            bind(*session, conn);
+            ended = std::exchange(session->ended, {});
+        }
+        if (previous)
+            detach(*previous, now);
+        if (!resumed)
+            session = std::make_shared<MonitorSession>();
+        rotate_token(*session);
+        if (!resumed)
+            sessions_.emplace(session->token, session);
+        session->body_max = body_max;
+        bind(*session, conn);
+        issued = session->token;
+        if (resumed) {
+            replay_id = next_replay_id_++;
+            std::lock_guard mlock{missed_mutex_};
+            session->replay_id = replay_id;
+        }
+    }
+
+    // What the request's per-account limit cuts from the replay, worked out before the reply,
+    // which reports it, and the replay that follows it.
+    std::map<std::string, std::map<namespace_id, int64_t>> cut;
+    if (resumed && account_limit)
+        cut = limit_replay(*session, *account_limit);
+
+    // The live monitors to list, gathered a batch at a time under a shared lock (which holds up
+    // other requests, but not notifications) from a snapshot of the session's accounts.
+    struct listed {
+        std::string account;
+        std::chrono::seconds expires_in;
+        bool want_data;
+        std::vector<namespace_id> namespaces;
+    };
+    std::vector<listed> live;
+    if (resumed && list_live) {
+        std::vector<std::string> accounts;
+        {
+            std::shared_lock lock{monitoring_mutex_};
+            accounts.assign(session->accounts.begin(), session->accounts.end());
+        }
+        const monitor_owner owner{session.get()};
+        for (size_t start = 0; start < accounts.size(); start += PASS_BATCH) {
+            std::shared_lock lock{monitoring_mutex_};
+            auto now = std::chrono::steady_clock::now();
+            for (size_t i = start; i < std::min(start + PASS_BATCH, accounts.size()); i++)
+                for (auto [it, end] = monitoring_.equal_range(accounts[i]); it != end; ++it)
+                    if (const auto& mon = it->second; mon.owner == owner && mon.expiry >= now)
+                        live.push_back(
+                                {accounts[i],
+                                 std::chrono::duration_cast<std::chrono::seconds>(mon.expiry - now),
+                                 mon.want_data,
+                                 mon.namespaces});
+        }
+    }
+
+    log::debug(
+            logcat,
+            "{} monitor session; {} ended monitor account(s), {} account(s) cut by its limit",
+            resumed ? "resumed" : "started",
+            ended.size(),
+            cut.size());
+
+    oxenc::bt_dict_producer out;
+    {
+        auto by_account = out.append_dict("m");
+        for (const auto& [account, by_ns] : cut) {
+            auto list = by_account.append_list(account);
+            for (const auto& [ns, count] : by_ns) {
+                auto entry = list.append_dict();
+                entry.append("n", to_int(ns));
+                entry.append("o", count);
+            }
+        }
+    }
+    out.append("r", resumed ? 1 : 0);
+    {
+        auto list = out.append_list("s");
+        for (const auto& account : ended) {
+            user_pubkey pk;
+            if (!pk.load(account))
+                continue;
+            auto entry = list.append_dict();
+            entry.append("@", account);
+            monitor_error(
+                    entry,
+                    MonitorResponse::WRONG_SWARM,
+                    "Account is no longer stored by this service node's swarm");
+            snode::swarm_to_bt(entry, swarm_for(pk), contacts());
+        }
+        for (const auto& m : live) {
+            auto entry = list.append_dict();
+            entry.append("@", m.account);
+            entry.append("d", m.want_data ? 1 : 0);
+            {
+                auto ns = entry.append_list("n");
+                for (auto n : m.namespaces)
+                    ns.append(to_int(n));
+            }
+            entry.append("x", m.expires_in.count());
+        }
+    }
+    out.append("t", issued);
+    reply(std::move(out).str());
+
+    if (resumed)
+        replay(conn, std::move(session), replay_id);
+}
+
+uint32_t Monitors::account_index(MonitorSession& s, const std::string& account) {
+    auto [it, inserted] =
+            s.account_index.try_emplace(account, static_cast<uint32_t>(s.account_keys.size()));
+    if (inserted)
+        s.account_keys.push_back(account);
+    return it->second;
+}
+
+void Monitors::note_missed(
+        MonitorSession& s, uint32_t account, namespace_id ns, int64_t id, bool want_data) {
+    auto [it, inserted] = s.missed.try_emplace({account, ns}, missed_from{id, want_data});
+    if (!inserted) {
+        it->second.id = std::min(it->second.id, id);
+        it->second.want_data |= want_data;
+    }
+}
+
+void Monitors::fold_recent(MonitorSession& s) {
+    for (const auto& r : s.recent)
+        note_missed(s, r.account, r.ns, r.id, r.want_data);
+    s.recent.clear();
+}
+
+void Monitors::prune_recent(MonitorSession& s, std::chrono::steady_clock::time_point now) {
+    while (!s.recent.empty() && s.recent.front().sent + RECENT_WINDOW < now)
+        s.recent.pop_front();
+}
+
+std::map<std::string, std::map<namespace_id, int64_t>> Monitors::limit_replay(
+        MonitorSession& s, uint64_t limit) {
+    // The pairs to replay, by account.
+    std::map<std::string, std::vector<std::pair<namespace_id, int64_t>>> by_account;
+    {
+        std::lock_guard lock{missed_mutex_};
+        for (const auto& [key, from] : s.missed)
+            by_account[s.account_keys[key.first]].emplace_back(key.second, from.id);
+    }
+
+    std::map<std::string, std::map<namespace_id, int64_t>> cut;
+    std::map<std::pair<std::string, namespace_id>, int64_t> new_start;
+    for (const auto& [account, pairs] : by_account) {
+        user_pubkey pk;
+        if (!pk.load(account))
+            continue;
+        try {
+            // The account's newest `limit` across its namespaces are among each namespace's newest
+            // `limit`; one more from each tells whether there is anything to cut.
+            std::vector<int64_t> newest;
+            for (const auto& [ns, from] : pairs)
+                for (const auto& [id, m] : retrieve_from_id(pk, ns, from, limit + 1, true))
+                    newest.push_back(id);
+            if (newest.size() <= limit)
+                continue;
+            std::ranges::sort(newest, std::greater<>{});
+            const int64_t cutoff = newest[limit - 1];
+            for (const auto& [ns, from] : pairs) {
+                if (from >= cutoff)
+                    continue;
+                if (auto n = count_id_range(pk, ns, from, cutoff); n > 0)
+                    cut[account][ns] = n;
+                new_start[{account, ns}] = cutoff;
+            }
+        } catch (const std::exception& e) {
+            // Replaying more than asked for is better than losing any.
+            log::warning(logcat, "Unable to apply a monitor session's replay limit: {}", e.what());
+        }
+    }
+
+    std::lock_guard lock{missed_mutex_};
+    for (const auto& [key, start] : new_start)
+        if (auto idx = s.account_index.find(key.first); idx != s.account_index.end())
+            if (auto it = s.missed.find({idx->second, key.second}); it != s.missed.end())
+                it->second.id = std::max(it->second.id, start);
+    return cut;
+}
+
+struct Monitors::replay_state {
+    connection_id conn;
+    uint64_t id;
+    std::shared_ptr<MonitorSession> session;
+    size_t sent = 0;
+};
+
+void Monitors::replay(const connection_id& conn, std::shared_ptr<MonitorSession> s, uint64_t id) {
+    replay_chunk(std::make_shared<replay_state>(conn, id, std::move(s)));
+}
+
+void Monitors::replay_chunk(std::shared_ptr<replay_state> state) {
+    auto& s = *state->session;
+    // Whether this replay may still act for the session.  Called with both locks held.
+    auto current = [&] { return s.conn == state->conn && s.replay_id == state->id; };
+    auto stop = [&](std::string_view why) {
+        log::debug(
+                logcat, "Ending a missed notification replay after {} sent: {}", state->sent, why);
+        send_paced(state->conn, state->id, {}, nullptr);
+    };
+
+    // Pairs with nothing (left) to send are passed straight over.
+    while (true) {
+        std::pair<uint32_t, namespace_id> key;
+        missed_from from;
+        std::string account;
+        {
+            std::shared_lock lock{monitoring_mutex_};
+            std::lock_guard mlock{missed_mutex_};
+            if (!current())
+                return stop("the session has moved on");
+            if (s.missed.empty())
+                return stop("all sent");
+            std::tie(key, from) = *s.missed.begin();
+            account = s.account_keys[key.first];
+        }
+
+        user_pubkey pk;
+        std::vector<std::pair<int64_t, message>> rows;
+        if (pk.load(account)) {
+            try {
+                rows = retrieve_from_id(pk, key.second, from.id, REPLAY_CHUNK, false);
+            } catch (const std::exception& e) {
+                // The session keeps what is left, for its next resume.
+                log::error(logcat, "Missed notification replay lookup failed: {}", e.what());
+                return stop("message lookup failed");
+            }
+        }
+
+        std::vector<std::string> bodies;
+        {
+            std::shared_lock lock{monitoring_mutex_};
+            std::lock_guard mlock{missed_mutex_};
+            if (!current())
+                return stop("the session has moved on");
+            auto it = s.missed.find(key);
+            if (it == s.missed.end())
+                continue;
+            // Whatever is taken from `missed` here goes into `recent` in the same step, so that if
+            // the connection turns out to be dead it is noted as missed again on detaching.
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [id, m] : rows) {
+                if (id < it->second.id)
+                    continue;
+                bodies.push_back(notify_body(
+                        m, {from.want_data, from.want_data ? s.body_max : std::nullopt}));
+                s.recent.push_back({now, id, key.first, key.second, from.want_data});
+            }
+            if (rows.size() < REPLAY_CHUNK)
+                s.missed.erase(it);
+            else
+                it->second.id = rows.back().first + 1;
+        }
+        if (bodies.empty())
+            continue;
+
+        state->sent += bodies.size();
+        return send_paced(
+                state->conn, state->id, std::move(bodies), [this, state] { replay_chunk(state); });
+    }
+}
+
+void Monitors::connection_closed(const connection_id& conn) {
     std::unique_lock lock{monitoring_mutex_};
+
+    closed_conns_.emplace(conn, std::chrono::steady_clock::now());
+
+    if (auto it = session_conns_.find(conn); it != session_conns_.end())
+        detach(*it->second, std::chrono::steady_clock::now());
 
     auto conn_it = monitoring_conns_.find(conn);
     if (conn_it == monitoring_conns_.end())
@@ -356,10 +866,11 @@ void Monitors::remove_monitors_for(const connection_id& conn) {
             "dropping {} monitor subscription(s) of a closed connection",
             conn_it->second.size());
 
+    const monitor_owner owner{conn};
     for (const auto& account : conn_it->second) {
         auto [it, end] = monitoring_.equal_range(account);
         while (it != end) {
-            if (it->second.conn == conn)
+            if (it->second.owner == owner)
                 it = monitoring_.erase(it);
             else
                 ++it;
@@ -369,60 +880,158 @@ void Monitors::remove_monitors_for(const connection_id& conn) {
     monitoring_conns_.erase(conn_it);
 }
 
-void Monitors::remove_expired() {
-    std::unique_lock lock{monitoring_mutex_};
-    auto now = std::chrono::steady_clock::now();
-
+struct Monitors::sweep_state {
+    // Sessions found ended, to remove.
+    std::vector<std::shared_ptr<MonitorSession>> ended;
+    size_t next_ended = 0;
+    // The walk over the table's buckets for expired monitors.
+    size_t bucket = 0, bucket_count = 0;
     size_t expired = 0;
-    for (auto it = monitoring_.begin(); it != monitoring_.end();) {
-        if (it->second.expiry < now) {
-            it = erase_monitor(it);
-            ++expired;
-        } else
-            ++it;
+};
+
+void Monitors::remove_expired() {
+    if (sweeping_.exchange(true))
+        return;
+
+    // First connections gone without our being told: their sessions are detached, and so fold in
+    // their recent logs, before anything is pruned from those.
+    std::vector<connection_id> conns;
+    {
+        std::shared_lock lock{monitoring_mutex_};
+        for (const auto& [conn, s] : session_conns_)
+            conns.push_back(conn);
+        for (const auto& [conn, accounts] : monitoring_conns_)
+            conns.push_back(conn);
+    }
+    std::ranges::sort(conns);
+    conns.erase(std::unique(conns.begin(), conns.end()), conns.end());
+    // Asked without the lock held, as the transport has its own thread to ask.
+    for (const auto& conn : gone_connections(std::move(conns))) {
+        log::debug(logcat, "Treating a connection that no longer exists as closed");
+        connection_closed(conn);
     }
 
-    if (expired)
-        log::debug(logcat, "removed {} expired monitor(s)", expired);
+    auto state = std::make_shared<sweep_state>();
+    {
+        std::unique_lock lock{monitoring_mutex_};
+        auto now = std::chrono::steady_clock::now();
+        std::erase_if(closed_conns_, [&now](const auto& c) {
+            return c.second + CLOSED_CONN_MEMORY < now;
+        });
+        std::lock_guard mlock{missed_mutex_};
+        for (auto& [token, s] : sessions_) {
+            if (!session_live(*s, now))
+                state->ended.push_back(s);
+            else if (s->conn)
+                prune_recent(*s, now);
+        }
+    }
+    sweep_step(std::move(state));
+}
+
+void Monitors::sweep_step(std::shared_ptr<sweep_state> state) {
+    bool done = false;
+    {
+        std::unique_lock lock{monitoring_mutex_};
+        auto now = std::chrono::steady_clock::now();
+        if (state->next_ended < state->ended.size()) {
+            // Sessions until about a batch's worth of monitors has gone with them.
+            size_t removed_monitors = 0;
+            while (state->next_ended < state->ended.size() && removed_monitors < PASS_BATCH) {
+                auto& s = *state->ended[state->next_ended++];
+                // Resumed since it was found ended, or already removed (to make room)?
+                if (session_live(s, now) || !sessions_.contains(s.token) ||
+                    sessions_.at(s.token).get() != &s)
+                    continue;
+                removed_monitors += s.monitor_count + 1;
+                remove_session(s);
+            }
+        } else {
+            for (const auto& account : accounts_in_buckets(state->bucket, state->bucket_count)) {
+                auto [it, end] = monitoring_.equal_range(account);
+                while (it != end) {
+                    const auto& mon = it->second;
+                    // A monitor of a session without a connection lasts as long as the session.
+                    if (mon.expiry < now && mon.destination()) {
+                        it = erase_monitor(it);
+                        ++state->expired;
+                    } else
+                        ++it;
+                }
+            }
+            done = state->bucket >= monitoring_.bucket_count();
+        }
+    }
+
+    if (!done)
+        return run_later(
+                [this, state = std::move(state)]() mutable { sweep_step(std::move(state)); });
+
+    if (state->expired || !state->ended.empty())
+        log::debug(
+                logcat,
+                "removed {} expired monitor(s) and {} monitor session(s)",
+                state->expired,
+                state->ended.size());
+    sweeping_ = false;
+}
+
+std::vector<std::string> Monitors::accounts_in_buckets(size_t& bucket, size_t& bucket_count) const {
+    if (bucket_count != monitoring_.bucket_count()) {
+        bucket_count = monitoring_.bucket_count();
+        bucket = 0;
+    }
+    std::vector<std::string> accounts;
+    const size_t end = std::min(bucket + PASS_BATCH, bucket_count);
+    for (; bucket < end; bucket++)
+        // Entries with equal keys are adjacent, and in the same bucket.
+        for (auto it = monitoring_.begin(bucket); it != monitoring_.end(bucket); ++it)
+            if (accounts.empty() || accounts.back() != it->first)
+                accounts.push_back(it->first);
+    return accounts;
 }
 
 std::vector<std::pair<user_pubkey, std::vector<connection_id>>> Monitors::extract_foreign_monitors(
         const std::function<bool(const user_pubkey&)>& still_ours) {
 
-    std::vector<std::string> accounts;
+    // Accounts found more than once (the table having been rehashed meanwhile) are tested once.
+    std::unordered_set<std::string> accounts;
     {
-        std::shared_lock lock{monitoring_mutex_};
-        accounts.reserve(monitoring_.size());
-        // Entries with equal keys are adjacent in an unordered_multimap, so this collects each
-        // monitored account exactly once.
-        for (const auto& [account, _mon] : monitoring_)
-            if (accounts.empty() || accounts.back() != account)
-                accounts.push_back(account);
+        size_t bucket = 0, bucket_count = 0;
+        bool more = true;
+        while (more) {
+            std::shared_lock lock{monitoring_mutex_};
+            for (auto& account : accounts_in_buckets(bucket, bucket_count))
+                accounts.insert(std::move(account));
+            more = bucket < monitoring_.bucket_count();
+        }
     }
 
     std::vector<std::pair<std::string, user_pubkey>> foreign;
-    for (auto& account : accounts) {
+    for (const auto& account : accounts) {
         user_pubkey pk;
         if (!pk.load(account)) {
             log::warning(logcat, "Ignoring unparseable pubkey in the monitoring table");
             continue;
         }
         if (!still_ours(pk))
-            foreign.emplace_back(std::move(account), std::move(pk));
+            foreign.emplace_back(account, std::move(pk));
     }
 
     std::vector<std::pair<user_pubkey, std::vector<connection_id>>> dropped;
-    if (foreign.empty())
-        return dropped;
-
     dropped.reserve(foreign.size());
-    {
+    for (size_t start = 0; start < foreign.size(); start += PASS_BATCH) {
         std::unique_lock lock{monitoring_mutex_};
-        for (auto& [account, pk] : foreign) {
+        for (size_t i = start; i < std::min(start + PASS_BATCH, foreign.size()); i++) {
+            auto& [account, pk] = foreign[i];
             std::vector<connection_id> conns;
             auto [it, end] = monitoring_.equal_range(account);
             while (it != end) {
-                conns.push_back(it->second.conn);
+                if (auto* to = it->second.destination())
+                    conns.push_back(*to);
+                else
+                    // A session with nobody to tell hears of it when next resumed.
+                    std::get<MonitorSession*>(it->second.owner)->ended.insert(account);
                 it = erase_monitor(it);
             }
             // A connection with several monitors of the account is told once.
@@ -470,67 +1079,54 @@ void Monitors::drop_foreign_monitors() {
     }
 }
 
-void Monitors::notify_message(const message& m) {
-    auto pubkey = m.pubkey.prefixed_raw();
-    // Each connection gets one notification however many of its monitors match: with data if any
-    // of them wants it.
-    std::map<connection_id, bool> to_conns;
+void Monitors::notify_message(const message& m, int64_t id) {
+    // Each destination gets one notification however many of its monitors match: with data if any
+    // of them wants it, limited by the `b` of the session they belong to.  (A connection bound to a
+    // session can also have monitors of its own, which have no limit and so lift it.)
+    std::map<connection_id, body_limit> to_conns;
     {
         auto now = std::chrono::steady_clock::now();
         std::shared_lock lock{monitoring_mutex_};
 
-        for (auto [it, end] = monitoring_.equal_range(pubkey); it != end; ++it) {
+        // The sessions it is for, and whether any of their matching monitors wants data: one with
+        // a connection is sent it and remembers having been; one without notes it as missed.
+        std::map<MonitorSession*, bool> to_sessions;
+        const auto account = m.pubkey.prefixed_raw();
+        for (auto [it, end] = monitoring_.equal_range(account); it != end; ++it) {
             const auto& mon_data = it->second;
-            if (mon_data.expiry >= now &&
-                std::binary_search(
+            auto* to = mon_data.destination();
+            // A monitor of a session without a connection lasts as long as the session: its
+            // subscriber cannot renew it while away.
+            if ((to && mon_data.expiry < now) ||
+                !std::binary_search(
                         mon_data.namespaces.begin(), mon_data.namespaces.end(), m.msg_namespace))
-                to_conns[mon_data.conn] |= mon_data.want_data;
+                continue;
+            if (to)
+                to_conns[*to].merge(
+                        {mon_data.want_data,
+                         mon_data.want_data ? body_max_of(mon_data.owner) : std::nullopt});
+            if (auto* s = std::get_if<MonitorSession*>(&mon_data.owner))
+                to_sessions[*s] |= mon_data.want_data;
+        }
+        if (!to_sessions.empty()) {
+            std::lock_guard mlock{missed_mutex_};
+            for (auto& [s, want_data] : to_sessions) {
+                auto idx = account_index(*s, account);
+                if (s->conn)
+                    s->recent.push_back({now, id, idx, m.msg_namespace, want_data});
+                else
+                    note_missed(*s, idx, m.msg_namespace, id, want_data);
+            }
         }
     }
 
-    std::vector<connection_id> relay_to, relay_to_with_data;
-    for (const auto& [conn, want_data] : to_conns)
-        (want_data ? relay_to_with_data : relay_to).push_back(conn);
+    // Grouped by what of the body they get, so that each distinct notification is built only once.
+    std::map<body_limit, std::vector<connection_id>> relay_to;
+    for (const auto& [conn, body] : to_conns)
+        relay_to[body.applied(m.data.size())].push_back(conn);
 
-    if (relay_to.empty() && relay_to_with_data.empty())
-        return;
-
-    // We output a dict with keys (in order):
-    // - @ pubkey
-    // - h msg hash
-    // - n msg namespace
-    // - t msg timestamp
-    // - z msg expiry
-    // - ~ msg data (optional)
-    constexpr size_t metadata_size = 2       // d...e
-                                   + 3 + 36  // 1:@ and 33:[33-byte pubkey]
-                                   + 3 + 46  // 1:h and 43:[43-byte base64 unpadded hash]
-                                   + 3 + 8   // 1:n and i-32768e
-                                   + 3 + 16  // 1:t and i1658784776010e plus a byte to grow
-                                   + 3 + 16  // 1:z and i1658784776010e plus a byte to grow
-                                   + 10;     // safety margin
-
-    oxenc::bt_dict_producer d;
-    d.reserve(
-            relay_to_with_data.empty() ? metadata_size
-                                       : metadata_size  // all the metadata above
-                                                 + 3    // 1:~
-                                                 + 8    // 76800: plus a couple bytes to grow
-                                                 + m.data.size());
-
-    d.append("@", pubkey);
-    d.append("h", m.hash);
-    d.append("n", to_int(m.msg_namespace));
-    d.append("t", to_epoch_ms(m.timestamp));
-    d.append("z", to_epoch_ms(m.expiry));
-
-    if (!relay_to.empty())
-        send(relay_to, "notify", d.view());
-
-    if (!relay_to_with_data.empty()) {
-        d.append("~", m.data);
-        send(relay_to_with_data, "notify", d.view());
-    }
+    for (const auto& [body, conns] : relay_to)
+        send(conns, "notify", notify_body(m, body));
 }
 
 }  // namespace oxenss::server

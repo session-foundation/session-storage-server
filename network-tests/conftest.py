@@ -96,7 +96,9 @@ def _prefer_pinned_node(pinned_node):
     ss.preferred_node = pinned_node['pubkey_ed25519'] if pinned_node else None
 
 
-@pytest.fixture(scope="module")
+# A connection of each test's own: one shared by a module would idle out (and close) while a long
+# test runs without using it, failing the next test that does.
+@pytest.fixture
 def random_sn(rpc, sns, pinned_node):
     return rpc.connect(pinned_node or random.choice(sns))
 

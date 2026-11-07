@@ -383,3 +383,28 @@ def test_session_replays_everything(rpc, node, sk):
             break
         time.sleep(0.25)
     assert [n[b'h'] for n in got] == hashes
+
+
+def test_session_unprivileged_monitor_limit(rpc, node, sk):
+    """A session made by an ordinary client can have at most 64 monitors."""
+    conn = rpc.connect(node)
+    start_session(rpc, conn)
+    # Each namespace list is a monitor of its own.
+    for ns in range(64):
+        subscribe(rpc, conn, sk, namespaces=(ns * 10,), data=False)
+    req = notify_request(sk, int(time.time()), False, [640], netid=3)
+    [reply] = rpc.monitor(conn, bt_serialize(req)).get()
+    refused = bt_deserialize(reply)
+    assert refused[b'errcode'] == 8
+    # Renewing one it has is fine.
+    assert subscribe(rpc, conn, sk, namespaces=(0,), data=False)[b'success'] == 1
+
+
+def test_session_one_new_per_connection(rpc, node, sk):
+    """A connection can start one new session; another needs a new connection."""
+    conn = rpc.connect(node)
+    token = start_session(rpc, conn)[b't']
+    reply = rpc.monitor_session(conn, bt_serialize({})).get()
+    assert bt_deserialize(reply)[b'errcode'] == 10
+    # Resuming is still fine.
+    assert start_session(rpc, conn, token)[b'r'] == 1

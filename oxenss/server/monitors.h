@@ -128,6 +128,14 @@ struct MonitorSession {
     // The current token, which is also this session's key in `Monitors::sessions_`.
     std::string token;
 
+    // Whether the session was created by a connection with a privileged key, which is exempt from
+    // the limits on ordinary sessions (see Monitors::session_limits).
+    bool privileged = false;
+
+    // The IP the (unprivileged) session was created from, which it counts against; see
+    // Monitors::session_limits::sessions_per_ip.
+    std::string ip;
+
     // The connection the session's notifications go to, if any; and if none, since when.
     std::optional<connection_id> conn;
     std::optional<std::chrono::steady_clock::time_point> detached_since;
@@ -171,6 +179,15 @@ inline const connection_id* MonitorData::destination() const {
     return &std::get<connection_id>(owner);
 }
 
+// The Ed25519 pubkey (hex) of the production push server, privileged on mainnet without needing
+// configuring; see default_privileged_keys.
+inline constexpr std::string_view MAINNET_PUSH_SERVER_KEY =
+        "87a324b8a9472fbd397f14973b6443fb0902ee0b663595806bd601aa1a156496";
+
+// The Ed25519 pubkeys (32 bytes each) whose monitor sessions are privileged on every node of the
+// network: on mainnet, MAINNET_PUSH_SERVER_KEY; on testnet, none.
+std::unordered_set<std::string> default_privileged_keys(bool mainnet);
+
 /// The monitor subscriptions held by this node, and the notifications pushed to them.  The QUIC
 /// server owns the one instance and supplies the transport by implementing `send`.
 ///
@@ -179,7 +196,8 @@ class Monitors {
   public:
     // `sn` supplies the swarm state that the default environment hooks below consult.  It may be
     // null only for a subclass that overrides every one of them.
-    explicit Monitors(snode::ServiceNode* sn) : service_node_{sn} {}
+    // `privileged_keys` are the Ed25519 pubkeys (32 bytes each) whose sessions are privileged.
+    explicit Monitors(snode::ServiceNode* sn, std::unordered_set<std::string> privileged_keys = {});
 
     virtual ~Monitors() = default;
 
@@ -192,8 +210,9 @@ class Monitors {
     // If `conn` is bound to a session then the monitors are attached to the session instead.
     std::string handle_monitor(std::string_view request, const connection_id& conn);
 
-    // Handles a `monitor_session` request arriving on `conn`; see QUIC::handle_monitor_session for
-    // the request and reply formats.  The session is changed
+    // Handles a `monitor_session` request arriving on `conn`, whose QUIC remote pubkey is
+    // `remote_key` (empty if it presented none) and remote IP `remote_ip`; see
+    // QUIC::handle_monitor_session for the request and reply formats.  The session is changed
     // (started or resumed, bound to `conn` and its token rotated) all at once: if `conn` has
     // already closed by then nothing is changed and `reply` is not invoked, so the token given
     // still resumes the session.  Otherwise `reply` is invoked with the reply body, before any
@@ -201,7 +220,9 @@ class Monitors {
     void handle_monitor_session(
             std::string_view request,
             const connection_id& conn,
-            const std::function<void(std::string)>& reply);
+            const std::function<void(std::string)>& reply,
+            std::string_view remote_key = {},
+            std::string_view remote_ip = {});
 
     // Called when `conn` has closed: its connection-bound monitors are removed, and any session
     // bound to it is detached, keeping its monitors.
@@ -237,6 +258,35 @@ class Monitors {
     // batch at a time, continuing through `run_later`, with the lock released in between.  A sweep
     // started while one is still in progress does nothing.
     void remove_expired();
+
+    // The limits on ordinary (unprivileged) sessions.  A session is privileged if the connection
+    // that created it had one of the privileged keys (meant for a push server: one bulk
+    // subscriber with tens of thousands of monitors per node), and then none of these apply.
+    //
+    // An unprivileged session can have at most `unprivileged_monitors` monitors.
+    //
+    // The monitors of unprivileged sessions without a connection are bounded too, as anyone can
+    // make sessions (filling each with 64 monitors, replaying the same signed subscriptions into
+    // one after another) and leave them for SESSION_DETACHED_LIFETIME.  A bound session is bounded
+    // by its connection, and an empty one costs little, so it is the monitors of detached sessions
+    // that are counted: at about 340 bytes a monitor, `detached_monitors` is a bound of some 340MB
+    // against an attacker, far beyond legitimate use.  (What a detached session has missed is an
+    // entry per account and namespace that had a message, so is bounded by its monitors too.)
+    // Detaching a session is the only way the count rises; when it passes the limit, the
+    // unprivileged sessions detached the longest are removed whole until it does not.
+    //
+    // And as a monitoring connection's remote address is its client's own (directly, or the unique
+    // address of its tunnel), each IP can have at most `sessions_per_ip` unprivileged sessions,
+    // bound or not: enough for a client's one per node, and some reconnects that start afresh
+    // instead of resuming.  Beyond it the IP's own session detached the longest is removed whole;
+    // with none of its sessions detached, the new one is refused.  This is no bound against
+    // deliberate abuse (a new tunnel address is cheap), which `detached_monitors` is; it keeps a
+    // client that starts fresh sessions by mistake from displacing anyone's but its own.
+    struct session_limits {
+        size_t unprivileged_monitors = 64;
+        size_t detached_monitors = 1'000'000;
+        size_t sessions_per_ip = 8;
+    };
 
     // Pushes a `notify` for the newly stored message `m`, whose database row id is `id`, to each
     // subscriber monitoring its account and namespace.
@@ -297,8 +347,9 @@ class Monitors {
     virtual void run_later(std::function<void()> f);
 
     // Adds or renews a monitor for each of `subs`, returning how long each one now has until it
-    // expires.
-    std::vector<std::chrono::seconds> update_monitors(
+    // expires, or nullopt for one refused because its session already has as many monitors as it
+    // may.
+    std::vector<std::optional<std::chrono::seconds>> update_monitors(
             std::vector<subscription>& subs, const connection_id& conn);
 
     // Removes every monitor subscription whose account `still_ours` rejects, returning the dropped
@@ -330,8 +381,17 @@ class Monitors {
     // Sessions, by current token.
     std::unordered_map<std::string, std::shared_ptr<MonitorSession>> sessions_;
 
+    // The Ed25519 pubkeys (32 bytes each) whose sessions are privileged.
+    std::unordered_set<std::string> privileged_keys_;
+
+    // The unprivileged sessions created from each IP.
+    std::unordered_map<std::string, std::vector<MonitorSession*>> sessions_by_ip_;
+
     // The session bound to each connection that has one.
     std::map<connection_id, MonitorSession*> session_conns_;
+
+    // The connections that have started a new session, which may not start another.
+    std::set<connection_id> started_session_;
 
     // Connections that have closed, and when.  A request is handled on a worker thread after the
     // QUIC loop hands it over, so its connection may close first; this keeps such a request from
@@ -343,13 +403,22 @@ class Monitors {
     // Guards all of the above together, so that the indices cannot drift apart from the table.
     mutable std::shared_mutex monitoring_mutex_;
 
-    // Guards each session's recent and missed notifications.  Always taken after
-    // `monitoring_mutex_` (in either mode) when both are needed.
+    session_limits limits_;
+
+    // Guards each session's recent and missed notifications, and the detached sessions' index and
+    // count.  Always taken after `monitoring_mutex_` (in either mode) when both are needed.
     std::mutex missed_mutex_;
     // The id of the next replay to start.
     std::atomic<uint64_t> next_replay_id_{1};
     // Set while a sweep is in progress.
     std::atomic<bool> sweeping_{false};
+
+    // The sessions with no connection bound, of each kind, longest detached first.
+    std::array<std::set<std::pair<std::chrono::steady_clock::time_point, MonitorSession*>>, 2>
+            detached_;
+    // The monitors held by unprivileged sessions in `detached_` (see
+    // session_limits::detached_monitors).
+    size_t detached_monitors_ = 0;
 
   private:
     snode::ServiceNode* service_node_;
@@ -417,7 +486,9 @@ class Monitors {
     bool has_monitor(const std::string& account, const monitor_owner& owner);
 
     // Unbinds the session from its connection, starting its SESSION_DETACHED_LIFETIME and noting
-    // what was sent through the connection lately as possibly missed.
+    // what was sent through the connection lately as possibly missed; then, if that puts detached
+    // unprivileged sessions' monitors over session_limits::detached_monitors, removes the ones
+    // detached the longest, whole, until it does not.
     void detach(MonitorSession& s, std::chrono::steady_clock::time_point now);
 
     // Binds (or rebinds) the session to `conn`, ending any detachment.  A session moving off

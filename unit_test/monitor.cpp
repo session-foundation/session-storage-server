@@ -43,7 +43,12 @@ namespace {
 // what would have gone out on the wire.
 class TestMQ : public oxenss::server::Monitors {
   public:
-    TestMQ() : Monitors{nullptr} {}
+    // The one key whose sessions are privileged.
+    inline static const std::string PRIVILEGED_KEY = std::string(32, 'P');
+
+    TestMQ() : Monitors{nullptr, {PRIVILEGED_KEY}} {}
+    explicit TestMQ(std::unordered_set<std::string> privileged_keys) :
+            Monitors{nullptr, std::move(privileged_keys)} {}
 
     // How many (account, namespace) pairs sessions have noted as missed, and still to replay.
     size_t missed_pairs() const {
@@ -63,9 +68,13 @@ class TestMQ : public oxenss::server::Monitors {
 
     // Makes the session with token `token`, if detached, look detached `by` longer than it has.
     void age_session(const std::string& token, std::chrono::seconds by) {
+        std::lock_guard lock{missed_mutex_};
         auto& s = *sessions_.at(token);
         REQUIRE(s.detached_since);
+        auto& index = detached_[s.privileged];
+        index.erase({*s.detached_since, &s});
         *s.detached_since -= by;
+        index.emplace(*s.detached_since, &s);
     }
 
     static constexpr swarm_id_t OUR_SWARM = 0x1000;
@@ -226,7 +235,9 @@ class TestMQ : public oxenss::server::Monitors {
     }
 
     using Monitors::closed_conns_;
+    using Monitors::detached_monitors_;
     using Monitors::extract_foreign_monitors;
+    using Monitors::limits_;
     using Monitors::monitoring_;
     using Monitors::monitoring_conns_;
     using Monitors::sessions_;
@@ -365,22 +376,28 @@ std::vector<std::string> remaining(TestMQ& mq) {
 }
 
 // Sends a `monitor_session` request on `c`, returning the decoded reply.
-json session_request(TestMQ& mq, connection_id c, std::string_view token = "") {
+json session_request(
+        TestMQ& mq, connection_id c, std::string_view token = "", std::string_view key = "") {
     oxenc::bt_dict_producer req;
     if (!token.empty())
         req.append("t", token);
     std::string reply;
     mq.handle_monitor_session(
-            std::move(req).str(), c, [&reply](std::string r) { reply = std::move(r); });
+            std::move(req).str(), c, [&reply](std::string r) { reply = std::move(r); }, key);
     return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
 }
 
 // Sends a `monitor_session` request with the given keys on `c`, returning the decoded reply.
-json session_with(TestMQ& mq, connection_id c, oxenc::bt_dict req) {
+json session_with(TestMQ& mq, connection_id c, oxenc::bt_dict req, std::string_view key = "") {
     std::string reply;
     mq.handle_monitor_session(
-            oxenc::bt_serialize(req), c, [&reply](std::string r) { reply = std::move(r); });
+            oxenc::bt_serialize(req), c, [&reply](std::string r) { reply = std::move(r); }, key);
     return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+}
+
+// A privileged session_request.
+json privileged_session(TestMQ& mq, connection_id c, std::string_view token = "") {
+    return session_request(mq, c, token, TestMQ::PRIVILEGED_KEY);
 }
 
 // The `m` dict of a reply, as account -> namespace -> count.
@@ -688,6 +705,35 @@ TEST_CASE("monitor session - the token alone resumes a session", "[monitor][sess
     auto r = session_request(mq, conn(3), token);
     CHECK(r.at("r") == 1);
     CHECK(r.at("s").size() == 1);
+}
+
+TEST_CASE("monitor session - a connection can start only one new session", "[monitor][session]") {
+    TestMQ mq;
+    auto a = account(0x11);
+
+    auto first = token_of(session_request(mq, conn(1)));
+    subscribe(mq, a, conn(1));
+
+    // Not another, with no token or with one that no longer resumes anything.
+    auto r = session_request(mq, conn(1));
+    CHECK(r.at("errcode") == 10);
+    CHECK_FALSE(r.contains("t"));
+    CHECK(session_request(mq, conn(1), std::string(32, 'x')).at("errcode") == 10);
+    // The first carries on unchanged.
+    CHECK(mq.sessions_.contains(first));
+    CHECK(notifiers(mq, a) == std::vector{conn(1)});
+
+    // Resuming one is still fine: here another, started on connection 2 and left there, which the
+    // first gives way to on connection 1 (keeping its monitors for a resume of its own).
+    auto other = token_of(session_request(mq, conn(2)));
+    mq.connection_closed(conn(2));
+    auto resumed = session_request(mq, conn(1), other);
+    CHECK(resumed.at("r") == 1);
+    CHECK(notifiers(mq, a).empty());
+
+    // And a new connection starts afresh as it likes.
+    CHECK(session_request(mq, conn(3)).at("r") == 0);
+    CHECK(session_request(mq, conn(4), first).at("r") == 1);
 }
 
 TEST_CASE(
@@ -1676,6 +1722,62 @@ TEST_CASE("monitor session - a replay goes a chunk at a time", "[monitor][sessio
     }
 }
 TEST_CASE(
+        "monitor session - privilege comes from the creating connection's key",
+        "[monitor][session]") {
+    TestMQ mq;
+    auto privileged_of = [&](const json& reply) {
+        return mq.sessions_.at(token_of(reply))->privileged;
+    };
+
+    CHECK(privileged_of(privileged_session(mq, conn(1))));
+    CHECK_FALSE(privileged_of(session_request(mq, conn(2))));
+    CHECK_FALSE(privileged_of(session_request(mq, conn(3), "", std::string(32, 'X'))));
+
+    // Kept across resumes, whatever (if any) key the resuming connection has.
+    auto token = token_of(privileged_session(mq, conn(4)));
+    mq.connection_closed(conn(4));
+    auto r = session_request(mq, conn(5), token);
+    REQUIRE(r.at("r") == 1);
+    CHECK(privileged_of(r));
+    // Nor does a privileged key make an unprivileged session privileged.
+    auto plain = token_of(session_request(mq, conn(6)));
+    mq.connection_closed(conn(6));
+    r = privileged_session(mq, conn(7), plain);
+    REQUIRE(r.at("r") == 1);
+    CHECK_FALSE(privileged_of(r));
+}
+
+TEST_CASE(
+        "monitor session - an unprivileged session has at most 64 monitors", "[monitor][session]") {
+    TestMQ mq;
+    const size_t limit = mq.limits_.unprivileged_monitors;
+    REQUIRE(limit == 64);
+
+    std::vector<test_key> keys(limit + 1);
+    auto monitor = [&](size_t i, connection_id c) {
+        return oxenss::bt_to_json(oxenc::bt_dict_consumer{
+                mq.handle_monitor(signed_monitor_request(keys[i], false), c)});
+    };
+
+    session_request(mq, conn(1));
+    for (size_t i = 0; i < limit; i++)
+        REQUIRE(monitor(i, conn(1)).at("success") == 1);
+    auto refused = monitor(limit, conn(1));
+    CHECK(refused.at("errcode") == 8);
+    CHECK(refused.at("error") == "Too many monitors in this session (at most 64)");
+    // Renewing one it has is fine.
+    CHECK(monitor(0, conn(1)).at("success") == 1);
+    CHECK(mq.monitoring_.size() == limit);
+
+    // A privileged session has no such limit, nor a connection without one.
+    privileged_session(mq, conn(2));
+    for (size_t i = 0; i <= limit; i++)
+        CHECK(monitor(i, conn(2)).at("success") == 1);
+    for (size_t i = 0; i <= limit; i++)
+        CHECK(monitor(i, conn(3)).at("success") == 1);
+}
+
+TEST_CASE(
         "monitor session - nothing missed is discarded, however much",
         "[monitor][session][missed]") {
     TestMQ mq;
@@ -1870,4 +1972,150 @@ TEST_CASE("monitor session - each replay has its own increasing id", "[monitor][
     session_request(mq, conn(3), token_of(r));
     CHECK(mq.replays.back() > first);
     CHECK(std::ranges::is_sorted(mq.replays));
+}
+TEST_CASE("monitor session - detached unprivileged monitors are capped", "[monitor][session]") {
+    TestMQ mq;
+    mq.limits_.detached_monitors = 5;
+    auto with_monitors = [&](connection_id c, unsigned char first, int n, bool privileged = false) {
+        auto token = token_of(privileged ? privileged_session(mq, c) : session_request(mq, c));
+        for (int i = 0; i < n; i++)
+            subscribe(mq, account(first + i), c);
+        return token;
+    };
+
+    auto priv = with_monitors(conn(1), 0x10, 4, true);
+    auto u1 = with_monitors(conn(2), 0x20, 2);
+    auto u2 = with_monitors(conn(3), 0x30, 2);
+    auto u3 = with_monitors(conn(4), 0x40, 2);
+    mq.connection_closed(conn(1));
+    mq.connection_closed(conn(2));
+    mq.connection_closed(conn(3));
+    mq.age_session(priv, 3min);
+    mq.age_session(u1, 2min);
+    mq.age_session(u2, 1min);
+    // Bound sessions, and privileged ones, are not counted.
+    CHECK(mq.detached_monitors_ == 4);
+
+    SECTION("detaching past the limit removes the longest-detached unprivileged session whole") {
+        mq.connection_closed(conn(4));  // 6
+        CHECK_FALSE(mq.sessions_.contains(u1));
+        CHECK(mq.sessions_.contains(u2));
+        CHECK(mq.sessions_.contains(u3));
+        CHECK(mq.sessions_.contains(priv));
+        CHECK(mq.detached_monitors_ == 4);
+        CHECK(notifiers(mq, account(0x20)).empty());
+        CHECK(session_request(mq, conn(5), u1).at("r") == 0);
+    }
+    SECTION("resuming, and an account moving swarm, bring the count down") {
+        CHECK(session_request(mq, conn(5), u2).at("r") == 1);
+        CHECK(mq.detached_monitors_ == 2);
+        mq.elsewhere[account(0x20)] = 0x2000;
+        mq.drop_foreign_monitors();
+        CHECK(mq.detached_monitors_ == 1);
+        mq.connection_closed(conn(4));  // 3: within the limit
+        CHECK(mq.sessions_.contains(u1));
+        CHECK(mq.sessions_.contains(u3));
+    }
+}
+
+TEST_CASE(
+        "monitor session - a resume is never cut by the detachment it causes",
+        "[monitor][session]") {
+    TestMQ mq;
+    mq.limits_.detached_monitors = 3;
+
+    // x, detached the longest, and z are within the limit between them...
+    auto x = token_of(session_request(mq, conn(1)));
+    subscribe(mq, account(0x11), conn(1));
+    subscribe(mq, account(0x12), conn(1));
+    auto z = token_of(session_request(mq, conn(2)));
+    subscribe(mq, account(0x21), conn(2));
+    mq.connection_closed(conn(1));
+    mq.connection_closed(conn(2));
+    mq.age_session(x, 1min);
+    // ... and y is bound to the connection x is resumed on, so is detached by it.
+    session_request(mq, conn(3));
+    subscribe(mq, account(0x31), conn(3));
+    subscribe(mq, account(0x32), conn(3));
+    REQUIRE(mq.detached_monitors_ == 3);
+
+    // Were x still counted as detached, y's two would put it over and x would go first.
+    auto r = session_request(mq, conn(3), x);
+    CHECK(r.at("r") == 1);
+    CHECK(r.at("s").size() == 2);
+    CHECK(notifiers(mq, account(0x11)) == std::vector{conn(3)});
+    CHECK(mq.detached_monitors_ == 3);
+    CHECK(mq.sessions_.contains(z));
+}
+
+TEST_CASE(
+        "monitor session - each IP has a limited number of unprivileged sessions",
+        "[monitor][session]") {
+    TestMQ mq;
+    mq.limits_.sessions_per_ip = 3;
+    const std::string A = "fd00::a", B = "fd00::b";
+    auto from = [&](connection_id c, const std::string& ip, std::string_view key = "") {
+        std::string reply;
+        mq.handle_monitor_session(
+                "de", c, [&reply](std::string r) { reply = std::move(r); }, key, ip);
+        return oxenss::bt_to_json(oxenc::bt_dict_consumer{reply});
+    };
+
+    auto a1 = token_of(from(conn(1), A));
+    auto a2 = token_of(from(conn(2), A));
+    auto a3 = token_of(from(conn(3), A));
+    auto b1 = token_of(from(conn(10), B));
+    mq.connection_closed(conn(1));
+    mq.connection_closed(conn(2));
+    mq.connection_closed(conn(10));
+    mq.age_session(b1, 5min);  // detached longest of all, but not A's to give up
+    mq.age_session(a1, 2min);
+    mq.age_session(a2, 1min);
+
+    // A fourth from A displaces A's own session detached the longest, then the next.
+    auto a4 = token_of(from(conn(4), A));
+    CHECK_FALSE(mq.sessions_.contains(a1));
+    CHECK(mq.sessions_.contains(a2));
+    CHECK(mq.sessions_.contains(b1));
+    auto a5 = token_of(from(conn(5), A));
+    CHECK_FALSE(mq.sessions_.contains(a2));
+    CHECK(mq.sessions_.contains(b1));
+
+    // With all of A's sessions bound, another is refused.
+    auto refused = from(conn(6), A);
+    CHECK(refused.at("errcode") == 9);
+    CHECK_FALSE(refused.contains("t"));
+    CHECK(mq.sessions_.size() == 4);
+
+    // Neither another address, nor privileged sessions from A, are affected; nor is resuming.
+    CHECK(from(conn(11), B).contains("t"));
+    CHECK(from(conn(7), A, TestMQ::PRIVILEGED_KEY).contains("t"));
+    mq.connection_closed(conn(3));
+    std::string reply;
+    oxenc::bt_dict_producer req;
+    req.append("t", a3);
+    mq.handle_monitor_session(
+            std::move(req).str(),
+            conn(8),
+            [&reply](std::string r) { reply = std::move(r); },
+            "",
+            A);
+    CHECK(oxenss::bt_to_json(oxenc::bt_dict_consumer{reply}).at("r") == 1);
+    CHECK(mq.sessions_.contains(a4));
+    CHECK(mq.sessions_.contains(a5));
+}
+
+TEST_CASE(
+        "monitor session - the push server's key is built in on mainnet only",
+        "[monitor][session]") {
+    using oxenss::server::default_privileged_keys;
+    const auto key = oxenc::from_hex(oxenss::server::MAINNET_PUSH_SERVER_KEY);
+    REQUIRE(key.size() == 32);
+    CHECK(default_privileged_keys(true) == std::unordered_set{key});
+    CHECK(default_privileged_keys(false).empty());
+
+    // So on mainnet a session made with that key is privileged.
+    TestMQ mq{default_privileged_keys(true)};
+    auto token = token_of(session_request(mq, conn(1), "", key));
+    CHECK(mq.sessions_.at(token)->privileged);
 }

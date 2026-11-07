@@ -35,6 +35,8 @@ struct command_line_options {
     std::string oxend_ed25519_key;  // test only
     // x25519 key that will be given access to get_stats omq endpoint
     std::vector<std::string> stats_access_keys;
+    // Ed25519 keys whose monitor sessions are privileged, in addition to the built-in ones.
+    std::vector<std::string> monitor_session_privileged_keys;
 };
 
 using parse_result = std::variant<command_line_options, int>;

@@ -42,6 +42,9 @@ enum class MonitorResponse {
     BAD_SIG = 5,
     WRONG_SWARM = 6,
     NO_SWARM_INFO = 7,
+    TOO_MANY_MONITORS = 8,
+    TOO_MANY_SESSIONS = 9,
+    SESSION_ALREADY_STARTED = 10,
 };
 
 inline void monitor_error(oxenc::bt_dict_producer& out, MonitorResponse r, std::string message) {

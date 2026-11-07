@@ -107,7 +107,8 @@ class QUIC : public MQBase {
          rpc::RateLimiter& rl,
          std::span<const Address> bind,
          const crypto::ed25519_seckey& sk,
-         const transport_options& opts);
+         const transport_options& opts,
+         std::unordered_set<std::string> privileged_monitor_keys = {});
 
     void startup_endpoint();
 
@@ -194,7 +195,11 @@ class QUIC : public MQBase {
         void run_later(std::function<void()> f) override;
 
       public:
-        QUICMonitors(QUIC& quic, snode::ServiceNode& sn) : Monitors{&sn}, quic_{quic} {}
+        QUICMonitors(
+                QUIC& quic,
+                snode::ServiceNode& sn,
+                std::unordered_set<std::string> privileged_keys) :
+                Monitors{&sn, std::move(privileged_keys)}, quic_{quic} {}
     };
 
     QUICMonitors monitors_;
@@ -240,7 +245,12 @@ class QUIC : public MQBase {
 
     // Each connection's monitor_session requests, and the monitor ones arriving behind them, run
     // one at a time in arrival order; see handle_request.
-    serial_runs<connection_id, quic::message> session_runs_;
+    struct session_request {
+        quic::message msg;
+        // For a monitor_session: the connection's QUIC pubkey (if any), and its remote IP.
+        std::string remote_key, remote_ip;
+    };
+    serial_runs<connection_id, session_request> session_runs_;
 
     // Which replay paces each client connection's notifications; see send_paced.
     replay_owners<connection_id> replay_owners_;
@@ -254,7 +264,7 @@ class QUIC : public MQBase {
 
     // Hands `msgs`, monitor and monitor_session requests of `conn`, to a worker to handle in order,
     // then carries on with any that have arrived on it meanwhile.
-    void run_session_requests(const connection_id& conn, std::deque<quic::message> reqs);
+    void run_session_requests(const connection_id& conn, std::deque<session_request> reqs);
 
     bool has_sn_conn(const crypto::ed25519_pubkey& pk) const;
 
@@ -355,6 +365,9 @@ class QUIC : public MQBase {
     ///   - 7 -- no swarm info -- this service node does not currently know of any swarms, and so
     ///     cannot tell whether the account is one it stores.  This is a temporary condition and
     ///     the request can be retried.
+    ///   - 8 -- too many monitors -- the connection is bound to an unprivileged monitor session
+    ///     (see `handle_monitor_session`) that already has the 64 monitors it may have; this
+    ///     subscription would have added another.  (Renewing one it has is fine.)
     /// - error -- included whenever `errcode` is, this contains an English description of the
     ///   error.
     /// - snodes, swarm -- included with errcode 6, and describing the swarm that *does* store the
@@ -455,7 +468,7 @@ class QUIC : public MQBase {
     /// connection still bound to it is unbound from it (it stays open, but no longer receives the
     /// session's notifications), and this one is bound to it. Otherwise a new session with no
     /// monitors is created and bound to this connection; omitting `t` is how a subscriber
-    /// deliberately starts clean.  In either case any
+    /// deliberately starts clean (on a new connection: see errcode 10 below).  In either case any
     /// other session that was bound to this connection is unbound from it, as a connection is bound
     /// to at most one session.  Every reply issues a new token: the one given in `t` is no longer
     /// valid.
@@ -482,6 +495,11 @@ class QUIC : public MQBase {
     /// A request that cannot be met gets a dict with `errcode` and `error` instead (as `monitor`
     /// does for a subscription), and changes nothing:
     /// - 1 -- the request is malformed (anything other than a bt-encoded dict of the keys above).
+    /// - 9 -- it would start a new session from an address that has as many as it may, none of
+    ///   them without a connection (see the limits below).
+    /// - 10 -- it would start a new session on a connection that has already started one: a
+    ///   connection can start one session (and resume any number).  To start afresh, a subscriber
+    ///   makes a new connection.
     ///
     /// A reply too large for a single response frame (a session of more than about 100,000
     /// monitors, listed with `l` 1) is replaced by an error response; the session is resumed (and
@@ -492,6 +510,27 @@ class QUIC : public MQBase {
     /// changed and no reply is sent, so the token given still resumes the session.  A reply lost in
     /// transit after that (the connection failing just then) orphans the session: the
     /// subscriber's token is no longer valid, and it treats the node as it would a new session.
+    ///
+    /// A session is privileged if it was created over a connection whose QUIC key (the client's
+    /// Ed25519 pubkey) is a push server's: on mainnet that of the production push server
+    /// (87a324b8a9472fbd397f14973b6443fb0902ee0b663595806bd601aa1a156496), which is built in, or
+    /// any others the node is configured with (for test networks); any other session is
+    /// unprivileged.
+    /// Privilege is decided at creation and kept across resumes.  An unprivileged session can have
+    /// at most 64 monitors; a privileged one has no limit.
+    ///
+    /// As anyone can make unprivileged sessions, a node also keeps at most 1,000,000 monitors in
+    /// unprivileged sessions without a connection.  When a session's connection closing takes them
+    /// past that, the unprivileged sessions that have been without a connection the longest are
+    /// removed whole, as though their detached lifetime (below) had run out.  So under pressure a
+    /// detached session can end early: its subscriber finds its token unknown on resuming, and
+    /// starts afresh.  Privileged sessions are not counted.
+    ///
+    /// And each IP address can have at most 8 unprivileged sessions, counting each against the
+    /// address of the connection that created it, with or without a connection now.  Starting
+    /// another removes that address's own session that has been without a connection the longest,
+    /// whole; if every one of its sessions has a connection, the request gets a dict with `errcode`
+    /// 9 and `error` instead of the usual reply.  (A client needs about one session per node.)
     ///
     /// While no connection is bound to a session, each message that would have been notified to it
     /// is noted instead, as where the replay of its account's namespace has to start: the session
@@ -525,7 +564,11 @@ class QUIC : public MQBase {
     /// long is removed whole (its monitors, what it missed, and its token).  Its monitors do not
     /// expire while it has no connection, as its subscriber cannot renew them while away; while it
     /// is bound they expire as any do, unless renewed, and the session lives on without them.
-    void handle_monitor_session(quic::message msg, size_t ep_idx);
+    void handle_monitor_session(
+            quic::message msg,
+            size_t ep_idx,
+            const std::string& remote_key,
+            const std::string& remote_ip);
 
     void handle_ping(quic::message msg);
 

@@ -39,11 +39,12 @@ QUIC::QUIC(
         rpc::RateLimiter& rl,
         std::span<const Address> bind,
         const crypto::ed25519_seckey& sk,
-        const transport_options& opts) :
+        const transport_options& opts,
+        std::unordered_set<std::string> privileged_monitor_keys) :
         tls_creds{quic::GNUTLSCreds::make_from_ed_seckey(sk.str())},
         congestion_control{opts.congestion_control},
         request_handler{rh},
-        monitors_{*this, snode} {
+        monitors_{*this, snode, std::move(privileged_monitor_keys)} {
     service_node_ = &snode;
     request_handler_ = &rh;
     rate_limiter_ = &rl;
@@ -686,7 +687,11 @@ void QUIC::handle_monitor_message(quic::message msg, size_t ep_idx) {
             monitors_.handle_monitor(msg.body(), std::pair{ep_idx, msg.stream()->reference_id}));
 }
 
-void QUIC::handle_monitor_session(quic::message msg, size_t ep_idx) {
+void QUIC::handle_monitor_session(
+        quic::message msg,
+        size_t ep_idx,
+        const std::string& remote_key,
+        const std::string& remote_ip) {
     monitors_.handle_monitor_session(
             msg.body(),
             std::pair{ep_idx, msg.stream()->reference_id},
@@ -695,14 +700,16 @@ void QUIC::handle_monitor_session(quic::message msg, size_t ep_idx) {
                 // through: responding directly would queue the reply on the stream's own job queue,
                 // which the loop runs in no particular order relative to the main one.
                 loop.call([msg, reply = std::move(reply)] { respond_within_limit(msg, reply); });
-            });
+            },
+            remote_key,
+            remote_ip);
 }
 
-void QUIC::run_session_requests(const connection_id& conn, std::deque<quic::message> reqs) {
+void QUIC::run_session_requests(const connection_id& conn, std::deque<session_request> reqs) {
     if (session_jobs_ >= MAX_SESSION_JOBS) {
         log::debug(logcat, "Refusing {} monitor request(s): too many queued", reqs.size());
-        for (auto& m : reqs)
-            m.respond("Too many monitor session requests queued; try again later", true);
+        for (auto& req : reqs)
+            req.msg.respond("Too many monitor session requests queued; try again later", true);
         // We are on the loop, where the connection's run continues.
         if (auto more = session_runs_.next(conn); !more.empty())
             run_session_requests(conn, std::move(more));
@@ -712,12 +719,12 @@ void QUIC::run_session_requests(const connection_id& conn, std::deque<quic::mess
     // A job rather than an injected task, which is dropped when its category's queue is full: that
     // would leave the subscriber without a reply and the connection's run waiting forever.
     service_node_->omq_server()->job(
-            [this, conn, reqs = std::make_shared<std::deque<quic::message>>(std::move(reqs))] {
+            [this, conn, reqs = std::make_shared<std::deque<session_request>>(std::move(reqs))] {
                 --session_jobs_;
-                for (auto& m : *reqs) {
+                for (auto& [m, remote_key, remote_ip] : *reqs) {
                     try {
                         if (m.endpoint() == "monitor_session")
-                            handle_monitor_session(std::move(m), conn.first);
+                            handle_monitor_session(std::move(m), conn.first, remote_key, remote_ip);
                         else
                             handle_monitor_message(std::move(m), conn.first);
                     } catch (const std::exception& e) {
@@ -765,9 +772,17 @@ void QUIC::handle_request(quic::message msg, size_t ep_idx) {
     if (!peer && (name == "monitor_session" || name == "monitor")) {
         const connection_id cid{ep_idx, msg.stream()->reference_id};
         if (name == "monitor_session" || session_runs_.running(cid)) {
-            switch (session_runs_.add(cid, msg)) {
+            // The connection's state belongs to the loop, so the key a new session's privilege is
+            // decided by is read here.
+            session_request req{msg, {}, {}};
+            if (name == "monitor_session") {
+                auto key = conn->remote_key();
+                req.remote_key.assign(reinterpret_cast<const char*>(key.data()), key.size());
+                req.remote_ip = remote_ip.to_string();
+            }
+            switch (session_runs_.add(cid, req)) {
                 case decltype(session_runs_)::added::run:
-                    return run_session_requests(cid, {std::move(msg)});
+                    return run_session_requests(cid, {std::move(req)});
                 case decltype(session_runs_)::added::queued: return;
                 case decltype(session_runs_)::added::full:
                     return msg.respond("Too many monitor requests waiting", true);

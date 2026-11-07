@@ -21,6 +21,15 @@ namespace oxenss::server {
 
 static auto logcat = log::Cat("server");
 
+std::unordered_set<std::string> default_privileged_keys(bool mainnet) {
+    if (!mainnet)
+        return {};
+    return {oxenc::from_hex(MAINNET_PUSH_SERVER_KEY)};
+}
+
+Monitors::Monitors(snode::ServiceNode* sn, std::unordered_set<std::string> privileged_keys) :
+        privileged_keys_{std::move(privileged_keys)}, service_node_{sn} {}
+
 snode::swarm_membership Monitors::swarm_for(const user_pubkey& pk) const {
     return service_node_->network().get_swarm_for(pk);
 }
@@ -293,16 +302,22 @@ std::string Monitors::handle_monitor(std::string_view request, const connection_
                 MonitorResponse::BAD_ARGS, "Invalid arguments: Failed to parse monitor data value");
     }
 
-    std::vector<std::chrono::seconds> expiries;
+    std::vector<std::optional<std::chrono::seconds>> expiries;
     if (!subs.empty())
         expiries = update_monitors(subs, conn);
 
     auto reply = [&](std::variant<std::string, size_t>& result) {
         if (auto* err = std::get_if<std::string>(&result))
             return std::move(*err);
+        auto& expiry = expiries[std::get<size_t>(result)];
+        if (!expiry)
+            return error_reply(
+                    MonitorResponse::TOO_MANY_MONITORS,
+                    "Too many monitors in this session (at most {})"_format(
+                            limits_.unprivileged_monitors));
         oxenc::bt_dict_producer out;
         out.append("success", 1);
-        out.append("x", expiries[std::get<size_t>(result)].count());
+        out.append("x", expiry->count());
         return std::move(out).str();
     };
 
@@ -367,9 +382,9 @@ namespace {
 
 }  // namespace
 
-std::vector<std::chrono::seconds> Monitors::update_monitors(
+std::vector<std::optional<std::chrono::seconds>> Monitors::update_monitors(
         std::vector<subscription>& subs, const connection_id& conn) {
-    std::vector<std::chrono::seconds> expiries;
+    std::vector<std::optional<std::chrono::seconds>> expiries;
     expiries.reserve(subs.size());
     std::unique_lock lock{monitoring_mutex_};
     // Taken before any expiry is set, so that a freshly renewed monitor counts as the whole
@@ -400,6 +415,11 @@ std::vector<std::chrono::seconds> Monitors::update_monitors(
                     fmt::join(mon_data->namespaces, ", "));
             mon_data->reset_expiry();
             expiries.push_back(until(*mon_data));
+            continue;
+        }
+        if (session && !session->privileged &&
+            session->monitor_count >= limits_.unprivileged_monitors) {
+            expiries.emplace_back();
             continue;
         }
         log::debug(
@@ -449,6 +469,10 @@ std::unordered_multimap<std::string, MonitorData>::iterator Monitors::erase_moni
 
     if (auto* s = std::get_if<MonitorSession*>(&owner)) {
         --(*s)->monitor_count;
+        if (!(*s)->privileged && (*s)->detached_since) {
+            std::lock_guard lock{missed_mutex_};
+            --detached_monitors_;
+        }
         if (!has_monitor(account, owner))
             (*s)->accounts.erase(account);
     } else if (!has_monitor(account, owner)) {
@@ -470,19 +494,46 @@ void Monitors::detach(MonitorSession& s, std::chrono::steady_clock::time_point n
         s.conn.reset();
     }
     s.detached_since = now;
-    std::lock_guard lock{missed_mutex_};
-    fold_recent(s);
+    {
+        std::lock_guard lock{missed_mutex_};
+        fold_recent(s);
+        detached_[s.privileged].emplace(now, &s);
+        if (s.privileged)
+            return;
+        detached_monitors_ += s.monitor_count;
+    }
+    while (true) {
+        MonitorSession* victim;
+        {
+            std::lock_guard lock{missed_mutex_};
+            if (detached_monitors_ <= limits_.detached_monitors || detached_[false].empty())
+                return;
+            victim = detached_[false].begin()->second;
+        }
+        log::debug(
+                logcat,
+                "Removing a detached monitor session ({} monitors) to keep within {}",
+                victim->monitor_count,
+                limits_.detached_monitors);
+        remove_session(*victim);
+    }
 }
 
 void Monitors::bind(MonitorSession& s, const connection_id& conn) {
-    if (s.detached_since) {
-        s.detached_since.reset();
-    } else if (s.conn && *s.conn != conn) {
-        log::debug(logcat, "monitor session moved off a connection still open");
-        if (auto it = session_conns_.find(*s.conn); it != session_conns_.end() && it->second == &s)
-            session_conns_.erase(it);
+    {
         std::lock_guard lock{missed_mutex_};
-        fold_recent(s);
+        if (s.detached_since) {
+            detached_[s.privileged].erase({*s.detached_since, &s});
+            if (!s.privileged)
+                detached_monitors_ -= s.monitor_count;
+            s.detached_since.reset();
+        } else if (s.conn && *s.conn != conn) {
+            log::debug(logcat, "monitor session moved off a connection still open");
+            if (auto it = session_conns_.find(*s.conn);
+                it != session_conns_.end() && it->second == &s)
+                session_conns_.erase(it);
+            fold_recent(s);
+        }
     }
     s.conn = conn;
     session_conns_[conn] = &s;
@@ -504,6 +555,16 @@ void Monitors::remove_session(MonitorSession& s) {
     if (s.conn)
         if (auto it = session_conns_.find(*s.conn); it != session_conns_.end() && it->second == &s)
             session_conns_.erase(it);
+    if (!s.ip.empty())
+        if (auto it = sessions_by_ip_.find(s.ip); it != sessions_by_ip_.end()) {
+            std::erase(it->second, &s);
+            if (it->second.empty())
+                sessions_by_ip_.erase(it);
+        }
+    if (s.detached_since) {
+        std::lock_guard lock{missed_mutex_};
+        detached_[s.privileged].erase({*s.detached_since, &s});
+    }
     // Last, as this may destroy `s` (so by iterator: erasing by key would use `s.token` as it
     // goes).
     sessions_.erase(sessions_.find(s.token));
@@ -526,7 +587,9 @@ void Monitors::rotate_token(MonitorSession& s) {
 void Monitors::handle_monitor_session(
         std::string_view request,
         const connection_id& conn,
-        const std::function<void(std::string)>& reply) {
+        const std::function<void(std::string)>& reply,
+        std::string_view remote_key,
+        std::string_view remote_ip) {
     std::optional<uint64_t> body_max, account_limit;
     bool list_live = true;
     std::optional<std::string> token;
@@ -581,14 +644,55 @@ void Monitors::handle_monitor_session(
             previous = it->second;
 
         resumed = session != nullptr;
+        // A client has no need to start more than one fresh session on a connection; refusing it
+        // makes each one cost at least a new connection.
+        if (!resumed && started_session_.contains(conn)) {
+            lock.unlock();
+            log::debug(logcat, "refusing a second new monitor session on one connection");
+            return reply(error_reply(
+                    MonitorResponse::SESSION_ALREADY_STARTED,
+                    "This connection has already started a monitor session: resume a session with "
+                    "its token, or start a new one on a new connection"));
+        }
+        const bool privileged = !resumed && privileged_keys_.contains(std::string{remote_key});
+        const std::string ip = resumed || privileged ? "" : std::string{remote_ip};
+        // Make room among the IP's sessions, by its own longest detached, or refuse.
+        while (!ip.empty()) {
+            auto it = sessions_by_ip_.find(ip);
+            if (it == sessions_by_ip_.end() || it->second.size() < limits_.sessions_per_ip)
+                break;
+            MonitorSession* oldest = nullptr;
+            for (auto* s : it->second)
+                if (s->detached_since && (!oldest || *s->detached_since < *oldest->detached_since))
+                    oldest = s;
+            if (!oldest) {
+                lock.unlock();
+                log::debug(logcat, "refusing a monitor session: too many from {}", ip);
+                return reply(error_reply(
+                        MonitorResponse::TOO_MANY_SESSIONS,
+                        "Too many monitor sessions from this address (at most {}), and none of "
+                        "them without a connection to make room"_format(limits_.sessions_per_ip)));
+            }
+            log::debug(logcat, "removing a monitor session of {} to make room for another", ip);
+            remove_session(*oldest);
+        }
+
         if (resumed) {
+            // Bound before `previous` is detached, which can remove the sessions detached the
+            // longest: this one is then no longer among them.
             bind(*session, conn);
             ended = std::exchange(session->ended, {});
         }
         if (previous)
             detach(*previous, now);
-        if (!resumed)
+        if (!resumed) {
             session = std::make_shared<MonitorSession>();
+            session->privileged = privileged;
+            session->ip = ip;
+            if (!ip.empty())
+                sessions_by_ip_[ip].push_back(session.get());
+            started_session_.insert(conn);
+        }
         rotate_token(*session);
         if (!resumed)
             sessions_.emplace(session->token, session);
@@ -853,6 +957,7 @@ void Monitors::connection_closed(const connection_id& conn) {
     std::unique_lock lock{monitoring_mutex_};
 
     closed_conns_.emplace(conn, std::chrono::steady_clock::now());
+    started_session_.erase(conn);
 
     if (auto it = session_conns_.find(conn); it != session_conns_.end())
         detach(*it->second, std::chrono::steady_clock::now());

@@ -711,6 +711,17 @@ std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts() {
     return get_all_pairs<namespace_id, int64_t>(st);
 }
 
+std::vector<std::pair<namespace_id, int64_t>> Database::get_namespace_counts(
+        const user_pubkey& pubkey) {
+    auto conn = db_->conn();
+    auto st = conn.prepared_st(
+            "SELECT namespace, COUNT(*) FROM messages"
+            " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?) AND expiry > ?"
+            " GROUP BY namespace");
+    return get_all_pairs<namespace_id, int64_t>(
+            st, pubkey.raw_bytes(), pubkey.type(), to_epoch_ms(std::chrono::system_clock::now()));
+}
+
 int64_t Database::get_total_bytes() {
     auto conn = db_->conn();
     return conn.prepared_get<int64_t>("PRAGMA page_count") * page_size_;
@@ -748,7 +759,73 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     return msg;
 }
 
-StoreResult Database::store(const message& msg, std::chrono::system_clock::time_point* expiry) {
+std::vector<std::pair<int64_t, message>> Database::retrieve_from_id(
+        const user_pubkey& pubkey,
+        namespace_id ns,
+        int64_t from_id,
+        size_t limit,
+        bool newest_first) {
+    std::vector<std::pair<int64_t, message>> result;
+    auto conn = db_->conn();
+    // Within one (owner, namespace) the messages_owner index is in id order, so either direction is
+    // a range scan of the index.
+    auto st = conn.prepared_st(
+            newest_first ? "SELECT id, hash, timestamp, expiry, data FROM messages"
+                           " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
+                           " AND namespace = ? AND id >= ? AND expiry > ? ORDER BY id DESC LIMIT ?"
+                         : "SELECT id, hash, timestamp, expiry, data FROM messages"
+                           " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
+                           " AND namespace = ? AND id >= ? AND expiry > ? ORDER BY id LIMIT ?");
+    int pos = 1;
+    const auto raw = pubkey.raw_bytes();
+    st->bind(pos++, raw.data(), static_cast<int>(raw.size()));
+    st->bind(pos++, pubkey.type());
+    st->bind(pos++, to_int(ns));
+    st->bind(pos++, from_id);
+    st->bind(pos++, to_epoch_ms(std::chrono::system_clock::now()));
+    st->bind(pos++, static_cast<int64_t>(limit));
+
+    std::vector<message> found;
+    std::vector<int64_t> ids;
+    while (st->executeStep()) {
+        auto [id, hash, ts, exp, data] =
+                get<int64_t, std::string, int64_t, int64_t, std::string>(st);
+        ids.push_back(id);
+        found.emplace_back(
+                pubkey,
+                std::move(hash),
+                ns,
+                from_epoch_ms(ts),
+                from_epoch_ms(exp),
+                std::move(data));
+    }
+
+    apply_deferred(found);
+    result.reserve(found.size());
+    for (size_t i = 0; i < found.size(); i++)
+        result.emplace_back(ids[i], std::move(found[i]));
+    return result;
+}
+
+int64_t Database::count_id_range(
+        const user_pubkey& pubkey, namespace_id ns, int64_t from_id, int64_t before_id) {
+    auto conn = db_->conn();
+    return exec_and_maybe_get<int64_t>(
+                   conn.prepared_st(
+                           "SELECT COUNT(*) FROM messages"
+                           " WHERE owner = (SELECT id FROM owners WHERE pubkey = ? AND type = ?)"
+                           " AND namespace = ? AND id >= ? AND id < ? AND expiry > ?"),
+                   pubkey.raw_bytes(),
+                   pubkey.type(),
+                   to_int(ns),
+                   from_id,
+                   before_id,
+                   to_epoch_ms(std::chrono::system_clock::now()))
+            .value_or(0);
+}
+
+StoreResult Database::store(
+        const message& msg, std::chrono::system_clock::time_point* expiry, int64_t* id) {
 
     auto conn = db_->conn();
 
@@ -793,14 +870,17 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                 *expiry = from_epoch_ms(exp);
         } else {
             reset_last_insert(conn.sql);
-            auto rows = conn.prepared_exec(
-                    "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
-                    " VALUES (?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT (owner, namespace) WHERE namespace < 0 AND namespace % 20 = -1"
-                    " DO UPDATE SET"
-                    " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
-                    " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
-                    " WHERE EXCLUDED.timestamp > messages.timestamp",
+            auto row = exec_and_maybe_get<int64_t>(
+                    conn.prepared_st(
+                            "INSERT INTO messages (owner, hash, namespace, timestamp, expiry, data)"
+                            " VALUES (?, ?, ?, ?, ?, ?)"
+                            " ON CONFLICT (owner, namespace)"
+                            " WHERE namespace < 0 AND namespace % 20 = -1"
+                            " DO UPDATE SET"
+                            " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
+                            " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
+                            " WHERE EXCLUDED.timestamp > messages.timestamp"
+                            " RETURNING id"),
                     owner_id,
                     msg.hash,
                     msg.msg_namespace,
@@ -809,8 +889,10 @@ StoreResult Database::store(const message& msg, std::chrono::system_clock::time_
                     to_span(msg.data));
 
             // did not insert, which means public namespace and not newer
-            if (rows == 0)
+            if (!row)
                 return StoreResult::Obsolete;
+            if (id)
+                *id = *row;
 
             ret = StoreResult::New;
             // Not so for a newer public outbox message, which replaces the existing one
@@ -1296,6 +1378,15 @@ void Database::apply_deferred(std::span<message> msgs) {
             m.expiry = from_epoch_ms(it->second.expiry);
 }
 
+void Database::apply_deferred(std::map<std::string, int64_t>& expiries, int64_t owner) {
+    std::lock_guard lock{deferred_mutex_};
+    if (deferred_.empty())
+        return;
+    for (auto& [hash, exp] : expiries)
+        if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == owner)
+            exp = std::max(exp, it->second.expiry);
+}
+
 std::vector<std::pair<std::string, Database::deferred_expiry>> Database::take_deferred(
         int64_t owner) {
     // A linear scan, but only owner-wide expiry changes need it, and those are rare.
@@ -1499,12 +1590,28 @@ std::map<std::string, int64_t> Database::get_expiries(
 
     transaction.commit();
 
-    std::lock_guard lock{deferred_mutex_};
-    if (deferred_.empty())
+    apply_deferred(result, *owner);
+    return result;
+}
+
+std::map<std::string, int64_t> Database::get_expiries(const user_pubkey& pubkey, namespace_id ns) {
+    auto conn = db_->conn();
+
+    std::map<std::string, int64_t> result;
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
         return result;
-    for (auto& [hash, exp] : result)
-        if (auto it = deferred_.find(hash); it != deferred_.end() && it->second.owner == *owner)
-            exp = std::max(exp, it->second.expiry);
+
+    auto st = conn.prepared_st(
+            "SELECT hash, expiry FROM messages WHERE owner = ? AND namespace = ? AND expiry > ?");
+    for (auto& [hash, exp] : get_all<std::string, int64_t>(
+                 st, *owner, to_int(ns), to_epoch_ms(std::chrono::system_clock::now())))
+        result.emplace(std::move(hash), exp);
+
+    apply_deferred(result, *owner);
     return result;
 }
 

@@ -6,6 +6,7 @@ from nacl.encoding import Base64Encoder
 from nacl.signing import SigningKey
 import nacl.utils
 import pytest
+import random
 
 # This test runs in a few seconds, a short ttl is fine.
 ttl = 600_000
@@ -15,9 +16,9 @@ msg_size = 70000
 
 
 @pytest.fixture(scope='module')
-def big_store(rpc, random_sn, exclude):
+def big_store(rpc, sns, pinned_node, exclude):
     sk = SigningKey.generate()
-    swarm = ss.get_swarm(rpc, random_sn, sk)
+    swarm = ss.get_swarm(rpc, rpc.connect(pinned_node or random.choice(sns)), sk)
 
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
     conn = rpc.connect(sn)

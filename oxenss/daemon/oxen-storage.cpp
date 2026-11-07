@@ -1,4 +1,5 @@
 #include "command_line.h"
+#include <oxenc/hex.h>
 #include <oxenss/common/mainnet.h>
 #include <oxenss/crypto/channel_encryption.hpp>
 #include <oxenss/crypto/keys.h>
@@ -267,13 +268,22 @@ int main(int argc, char* argv[]) {
             quic_opts.socket_buffers.recv = *options.quic_recv_buffer;
         if (options.quic_send_buffer)
             quic_opts.socket_buffers.send = *options.quic_send_buffer;
+        auto privileged_monitor_keys = server::default_privileged_keys(is_mainnet);
+        for (const auto& key : privileged_monitor_keys)
+            log::info(logcat, "Privileged monitor session key: {} (built in)", oxenc::to_hex(key));
+        for (const auto& key : options.monitor_session_privileged_keys) {
+            privileged_monitor_keys.insert(
+                    std::string{crypto::ed25519_pubkey::from_hex(key).view()});
+            log::info(logcat, "Privileged monitor session key: {}", key);
+        }
         auto quic = std::make_unique<server::QUIC>(
                 service_node,
                 request_handler,
                 rate_limiter,
                 std::move(quic_bind),
                 ed_keys.sec,
-                quic_opts);
+                quic_opts,
+                std::move(privileged_monitor_keys));
         service_node.register_mq_server(quic.get());
 
         auto http_client = std::make_shared<http::Client>(quic->loop);

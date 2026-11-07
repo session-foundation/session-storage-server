@@ -4,8 +4,9 @@ Storage server for Oxen Service Nodes
 
 ## Binary releases
 
-Pre-built releases (with system service files) are available for Ubuntu/Debian on
-https://deb.oxen.io and are recommended for simple deployment and updates on those distributions.
+Pre-built releases (with systemd service files) are available for Ubuntu/Debian on
+https://deb.session.foundation and are recommended for simple deployment and updates on those
+distributions.
 
 ## Building from source
 

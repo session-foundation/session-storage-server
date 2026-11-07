@@ -252,12 +252,6 @@ OMQ::OMQ(
     for (const auto& [name, _cb] : rpc::RequestHandler::client_rpc_endpoints)
         st_cat.add_request_command(std::string{name}, [this, name=name](auto& m) { handle_client_request(name, m); });
 
-    // monitor.* endpoints are used to subscribe to events such as new messages arriving for an
-    // account.
-    omq_.add_category("monitor", oxenmq::AuthLevel::none, 1 /*reserved threads*/, 500 /*max queue*/)
-        .add_request_command("messages", [this](auto& m) { handle_monitor_messages(m); })
-        ;
-
     // Endpoints invokable by a local admin
     omq_.add_category("service", oxenmq::AuthLevel::admin)
         .add_request_command("get_stats", [this](auto& m) { handle_get_stats(m); })
@@ -499,34 +493,6 @@ std::pair<std::string_view, rpc::OnionRequestMetadata> OMQ::decode_onion_data(
         meta.hop_no = 1;
 
     return result;
-}
-
-void OMQ::handle_monitor_messages(oxenmq::Message& message) {
-    // If not a single part then send an empty string so that the base class fires back an error for
-    // us:
-    std::string_view request = message.data.size() != 1 ? ""sv : message.data[0];
-
-    handle_monitor(
-            request,
-            [&message](std::string body) { message.send_reply(std::move(body)); },
-            message.conn);
-}
-
-void OMQ::send_notification(
-        std::vector<connection_id>& conns,
-        std::string_view command,
-        std::string_view notification) {
-    for (const auto& c : conns)
-        if (auto* id = std::get_if<oxenmq::ConnectionID>(&c))
-            omq_.send(*id, command, notification);
-}
-
-void OMQ::notify(std::vector<connection_id>& conns, std::string_view notification) {
-    send_notification(conns, "notify.message", notification);
-}
-
-void OMQ::notify_monitor_ended(std::vector<connection_id>& conns, std::string_view notification) {
-    send_notification(conns, "notify.monitor_ended", notification);
 }
 
 void OMQ::sn_request(

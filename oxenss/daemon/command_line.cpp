@@ -283,6 +283,17 @@ parse_result parse_cli_args(int argc, char* argv[]) {
                "One or more public keys (x25519) that will be granted access to the "
                "`get_stats` omq endpoint")
             ->type_name("PUBKEY");
+    // Hidden (in the "" group): the production push server's key is built in on mainnet, so this
+    // is only for test networks and push server development, not for node operators.
+    cli.add_option(
+               "--monitor-session-privileged-keys",
+               options.monitor_session_privileged_keys,
+               "One or more public keys (Ed25519, hex) of push servers: a monitor session created "
+               "over a QUIC connection authenticated with one of these is exempt from the limits "
+               "on ordinary sessions.  These add to the production push server's key, which is "
+               "built in on mainnet")
+            ->type_name("PUBKEY")
+            ->group("");
     cli.set_version_flag("--version,-v", std::string{oxenss::STORAGE_SERVER_VERSION_INFO});
 
     // Deprecated options, put in the "" group to hide them:

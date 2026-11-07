@@ -1538,3 +1538,72 @@ TEST_CASE("storage - dump batches and cursors", "[storage][swarm]") {
     CHECK(dumps[0].swarm == 124);
     CHECK(dumps[0].end_id == 9);
 }
+
+TEST_CASE("storage - retrieve and count from a row id", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey a, b;
+    REQUIRE(a.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(b.load("05fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"));
+    const auto ns0 = namespace_id::Default, ns5 = namespace_id{5};
+    const auto now = std::chrono::system_clock::now();
+
+    Database storage{"."};
+    std::vector<int64_t> ids;
+    auto store =
+            [&](const user_pubkey& pk, std::string hash, namespace_id ns, bool expired = false) {
+                int64_t id = 0;
+                REQUIRE(storage.store(
+                                {pk,
+                                 hash,
+                                 ns,
+                                 expired ? now - 2h : now,
+                                 expired ? now - 1h : now + 1h,
+                                 "data " + hash},
+                                nullptr,
+                                &id) == StoreResult::New);
+                ids.push_back(id);
+                return id;
+            };
+    auto a1 = store(a, "a1", ns0);
+    store(b, "b1", ns0);
+    auto a2 = store(a, "a2", ns0);
+    store(a, "a5", ns5);
+    store(a, "gone", ns0, true);
+    auto a3 = store(a, "a3", ns0);
+    CHECK(std::ranges::is_sorted(ids));
+    // Storing an existing message again is not new, and reports no id.
+    int64_t again = 0;
+    REQUIRE(storage.store({a, "a1", ns0, now, now + 1h, "data a1"}, nullptr, &again) ==
+            StoreResult::Exists);
+    CHECK(again == 0);
+
+    auto hashes = [](const std::vector<std::pair<int64_t, message>>& got) {
+        std::vector<std::string> h;
+        for (auto& [id, m] : got)
+            h.push_back(m.hash);
+        return h;
+    };
+
+    // Only the account's unexpired messages in the namespace, from the id on, oldest first.
+    auto got = storage.retrieve_from_id(a, ns0, a1, 10);
+    CHECK(hashes(got) == std::vector<std::string>{"a1", "a2", "a3"});
+    REQUIRE(got.size() == 3);
+    CHECK(got[0].first == a1);
+    CHECK(got[2].first == a3);
+    CHECK(got[0].second.pubkey == a);
+    CHECK(got[0].second.msg_namespace == ns0);
+    CHECK(got[0].second.data == "data a1");
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1 + 1, 10)) ==
+          std::vector<std::string>{"a2", "a3"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1, 2)) == std::vector<std::string>{"a1", "a2"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1, 2, true)) ==
+          std::vector<std::string>{"a3", "a2"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns5, 1, 10)) == std::vector<std::string>{"a5"});
+    CHECK(storage.retrieve_from_id(a, namespace_id{6}, 1, 10).empty());
+
+    CHECK(storage.count_id_range(a, ns0, a1, a3) == 2);
+    CHECK(storage.count_id_range(a, ns0, a2, a3 + 1) == 2);  // a2, a3; not the expired one
+    CHECK(storage.count_id_range(a, ns0, a3 + 1, a3 + 100) == 0);
+    CHECK(storage.count_id_range(b, ns5, 1, a3 + 1) == 0);
+}

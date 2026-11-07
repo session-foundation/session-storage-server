@@ -577,59 +577,9 @@ void ServiceNode::check_new_members() {
     }
 }
 
-static void write_metadata(
-        oxenc::bt_dict_producer& d, std::string_view pubkey, const message& msg) {
-    d.append("@", pubkey);
-    d.append("h", msg.hash);
-    d.append("n", to_int(msg.msg_namespace));
-    d.append("t", to_epoch_ms(msg.timestamp));
-    d.append("z", to_epoch_ms(msg.expiry));
-}
-
-void ServiceNode::send_notifies(message msg) {
-    auto pubkey = msg.pubkey.prefixed_raw();
-    std::vector<server::connection_id> relay_to, relay_to_with_data;
-
+void ServiceNode::send_notifies(const message& msg, int64_t id) {
     for (auto* s : mq_servers_)
-        s->get_notifiers(msg, relay_to, relay_to_with_data);
-
-    if (relay_to.empty() && relay_to_with_data.empty())
-        return;
-
-    // We output a dict with keys (in order):
-    // - @ pubkey
-    // - h msg hash
-    // - n msg namespace
-    // - t msg timestamp
-    // - z msg expiry
-    // - ~ msg data (optional)
-    constexpr size_t metadata_size = 2       // d...e
-                                   + 3 + 36  // 1:@ and 33:[33-byte pubkey]
-                                   + 3 + 46  // 1:h and 43:[43-byte base64 unpadded hash]
-                                   + 3 + 8   // 1:n and i-32768e
-                                   + 3 + 16  // 1:t and i1658784776010e plus a byte to grow
-                                   + 3 + 16  // 1:z and i1658784776010e plus a byte to grow
-                                   + 10;     // safety margin
-
-    oxenc::bt_dict_producer d;
-    d.reserve(
-            relay_to_with_data.empty() ? metadata_size
-                                       : metadata_size  // all the metadata above
-                                                 + 3    // 1:~
-                                                 + 8    // 76800: plus a couple bytes to grow
-                                                 + msg.data.size());
-
-    write_metadata(d, pubkey, msg);
-
-    if (!relay_to.empty())
-        for (auto* s : mq_servers_)
-            s->notify(relay_to, d.view());
-
-    if (!relay_to_with_data.empty()) {
-        d.append("~", msg.data);
-        for (auto* s : mq_servers_)
-            s->notify(relay_to_with_data, d.view());
-    }
+        s->notify_message(msg, id);
 }
 
 bool ServiceNode::process_store(
@@ -648,12 +598,13 @@ bool ServiceNode::process_store(
     all_stats_.bump_store_requests();
 
     /// store in the database (if not already present)
-    const auto result = db->store(msg, expiry);
+    int64_t id = 0;
+    const auto result = db->store(msg, expiry, &id);
     if (new_msg)
         *new_msg = result == StoreResult::New;
 
     if (result == StoreResult::New)
-        send_notifies(std::move(msg));
+        send_notifies(msg, id);
 
     return result != StoreResult::Full;
 }

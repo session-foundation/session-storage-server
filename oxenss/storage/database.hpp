@@ -176,8 +176,12 @@ class Database {
 
     // Stores a message in the database.  Returns an enum value indicating the result -- see
     // StoreResult for a description.  `expiry` can be set to a pointer into which the message's
-    // expiry (existing, if longer; otherwise the one from `msg`) will be copied.
-    StoreResult store(const message& msg, std::chrono::system_clock::time_point* expiry = nullptr);
+    // expiry (existing, if longer; otherwise the one from `msg`) will be copied, and `id` to one
+    // into which the message's row id will be copied when the result is StoreResult::New.
+    StoreResult store(
+            const message& msg,
+            std::chrono::system_clock::time_point* expiry = nullptr,
+            int64_t* id = nullptr);
 
     void bulk_store(std::span<const message> items);
 
@@ -239,6 +243,20 @@ class Database {
     // Get message by `msg_hash`, return true if found.  Note that this does *not* filter by
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
+
+    // Gets at most `limit` of `pubkey`'s unexpired messages in namespace `ns` whose row ids (as
+    // `store` reports them) are at least `from_id`, with their row ids: oldest first, or newest
+    // first if `newest_first`.
+    std::vector<std::pair<int64_t, message>> retrieve_from_id(
+            const user_pubkey& pubkey,
+            namespace_id ns,
+            int64_t from_id,
+            size_t limit,
+            bool newest_first = false);
+
+    // Counts `pubkey`'s unexpired messages in namespace `ns` with row ids in [from_id, before_id).
+    int64_t count_id_range(
+            const user_pubkey& pubkey, namespace_id ns, int64_t from_id, int64_t before_id);
 
     // Removes expired messages from the database, EXPIRY_DELETE_CHUNK at a time; the `Database`
     // instance owner should call this periodically.  Until then the methods that read messages or

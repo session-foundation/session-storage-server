@@ -59,12 +59,31 @@ def notify_request(
     return req
 
 
+# A subscription lasts 65 minutes from its last renewal.
+MONITOR_EXPIRY = 65 * 60
+
+
+def check_subscribed(reply, count=None):
+    """Checks that a `monitor` reply (as `rpc.monitor(...).get()` returns it) reports success for
+    each subscription: `count` of them for a list request, or None for a single dict."""
+    assert len(reply) == 1, reply
+    r = bt_deserialize(reply[0])
+    entries = [r] if count is None else r
+    assert len(entries) == (1 if count is None else count)
+    for e in entries:
+        assert e[b'success'] == 1, e
+        # Nodes from before the expiry was reported leave `x` out.
+        if b'x' in e:
+            assert 0 < e[b'x'] <= MONITOR_EXPIRY
+
+
 def register_all(rpc, swarm, make_request):
     """Connects to every member of `swarm` and subscribes with `make_request()` on each; returns
     the connections (in swarm order) once every node has accepted."""
     conns = [rpc.connect(snode) for snode in swarm['snodes']]
     registered = [rpc.monitor(c, bt_serialize(make_request())) for c in conns]
-    assert [r.get() for r in registered] == [[b'd7:successi1ee']] * len(conns)
+    for r in registered:
+        check_subscribed(r.get())
     return conns
 
 
@@ -152,7 +171,8 @@ def test_monitor_push(rpc, random_sn, sk, exclude):
                 ),
             )
         )
-    assert [r.get() for r in registered] == [[b'd7:successi1ee']] * len(conns)
+    for r in registered:
+        check_subscribed(r.get())
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]
@@ -242,7 +262,8 @@ def test_monitor_multi(rpc, random_sn, sk, exclude):
         )
         for c in conns
     ]
-    assert [r.get() for r in registered] == [[b'l' + b'd7:successi1ee' * 2 + b'e']] * len(conns)
+    for r in registered:
+        check_subscribed(r.get(), count=2)
 
     # Now go send a message:
     sn = ss.random_swarm_members(swarm, 1, exclude)[0]

@@ -577,59 +577,9 @@ void ServiceNode::check_new_members() {
     }
 }
 
-static void write_metadata(
-        oxenc::bt_dict_producer& d, std::string_view pubkey, const message& msg) {
-    d.append("@", pubkey);
-    d.append("h", msg.hash);
-    d.append("n", to_int(msg.msg_namespace));
-    d.append("t", to_epoch_ms(msg.timestamp));
-    d.append("z", to_epoch_ms(msg.expiry));
-}
-
-void ServiceNode::send_notifies(message msg) {
-    auto pubkey = msg.pubkey.prefixed_raw();
-    std::vector<server::connection_id> relay_to, relay_to_with_data;
-
+void ServiceNode::send_notifies(const message& msg, int64_t id) {
     for (auto* s : mq_servers_)
-        s->get_notifiers(msg, relay_to, relay_to_with_data);
-
-    if (relay_to.empty() && relay_to_with_data.empty())
-        return;
-
-    // We output a dict with keys (in order):
-    // - @ pubkey
-    // - h msg hash
-    // - n msg namespace
-    // - t msg timestamp
-    // - z msg expiry
-    // - ~ msg data (optional)
-    constexpr size_t metadata_size = 2       // d...e
-                                   + 3 + 36  // 1:@ and 33:[33-byte pubkey]
-                                   + 3 + 46  // 1:h and 43:[43-byte base64 unpadded hash]
-                                   + 3 + 8   // 1:n and i-32768e
-                                   + 3 + 16  // 1:t and i1658784776010e plus a byte to grow
-                                   + 3 + 16  // 1:z and i1658784776010e plus a byte to grow
-                                   + 10;     // safety margin
-
-    oxenc::bt_dict_producer d;
-    d.reserve(
-            relay_to_with_data.empty() ? metadata_size
-                                       : metadata_size  // all the metadata above
-                                                 + 3    // 1:~
-                                                 + 8    // 76800: plus a couple bytes to grow
-                                                 + msg.data.size());
-
-    write_metadata(d, pubkey, msg);
-
-    if (!relay_to.empty())
-        for (auto* s : mq_servers_)
-            s->notify(relay_to, d.view());
-
-    if (!relay_to_with_data.empty()) {
-        d.append("~", msg.data);
-        for (auto* s : mq_servers_)
-            s->notify(relay_to_with_data, d.view());
-    }
+        s->notify_message(msg, id);
 }
 
 bool ServiceNode::process_store(
@@ -648,12 +598,13 @@ bool ServiceNode::process_store(
     all_stats_.bump_store_requests();
 
     /// store in the database (if not already present)
-    const auto result = db->store(msg, expiry);
+    int64_t id = 0;
+    const auto result = db->store(msg, expiry, &id);
     if (new_msg)
         *new_msg = result == StoreResult::New;
 
     if (result == StoreResult::New)
-        send_notifies(std::move(msg));
+        send_notifies(msg, id);
 
     return result != StoreResult::Full;
 }
@@ -1007,6 +958,9 @@ void ServiceNode::advance_dump(const dump_key& key_ref, dump_window& w) {
         return;
     }
 
+    if (w.failed_batch)
+        return;
+
     if (w.exhausted) {
         if (w.in_flight == 0)
             finish();
@@ -1082,26 +1036,37 @@ void ServiceNode::on_dump_batch_reply(
     auto& w = it->second;
     const auto& [pk, swarm] = key;
 
+    auto b = w.batches.find(last_id);
+    if (b == w.batches.end())
+        return;
     if (!ok) {
+        if (!w.failed_batch)
+            log::info(
+                    logcat,
+                    "Dump batch to {} failed; resuming once the rest of its window resolves",
+                    pk);
+        w.failed_batch = std::min(last_id, w.failed_batch.value_or(last_id));
+    }
+    if (--b->second > 0)
+        return;
+    w.in_flight--;
+
+    while (!w.batches.empty() && w.batches.begin()->second == 0 &&
+           !(w.failed_batch && w.batches.begin()->first >= *w.failed_batch)) {
+        w.next_id = w.batches.begin()->first + 1;
+        w.batches.erase(w.batches.begin());
+    }
+
+    if (w.failed_batch && w.in_flight == 0) {
         log::info(
                 logcat,
-                "Dump batch to {} failed; resuming from message id {} in {}",
+                "Resuming dump to {} from message id {} in {}",
                 pk,
                 w.next_id,
                 DUMP_RETRY_DELAY);
         db->update_dump(pk, swarm, w.next_id, std::chrono::system_clock::now() + DUMP_RETRY_DELAY);
         dump_windows_.erase(it);
         return;
-    }
-
-    auto b = w.batches.find(last_id);
-    if (b == w.batches.end() || --b->second > 0)
-        return;
-    w.in_flight--;
-
-    while (!w.batches.empty() && w.batches.begin()->second == 0) {
-        w.next_id = w.batches.begin()->first + 1;
-        w.batches.erase(w.batches.begin());
     }
     db->update_dump(pk, swarm, w.next_id, {});
 
@@ -1627,15 +1592,10 @@ void ServiceNode::check_retry_requests() {
             return false;
 
         auto on_request_done = [this, req_id](bool success, std::vector<std::string> parts) {
-            // We cleanup the request in all situations except timeout (timeout
-            // indicating that the node was non-responsive, maybe offline). In an error
-            // state we don't know what state the recipient's storage server is in and
-            // we default to deleting it and ending the retry attempts.
-            rpc::SNStorageCCResult store_result =
-                    rpc::interpret_sn_storage_cc_response_parts(success, parts);
-            if (store_result.status != rpc::SNStorageCCResultStatus::Timeout) {
+            // In an error state we don't know what state the recipient's storage server is in,
+            // so we default to deleting the request and ending the retry attempts.
+            if (!rpc::interpret_sn_storage_cc_response_parts(success, parts).retryable())
                 db->remove_node_retry_request(req_id);
-            }
         };
         sn_request(*ct, "storage_cc", {cmd, payload}, on_request_done, RETRY_REQUEST_TIMEOUT);
         return true;

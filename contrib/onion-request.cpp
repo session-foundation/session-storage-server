@@ -16,8 +16,13 @@
 #include <oxenc/base64.h>
 #include <oxenmq/oxenmq.h>
 #include <nlohmann/json.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
+#include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/network.hpp>
+#include <oxen/quic/opt.hpp>
 
 extern "C" {
 #include <sys/param.h>

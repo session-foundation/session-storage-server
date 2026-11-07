@@ -469,6 +469,71 @@ TEST_CASE("storage - multi-hash expiry updates, lookups and deletes", "[storage]
     CHECK(updated == updates{{long1, now + 2h}, {long2, now + 2h}});
 }
 
+TEST_CASE("storage - all of a namespace's expiries", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    using expiries = std::map<std::string, int64_t>;
+    const auto now = std::chrono::system_clock::now();
+    const auto ns0 = namespace_id::Default;
+    const auto ns2 = namespace_id{2};
+    const auto ns_neg = namespace_id{-5};
+
+    REQUIRE(storage.store({pk1, "a1", ns0, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a2", ns2, now, now + 2h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a3", ns2, now, now + 4h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a4", ns_neg, now, now + 5h, "data"}) == StoreResult::New);
+    // Expired but not yet cleaned up
+    REQUIRE(storage.store({pk1, "gone", ns0, now - 2h, now - 1min, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk2, "b1", ns0, now, now + 3h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk2, "b2", ns2, now, now + 3h, "data"}) == StoreResult::New);
+
+    CHECK(storage.get_expiries(pk1, ns0) == expiries{{"a1", to_epoch_ms(now + 1h)}});
+    CHECK(storage.get_expiries(pk1, ns2) ==
+          expiries{{"a2", to_epoch_ms(now + 2h)}, {"a3", to_epoch_ms(now + 4h)}});
+    CHECK(storage.get_expiries(pk1, ns_neg) == expiries{{"a4", to_epoch_ms(now + 5h)}});
+    CHECK(storage.get_expiries(pk1, namespace_id{3}).empty());
+    CHECK(storage.get_expiries(pk2, ns0) == expiries{{"b1", to_epoch_ms(now + 3h)}});
+    CHECK(storage.get_expiries(nobody, ns0).empty());
+}
+
+TEST_CASE("storage - an account's message counts by namespace", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    using counts = std::vector<std::pair<namespace_id, int64_t>>;
+    const auto now = std::chrono::system_clock::now();
+    const auto ns0 = namespace_id::Default;
+    const auto ns13 = namespace_id{13};
+    const auto ns_neg = namespace_id{-21};
+
+    REQUIRE(storage.store({pk1, "a1", ns0, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a2", ns0, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a3", ns13, now, now + 1h, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a4", ns_neg, now, now + 1h, "data"}) == StoreResult::New);
+    // Expired but not yet cleaned up
+    REQUIRE(storage.store({pk1, "gone", ns0, now - 2h, now - 1min, "data"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "gone2", namespace_id{5}, now - 2h, now - 1min, "data"}) ==
+            StoreResult::New);
+    REQUIRE(storage.store({pk2, "b1", ns13, now, now + 1h, "data"}) == StoreResult::New);
+
+    CHECK(storage.get_namespace_counts(pk1) == counts{{ns_neg, 1}, {ns0, 2}, {ns13, 1}});
+    CHECK(storage.get_namespace_counts(pk2) == counts{{ns13, 1}});
+    CHECK(storage.get_namespace_counts(nobody).empty());
+}
+
 TEST_CASE("storage - return entries older than lasthash", "[storage]") {
     StorageDeleter fixture;
 
@@ -744,6 +809,8 @@ TEST_CASE("storage - deferred expiry extensions", "[storage][expiry]") {
         CHECK(stored("h1") == exp_ms(base));
         CHECK(storage.get_expiries(pk, hashes{"h1", "h2"}) ==
               expiries{{"h1", exp_ms(base + 5min)}, {"h2", exp_ms(base)}});
+        CHECK(storage.get_expiries(pk, ns) ==
+              expiries{{"h1", exp_ms(base + 5min)}, {"h2", exp_ms(base)}, {"h3", exp_ms(base)}});
 
         // Repeats go into the same entry
         updated = storage.update_expiry(pk, hashes{"h1"}, std::array{base + 10min}, true);
@@ -1470,4 +1537,73 @@ TEST_CASE("storage - dump batches and cursors", "[storage][swarm]") {
     REQUIRE(dumps.size() == 1);
     CHECK(dumps[0].swarm == 124);
     CHECK(dumps[0].end_id == 9);
+}
+
+TEST_CASE("storage - retrieve and count from a row id", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey a, b;
+    REQUIRE(a.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(b.load("05fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"));
+    const auto ns0 = namespace_id::Default, ns5 = namespace_id{5};
+    const auto now = std::chrono::system_clock::now();
+
+    Database storage{"."};
+    std::vector<int64_t> ids;
+    auto store =
+            [&](const user_pubkey& pk, std::string hash, namespace_id ns, bool expired = false) {
+                int64_t id = 0;
+                REQUIRE(storage.store(
+                                {pk,
+                                 hash,
+                                 ns,
+                                 expired ? now - 2h : now,
+                                 expired ? now - 1h : now + 1h,
+                                 "data " + hash},
+                                nullptr,
+                                &id) == StoreResult::New);
+                ids.push_back(id);
+                return id;
+            };
+    auto a1 = store(a, "a1", ns0);
+    store(b, "b1", ns0);
+    auto a2 = store(a, "a2", ns0);
+    store(a, "a5", ns5);
+    store(a, "gone", ns0, true);
+    auto a3 = store(a, "a3", ns0);
+    CHECK(std::ranges::is_sorted(ids));
+    // Storing an existing message again is not new, and reports no id.
+    int64_t again = 0;
+    REQUIRE(storage.store({a, "a1", ns0, now, now + 1h, "data a1"}, nullptr, &again) ==
+            StoreResult::Exists);
+    CHECK(again == 0);
+
+    auto hashes = [](const std::vector<std::pair<int64_t, message>>& got) {
+        std::vector<std::string> h;
+        for (auto& [id, m] : got)
+            h.push_back(m.hash);
+        return h;
+    };
+
+    // Only the account's unexpired messages in the namespace, from the id on, oldest first.
+    auto got = storage.retrieve_from_id(a, ns0, a1, 10);
+    CHECK(hashes(got) == std::vector<std::string>{"a1", "a2", "a3"});
+    REQUIRE(got.size() == 3);
+    CHECK(got[0].first == a1);
+    CHECK(got[2].first == a3);
+    CHECK(got[0].second.pubkey == a);
+    CHECK(got[0].second.msg_namespace == ns0);
+    CHECK(got[0].second.data == "data a1");
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1 + 1, 10)) ==
+          std::vector<std::string>{"a2", "a3"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1, 2)) == std::vector<std::string>{"a1", "a2"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns0, a1, 2, true)) ==
+          std::vector<std::string>{"a3", "a2"});
+    CHECK(hashes(storage.retrieve_from_id(a, ns5, 1, 10)) == std::vector<std::string>{"a5"});
+    CHECK(storage.retrieve_from_id(a, namespace_id{6}, 1, 10).empty());
+
+    CHECK(storage.count_id_range(a, ns0, a1, a3) == 2);
+    CHECK(storage.count_id_range(a, ns0, a2, a3 + 1) == 2);  // a2, a3; not the expired one
+    CHECK(storage.count_id_range(a, ns0, a3 + 1, a3 + 100) == 0);
+    CHECK(storage.count_id_range(b, ns5, 1, a3 + 1) == 0);
 }

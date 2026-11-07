@@ -98,6 +98,8 @@ class Database {
     void forget_deferred(std::span<const std::pair<namespace_id, std::string>> ns_hashes);
     // Replaces each message's expiry with its deferred extension, where there is one.
     void apply_deferred(std::span<message> msgs);
+    // The same for a hash -> expiry map of the given owner's messages.
+    void apply_deferred(std::map<std::string, int64_t>& expiries, int64_t owner);
     // Removes and returns every deferred extension for the given owner.
     std::vector<std::pair<std::string, deferred_expiry>> take_deferred(int64_t owner);
     // Writes the given (already removed) deferred extensions to the table, never lowering an
@@ -174,8 +176,12 @@ class Database {
 
     // Stores a message in the database.  Returns an enum value indicating the result -- see
     // StoreResult for a description.  `expiry` can be set to a pointer into which the message's
-    // expiry (existing, if longer; otherwise the one from `msg`) will be copied.
-    StoreResult store(const message& msg, std::chrono::system_clock::time_point* expiry = nullptr);
+    // expiry (existing, if longer; otherwise the one from `msg`) will be copied, and `id` to one
+    // into which the message's row id will be copied when the result is StoreResult::New.
+    StoreResult store(
+            const message& msg,
+            std::chrono::system_clock::time_point* expiry = nullptr,
+            int64_t* id = nullptr);
 
     void bulk_store(std::span<const message> items);
 
@@ -221,6 +227,9 @@ class Database {
     // Returns the number of messages grouped by namespace id
     std::vector<std::pair<namespace_id, int64_t>> get_namespace_counts();
 
+    // Returns the number of the account's unexpired messages in each namespace that has any.
+    std::vector<std::pair<namespace_id, int64_t>> get_namespace_counts(const user_pubkey& pubkey);
+
     // Returns the number of allocated bytes used on disk (i.e. used pages * page size).  This
     // includes both used and unused storage (i.e. allocated on disk, currently currently unused
     // that will likely be reused by sqlite when needed).
@@ -234,6 +243,20 @@ class Database {
     // Get message by `msg_hash`, return true if found.  Note that this does *not* filter by
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
+
+    // Gets at most `limit` of `pubkey`'s unexpired messages in namespace `ns` whose row ids (as
+    // `store` reports them) are at least `from_id`, with their row ids: oldest first, or newest
+    // first if `newest_first`.
+    std::vector<std::pair<int64_t, message>> retrieve_from_id(
+            const user_pubkey& pubkey,
+            namespace_id ns,
+            int64_t from_id,
+            size_t limit,
+            bool newest_first = false);
+
+    // Counts `pubkey`'s unexpired messages in namespace `ns` with row ids in [from_id, before_id).
+    int64_t count_id_range(
+            const user_pubkey& pubkey, namespace_id ns, int64_t from_id, int64_t before_id);
 
     // Removes expired messages from the database, EXPIRY_DELETE_CHUNK at a time; the `Database`
     // instance owner should call this periodically.  Until then the methods that read messages or
@@ -328,6 +351,10 @@ class Database {
     // found are not included).
     std::map<std::string, int64_t> get_expiries(
             const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
+
+    // Retrieves the expiries of all of an account's unexpired messages in the given namespace, as a
+    // map of hash -> expiry.
+    std::map<std::string, int64_t> get_expiries(const user_pubkey& pubkey, namespace_id ns);
 
     // Writes the deferred expiry extensions that are due (see update_expiry) to the database, or
     // all of them if `all` is set.  The `Database` instance owner should call this periodically

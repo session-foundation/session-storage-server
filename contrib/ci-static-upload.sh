@@ -9,8 +9,7 @@ set -o errexit
 
 if [ -z "$SSH_KEY" ]; then
     echo -e "\n\n\n\e[31;1mUnable to upload artifact: SSH_KEY not set\e[0m"
-    # Just warn but don't fail, so that this doesn't trigger a build failure for untrusted builds
-    exit 0
+    exit 1
 fi
 
 echo "$SSH_KEY" >ssh_key

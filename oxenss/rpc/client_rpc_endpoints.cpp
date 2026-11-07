@@ -905,10 +905,11 @@ bt_value expire_msgs::to_bt() const {
 
 template <typename Dict>
 static void load(get_expiries& ge, Dict& d) {
-    auto [messages, pubkey, pk_ed25519, sig, subacc, subacc_sig, timestamp] =
-            load_fields<Vec<Str>, Str, SV, SV, SV, SV, TP>(
+    auto [messages, msg_ns, pubkey, pk_ed25519, sig, subacc, subacc_sig, timestamp] =
+            load_fields<Vec<Str>, namespace_id, Str, SV, SV, SV, SV, TP>(
                     d,
                     "messages",
+                    "namespace",
                     "pubkey",
                     "pubkey_ed25519",
                     "signature",
@@ -920,7 +921,11 @@ static void load(get_expiries& ge, Dict& d) {
     load_subaccount(ge, d, subacc, subacc_sig);
     require("timestamp", timestamp);
     ge.sig_ts = *timestamp;
-    require("messages", messages);
+    require_exactly_one_of("messages", messages, "namespace", msg_ns);
+    if (msg_ns) {
+        ge.msg_namespace = *msg_ns;
+        return;
+    }
     ge.messages = std::move(*messages);
     if (ge.messages.empty())
         throw parse_error{"messages does not contain any message hashes"};
@@ -929,6 +934,30 @@ void get_expiries::load_from(json params) {
     load(*this, params);
 }
 void get_expiries::load_from(bt_dict_consumer params) {
+    load(*this, params);
+}
+
+template <typename Dict>
+static void load(get_message_count& gc, Dict& d) {
+    auto [pubkey, pk_ed25519, sig, subacc, subacc_sig, timestamp] =
+            load_fields<Str, SV, SV, SV, SV, TP>(
+                    d,
+                    "pubkey",
+                    "pubkey_ed25519",
+                    "signature",
+                    "subaccount",
+                    "subaccount_sig",
+                    "timestamp");
+
+    load_pk_signature(gc, d, pubkey, pk_ed25519, sig);
+    load_subaccount(gc, d, subacc, subacc_sig);
+    require("timestamp", timestamp);
+    gc.sig_ts = *timestamp;
+}
+void get_message_count::load_from(json params) {
+    load(*this, params);
+}
+void get_message_count::load_from(bt_dict_consumer params) {
     load(*this, params);
 }
 

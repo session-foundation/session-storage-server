@@ -73,6 +73,8 @@ struct Response {
 enum class SNStorageCCResultStatus {
     Good,
     Timeout,
+    // Refused unsent because too much is already queued for the peer.
+    StreamFull,
     ErrorCodeReason,
     BadPeerResponse,
 };
@@ -83,6 +85,13 @@ struct SNStorageCCResult {
     SNStorageCCResultStatus status = {};
     std::string_view error_code;
     std::string_view error_reason;
+
+    // True if the request never reached the peer, or got no reply, so is worth sending again.
+    // Otherwise the peer refused it or answered unintelligibly, and would do the same again.
+    bool retryable() const {
+        return status == SNStorageCCResultStatus::Timeout ||
+               status == SNStorageCCResultStatus::StreamFull;
+    }
 };
 
 // Views the string or string_view body inside a Response.  Should only be called when the body
@@ -219,6 +228,7 @@ class RequestHandler {
     void process_client_req(rpc::expire_all&&, std::function<void(Response)> cb);
     void process_client_req(rpc::expire_msgs&&, std::function<void(Response)> cb);
     void process_client_req(rpc::get_expiries&&, std::function<void(Response)> cb);
+    void process_client_req(rpc::get_message_count&&, std::function<void(Response)> cb);
     void process_client_req(rpc::batch&&, std::function<void(Response)> cb);
     void process_client_req(rpc::sequence&&, std::function<void(Response)> cb);
     void process_client_req(rpc::ifelse&&, std::function<void(Response)> cb);

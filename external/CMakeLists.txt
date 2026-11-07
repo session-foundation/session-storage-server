@@ -65,8 +65,10 @@ endif()
 include(oxen-libquic/external/oxen-logging/cmake/load.cmake)
 
 set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-# 1.13.0 is the first release with opt::socket_buffers.
-sessiondep_or_submodule(liboxenquic 1.13.0 oxen-libquic oxen::quic)
+# 1.14.0 is the first release that withdraws timed-out requests that were never sent.  That is a
+# change of behaviour rather than of API, so an older libquic would still build, but would leave
+# us queueing duplicate data for slow peers.
+sessiondep_or_submodule(liboxenquic 1.14.0 oxen-libquic oxen::quic)
 
 # 1.3.2 is the first release carrying the fixed libzmq and the proxy deadlock fix.
 sessiondep_or_submodule(liboxenmq 1.3.2 oxen-mq oxenmq::oxenmq)

@@ -19,9 +19,6 @@ namespace oxenss {
 // place this here so we can use it in oxenss::*
 using namespace std::literals;
 
-// {pubkey (bytes), pubkey (hex), namespaces, want_data}
-using sub_info = std::tuple<std::string, std::string, std::vector<namespace_id>, bool>;
-
 oxenc::bt_value json_to_bt(nlohmann::json j);
 
 nlohmann::json bt_to_json(oxenc::bt_dict_consumer d);
@@ -45,6 +42,9 @@ enum class MonitorResponse {
     BAD_SIG = 5,
     WRONG_SWARM = 6,
     NO_SWARM_INFO = 7,
+    TOO_MANY_MONITORS = 8,
+    TOO_MANY_SESSIONS = 9,
+    SESSION_ALREADY_STARTED = 10,
 };
 
 inline void monitor_error(oxenc::bt_dict_producer& out, MonitorResponse r, std::string message) {

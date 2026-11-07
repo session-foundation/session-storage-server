@@ -228,6 +228,7 @@ class RequestHandler {
     void process_client_req(rpc::expire_all&&, std::function<void(Response)> cb);
     void process_client_req(rpc::expire_msgs&&, std::function<void(Response)> cb);
     void process_client_req(rpc::get_expiries&&, std::function<void(Response)> cb);
+    void process_client_req(rpc::get_message_count&&, std::function<void(Response)> cb);
     void process_client_req(rpc::batch&&, std::function<void(Response)> cb);
     void process_client_req(rpc::sequence&&, std::function<void(Response)> cb);
     void process_client_req(rpc::ifelse&&, std::function<void(Response)> cb);

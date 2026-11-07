@@ -668,7 +668,8 @@ struct expire_msgs final : recursive {
     oxenc::bt_value to_bt() const override;
 };
 
-/// Retrieves the current expiry timestamps of the given messages.
+/// Retrieves the current expiry timestamps of the given messages, or of every message in a
+/// namespace.
 ///
 /// Takes parameters of:
 /// - `pubkey` -- the account
@@ -679,27 +680,69 @@ struct expire_msgs final : recursive {
 /// - `subaccount`/`subaccount_sig` - see `store` for details.  Only subaccounts with the `read` bit
 ///   set in the token may invoke this endpoint.
 /// - `messages` -- array of message hash strings (as provided by the storage server) to look up.
-///   Messages can be from any namespace(s).  You may pass a single message id of "all" to retrieve
-///   the expiries of all of the account's messages, in every namespace.
+///   Messages can be from any namespace(s).
+/// - `namespace` -- instead of `messages`, look up every message in this namespace.  Exactly one of
+///   `messages` and `namespace` must be given.  Storage servers before 2.13.0 do not support this,
+///   and reject a request without `messages`.
 /// - `timestamp` -- the timestamp at which this request was initiated, in milliseconds since unix;
 ///   must with ±60s of the current time (as with other signature timestamps, using the server time
 ///   is recommended).
 /// - `signature` -- Ed25519 signature of:
 ///       ("get_expiries" || timestamp || messages[0] || ... || messages[N])
-///   where `timestamp` is expressed as a string (base10).  The signature must be base64 encoded
-///   (json) or bytes (bt).
+///   when given `messages`, or of:
+///       ("get_expiries" || "N" || namespace || timestamp)
+///   when given `namespace` (including namespace 0), where "N" is the literal letter N and
+///   `namespace` and `timestamp` are expressed as strings (base10).  The signature must be base64
+///   encoded (json) or bytes (bt).
 ///
 ///
 /// Returns dict with keys:
 /// - "expiries" sub-dict of messageid => expiry (milliseconds since unix epoch) pairs.  Only
-///   message that exist on the server are included.
+///   messages that exist on the server are included.
 struct get_expiries final : endpoint {
     static constexpr auto names() { return NAMES("get_expiries"); }
 
     user_pubkey pubkey;
     std::optional<std::array<unsigned char, 32>> pubkey_ed25519;
     std::optional<signed_subaccount_token> subaccount;
+    // Exactly one of these is given: the hashes to look up, or the namespace to look up wholesale.
     std::vector<std::string> messages;
+    std::optional<namespace_id> msg_namespace;
+    std::chrono::system_clock::time_point sig_ts;
+    std::array<unsigned char, 64> signature;
+
+    void load_from(nlohmann::json params) override;
+    void load_from(oxenc::bt_dict_consumer params) override;
+};
+
+/// Retrieves the number of messages stored for an account, in total and per namespace.
+///
+/// Takes parameters of:
+/// - `pubkey` -- the account
+/// - `pubkey_ed25519` if provided *and* the pubkey has a type 05 (i.e. Session id) then `pubkey`
+///   will be interpreted as an `x25519` pubkey derived from this given ed25519 pubkey (which must
+///   be 64 hex characters or 32 bytes).  *This* pubkey should be used for signing, but must also
+///   convert to the given `pubkey` value (without the `05` prefix).
+/// - `subaccount`/`subaccount_sig` - see `store` for details.  Only subaccounts with the `read` bit
+///   set in the token may invoke this endpoint.
+/// - `timestamp` -- the timestamp at which this request was initiated, in milliseconds since unix;
+///   must with ±60s of the current time (as with other signature timestamps, using the server time
+///   is recommended).
+/// - `signature` -- Ed25519 signature of ("get_message_count" || timestamp), where `timestamp` is
+///   expressed as a string (base10).  The signature must be base64 encoded (json) or bytes (bt).
+///
+/// Returns dict with keys:
+/// - "total" -- the number of messages stored for the account, across all namespaces.
+/// - "namespace" -- dict of namespace => number of messages stored in it, with the namespace as a
+///   (base10) string key, e.g. `{"0": 100, "-21": 1}`.  Namespaces with no messages are omitted.
+///
+/// Expired messages are not counted, even if they have not yet been deleted.
+struct get_message_count final : endpoint {
+    static constexpr auto names() { return NAMES("get_message_count"); }
+
+    user_pubkey pubkey;
+    std::optional<std::array<unsigned char, 32>> pubkey_ed25519;
+    std::optional<signed_subaccount_token> subaccount;
     std::chrono::system_clock::time_point sig_ts;
     std::array<unsigned char, 64> signature;
 
@@ -781,6 +824,7 @@ using client_rpc_subrequests = type_list<
         expire_msgs,
         expire_all,
         get_expiries,
+        get_message_count,
         get_swarm,
         oxend_request,
         active_nodes_bin,

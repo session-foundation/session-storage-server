@@ -1,3 +1,29 @@
+oxen-storage-server (2.13.0~rc1-1~deb13) trixie; urgency=medium
+
+  * Bound the backlog of client commands forwarded to swarm peers
+  * Update libquic to 1.14.0
+  * Don't resume a failed dump while its window is still in flight
+  * Warn when a peer's forward stream backlogs, with hysteresis
+  * Make get_expiries' "all" return every message's expiry
+  * Migrate CI from .drone.jsonnet to Woodpecker Starlark
+  * Point the docs at deb.session.foundation
+  * Build with Woodpecker via .woodpecker/override-deb.star
+  * Replace get_expiries' "all" with a lookup by namespace
+  * Add a get_message_count endpoint
+  * Remove the oxenmq monitor path
+  * Move monitoring out of MQBase into a Monitors class owned by QUIC
+  * Keep one monitor per subscription instead of merging them
+  * Report each subscription's expiry in monitor replies
+  * Report a stored message's row id, and look up an account's messages from one
+  * Add serial_runs, to run each connection's requests in arrival order
+  * Add replay_owners, to track which replay paces each connection
+  * Add monitor sessions, which keep monitors across connections
+  * Bound monitor sessions for ordinary clients, with a privileged tier
+  * Bump version to 2.13.0
+  * Give each network test its own entry connection
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 07 Nov 2026 12:26:25 -0400
+
 oxen-storage-server (2.12.1-1~deb13) trixie; urgency=medium
 
   * require final libquic dev package

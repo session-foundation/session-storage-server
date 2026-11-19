@@ -609,7 +609,11 @@ bool ServiceNode::process_store(
     return result != StoreResult::Full;
 }
 
-bool ServiceNode::save_bulk(std::span<const message> msgs) {
+bool ServiceNode::save_bulk(std::vector<message> msgs, std::string_view sender) {
+    if (auto dropped = drop_mismatched_hashes(msgs))
+        log::debug(
+                logcat, "Dropped {} messages from {} whose hash does not match", dropped, sender);
+
     try {
         db->bulk_store(msgs);
     } catch (const std::exception& e) {
@@ -1571,7 +1575,7 @@ bool ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
 
     log::debug(logcat, "Got {} messages from peers, size: {}", items.size(), blob.size());
 
-    return save_bulk(items);
+    return save_bulk(std::move(items), sender);
 }
 
 void ServiceNode::check_retry_requests() {

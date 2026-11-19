@@ -1,3 +1,4 @@
+#include <oxenss/rpc/request_handler.h>
 #include <oxenss/snode/serialization.h>
 #include <oxenss/snode/service_node.h>
 #include <oxenc/hex.h>
@@ -101,4 +102,51 @@ TEST_CASE("v1 serialization - message payload 100MiB", "[serialization]") {
             oxenss::util::get_human_readable_bytes(total_bytes),
             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed),
             gbs_per_s);
+}
+
+TEST_CASE("v1 serialization - messages whose hash does not match are dropped", "[serialization]") {
+    oxenss::user_pubkey pub_key;
+    REQUIRE(pub_key.load("034368520005786b249bcd461d28f75e560ea794014eeb17fcf6003f37d876783e"s));
+    const std::chrono::system_clock::time_point timestamp{1'622'576'077s};
+    auto make = [&](oxenss::namespace_id ns, std::string data) {
+        auto hash = oxenss::rpc::computeMessageHash(pub_key, ns, data);
+        return oxenss::message{pub_key, hash, ns, timestamp, timestamp + 24h, std::move(data)};
+    };
+    const auto group_message = make(oxenss::namespace_id::GroupMessages, "group");
+    const auto default_message = make(oxenss::namespace_id::Default, "default");
+
+    SECTION("a batch with namespaces keeps every message") {
+        auto msgs = deserialize_messages(
+                serialize_messages(std::vector{group_message, default_message}, 1).front());
+        CHECK(drop_mismatched_hashes(msgs) == 0);
+        REQUIRE(msgs.size() == 2);
+        CHECK(msgs[0].msg_namespace == oxenss::namespace_id::GroupMessages);
+        CHECK(msgs[1].msg_namespace == oxenss::namespace_id::Default);
+    }
+
+    SECTION("a batch without namespaces keeps only the Default messages") {
+        auto blob = serialize_messages(std::vector{group_message, default_message}, 1).front();
+        for (auto ns : {"i11ee"s, "i0ee"s}) {
+            auto at = blob.find(ns);
+            REQUIRE(at != std::string::npos);
+            blob.erase(at, ns.size() - 1);
+        }
+        auto msgs = deserialize_messages(blob);
+        REQUIRE(msgs.size() == 2);
+        CHECK(msgs[0].msg_namespace == oxenss::namespace_id::Default);
+        CHECK(drop_mismatched_hashes(msgs) == 1);
+        REQUIRE(msgs.size() == 1);
+        CHECK(msgs[0].hash == default_message.hash);
+    }
+
+    SECTION("a message claiming another namespace, or with other data, is dropped") {
+        auto moved = group_message;
+        moved.msg_namespace = oxenss::namespace_id::GroupInfo;
+        auto altered = group_message;
+        altered.data = "other";
+        std::vector msgs{moved, altered, default_message};
+        CHECK(drop_mismatched_hashes(msgs) == 2);
+        REQUIRE(msgs.size() == 1);
+        CHECK(msgs[0].hash == default_message.hash);
+    }
 }

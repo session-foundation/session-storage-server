@@ -2,6 +2,7 @@
 
 #include <oxenss/common/format.h>
 #include <oxenss/logging/oxen_logger.h>
+#include <oxenss/rpc/request_handler.h>
 #include <oxenss/utils/string_utils.hpp>
 #include <oxenss/utils/time.hpp>
 
@@ -106,6 +107,12 @@ std::vector<message> deserialize_messages(std::string_view slice) {
     log::trace(logcat, "=== END ===");
 
     return result;
+}
+
+size_t drop_mismatched_hashes(std::vector<message>& msgs) {
+    return std::erase_if(msgs, [](const message& m) {
+        return rpc::computeMessageHash(m.pubkey, m.msg_namespace, m.data) != m.hash;
+    });
 }
 
 }  // namespace oxenss::snode

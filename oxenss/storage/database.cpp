@@ -935,6 +935,13 @@ void Database::bulk_store(std::span<const message> items) {
             " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
             " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
             " WHERE EXCLUDED.timestamp > messages.timestamp");
+    auto find_misfiled = conn.prepared_st(
+            "SELECT id, expiry,"
+            " EXISTS(SELECT 1 FROM messages o WHERE o.owner = m.owner AND o.id != m.id)"
+            " FROM messages m WHERE hash = ? AND namespace != ?");
+    auto delete_message = conn.prepared_st("DELETE FROM messages WHERE id = ?");
+    auto refile_message = conn.prepared_st(
+            "UPDATE messages SET namespace = ?, expiry = MAX(expiry, ?) WHERE id = ?");
 
     // A batch is up to a megabyte, and slow to insert when the pages it touches aren't cached, so
     // it is committed in pieces of about BULK_WORK_TARGET rather than in one transaction: each
@@ -950,11 +957,29 @@ void Database::bulk_store(std::span<const message> items) {
         auto transaction = conn.begin_immediate();
         const auto piece_end = std::chrono::steady_clock::now() + BULK_WORK_TARGET;
         std::unordered_map<user_pubkey, std::optional<int64_t>> owners;
-        int64_t added = 0;
+        int64_t added = 0, removed = 0;
         do {
             auto& m = *next++;
             if (!m.pubkey)
                 continue;
+            auto expiry = to_epoch_ms(m.expiry);
+            auto misfiled = exec_and_maybe_get<int64_t, int64_t, int64_t>(
+                    find_misfiled, m.hash, m.msg_namespace);
+            find_misfiled->reset();
+            if (misfiled) {
+                auto& [id, old_expiry, owner_has_others] = *misfiled;
+                expiry = std::max(expiry, old_expiry);
+                // Re-inserted to get a new id, so clients paging by last hash receive it; but not
+                // an owner's only message, whose delete would take the owner and its revocations.
+                if (!owner_has_others) {
+                    exec_query(refile_message, m.msg_namespace, expiry, id);
+                    refile_message->reset();
+                    continue;
+                }
+                exec_query(delete_message, id);
+                delete_message->reset();
+                removed++;
+            }
             auto [owner, inserted] = owners.try_emplace(m.pubkey);
             if (inserted) {
                 owner->second = exec_and_maybe_get<int64_t>(
@@ -981,14 +1006,14 @@ void Database::bulk_store(std::span<const message> items) {
                     m.hash,
                     m.msg_namespace,
                     to_epoch_ms(m.timestamp),
-                    to_epoch_ms(m.expiry),
+                    expiry,
                     to_span(m.data));
             insert_message->reset();
             if (inserted_row(conn.sql))
                 added++;
         } while (next != items.end() && std::chrono::steady_clock::now() < piece_end);
         transaction.commit();
-        message_count_ += added;
+        message_count_ += added - removed;
     }
 }
 

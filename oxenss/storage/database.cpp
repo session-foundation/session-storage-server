@@ -935,9 +935,13 @@ void Database::bulk_store(std::span<const message> items) {
             " hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp,"
             " expiry = EXCLUDED.expiry, data = EXCLUDED.data"
             " WHERE EXCLUDED.timestamp > messages.timestamp");
-    auto find_misfiled =
-            conn.prepared_st("SELECT id, expiry FROM messages WHERE hash = ? AND namespace != ?");
+    auto find_misfiled = conn.prepared_st(
+            "SELECT id, expiry,"
+            " EXISTS(SELECT 1 FROM messages o WHERE o.owner = m.owner AND o.id != m.id)"
+            " FROM messages m WHERE hash = ? AND namespace != ?");
     auto delete_message = conn.prepared_st("DELETE FROM messages WHERE id = ?");
+    auto refile_message = conn.prepared_st(
+            "UPDATE messages SET namespace = ?, expiry = MAX(expiry, ?) WHERE id = ?");
 
     // A batch is up to a megabyte, and slow to insert when the pages it touches aren't cached, so
     // it is committed in pieces of about BULK_WORK_TARGET rather than in one transaction: each
@@ -959,18 +963,22 @@ void Database::bulk_store(std::span<const message> items) {
             if (!m.pubkey)
                 continue;
             auto expiry = to_epoch_ms(m.expiry);
-            // Deleted and inserted anew, not updated, so that clients paging by last hash get it.
-            auto misfiled =
-                    exec_and_maybe_get<int64_t, int64_t>(find_misfiled, m.hash, m.msg_namespace);
+            auto misfiled = exec_and_maybe_get<int64_t, int64_t, int64_t>(
+                    find_misfiled, m.hash, m.msg_namespace);
             find_misfiled->reset();
             if (misfiled) {
-                auto& [id, old_expiry] = *misfiled;
+                auto& [id, old_expiry, owner_has_others] = *misfiled;
                 expiry = std::max(expiry, old_expiry);
+                // Re-inserted to get a new id, so clients paging by last hash receive it; but not
+                // an owner's only message, whose delete would take the owner and its revocations.
+                if (!owner_has_others) {
+                    exec_query(refile_message, m.msg_namespace, expiry, id);
+                    refile_message->reset();
+                    continue;
+                }
                 exec_query(delete_message, id);
                 delete_message->reset();
                 removed++;
-                // The delete removes the owner along with its last message.
-                owners.erase(m.pubkey);
             }
             auto [owner, inserted] = owners.try_emplace(m.pubkey);
             if (inserted) {

@@ -187,9 +187,9 @@ class ServiceNode {
 
     void send_notifies(const message& m, int64_t id);
 
-    // Save multiple messages to the database at once (i.e. in a single transaction).  Returns
-    // false if they could not be saved.
-    bool save_bulk(std::span<const message> msgs);
+    // Save multiple messages to the database at once (i.e. in a single transaction), dropping
+    // those whose hash does not match.  Returns false if they could not be saved.
+    bool save_bulk(std::vector<message> msgs, std::string_view sender);
 
     void process_snodes_update(std::string_view data);
 

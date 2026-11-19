@@ -762,14 +762,40 @@ TEST_CASE("storage - bulk storage moves a message stored under another namespace
         CHECK(storage.get_owner_count() == 1);
     }
 
-    SECTION("when it was the owner's only message") {
+    SECTION("in place when it is the owner's only message, keeping the owner's revocations") {
         storage.bulk_store(std::vector<message>{
                 {pubkey, "misfiled", namespace_id::Default, timestamp, timestamp + 1h, bytes}});
+        subaccount_token revoked;
+        revoked.token.fill(7);
+        storage.revoke_subaccounts(pubkey, std::span{&revoked, 1});
+        REQUIRE(storage.subaccount_revoked(pubkey, revoked));
+
         CHECK_NOTHROW(storage.bulk_store(std::vector<message>{
-                {pubkey, "misfiled", namespace_id::GroupInfo, timestamp, timestamp + 1h, bytes}}));
-        CHECK(storage.retrieve(pubkey, namespace_id::GroupInfo, "").first.size() == 1);
+                {pubkey, "misfiled", namespace_id::GroupInfo, timestamp, timestamp + 2h, bytes}}));
+
+        auto [moved, more] = storage.retrieve(pubkey, namespace_id::GroupInfo, "");
+        REQUIRE(moved.size() == 1);
+        CHECK(moved[0].expiry == timestamp + 2h);
+        CHECK(storage.retrieve(pubkey, namespace_id::Default, "").first.empty());
+        CHECK(storage.subaccount_revoked(pubkey, revoked));
         CHECK(storage.get_message_count() == 1);
         CHECK(storage.get_owner_count() == 1);
+    }
+
+    SECTION("into a public outbox holding a newer message, which it leaves alone") {
+        const auto outbox = static_cast<namespace_id>(-1);
+        storage.bulk_store(std::vector<message>{
+                {pubkey, "newer", outbox, timestamp + 1s, timestamp + 1h, bytes},
+                {pubkey, "misfiled", namespace_id::Default, timestamp, timestamp + 1h, bytes}});
+
+        CHECK_NOTHROW(storage.bulk_store(std::vector<message>{
+                {pubkey, "misfiled", outbox, timestamp, timestamp + 1h, bytes}}));
+
+        auto [kept, more] = storage.retrieve(pubkey, outbox, "");
+        REQUIRE(kept.size() == 1);
+        CHECK(kept[0].hash == "newer");
+        CHECK(storage.retrieve(pubkey, namespace_id::Default, "").first.empty());
+        CHECK(storage.get_message_count() == 1);
     }
 
     SECTION("but leaves one already in the item's namespace in place") {

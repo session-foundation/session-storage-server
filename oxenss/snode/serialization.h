@@ -19,4 +19,8 @@ std::vector<std::string> serialize_messages(std::span<const message> msgs, uint8
 
 std::vector<message> deserialize_messages(std::string_view blob);
 
+// Drops the messages whose hash does not match their namespace and data; returns the count.
+// Peers older than 2.11.3 send no namespace, which reads as Default.
+size_t drop_mismatched_hashes(std::vector<message>& msgs);
+
 }  // namespace oxenss::snode

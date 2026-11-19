@@ -727,6 +727,65 @@ TEST_CASE("storage - bulk storage with overlap", "[storage]") {
     }
 }
 
+TEST_CASE("storage - bulk storage moves a message stored under another namespace", "[storage]") {
+    StorageDeleter fixture;
+
+    user_pubkey pubkey;
+    REQUIRE(pubkey.load("030123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    const auto timestamp =
+            std::chrono::floor<std::chrono::milliseconds>(std::chrono::system_clock::now());
+    const auto bytes = "bytesasstring";
+
+    Database storage{"."};
+
+    SECTION("into the item's namespace, with a new id and the later expiry") {
+        storage.bulk_store(std::vector<message>{
+                {pubkey, "earlier", namespace_id::GroupMessages, timestamp, timestamp + 1h, bytes},
+                {pubkey, "misfiled", namespace_id::Default, timestamp, timestamp + 2h, bytes}});
+        REQUIRE(storage.get_message_count() == 2);
+
+        storage.bulk_store(std::vector<message>{
+                {pubkey,
+                 "misfiled",
+                 namespace_id::GroupMessages,
+                 timestamp,
+                 timestamp + 1h,
+                 bytes}});
+
+        CHECK(storage.retrieve(pubkey, namespace_id::Default, "").first.empty());
+        auto [after_earlier, more] =
+                storage.retrieve(pubkey, namespace_id::GroupMessages, "earlier");
+        REQUIRE(after_earlier.size() == 1);
+        CHECK(after_earlier[0].hash == "misfiled");
+        CHECK(after_earlier[0].expiry == timestamp + 2h);
+        CHECK(storage.get_message_count() == 2);
+        CHECK(storage.get_owner_count() == 1);
+    }
+
+    SECTION("when it was the owner's only message") {
+        storage.bulk_store(std::vector<message>{
+                {pubkey, "misfiled", namespace_id::Default, timestamp, timestamp + 1h, bytes}});
+        CHECK_NOTHROW(storage.bulk_store(std::vector<message>{
+                {pubkey, "misfiled", namespace_id::GroupInfo, timestamp, timestamp + 1h, bytes}}));
+        CHECK(storage.retrieve(pubkey, namespace_id::GroupInfo, "").first.size() == 1);
+        CHECK(storage.get_message_count() == 1);
+        CHECK(storage.get_owner_count() == 1);
+    }
+
+    SECTION("but leaves one already in the item's namespace in place") {
+        storage.bulk_store(std::vector<message>{
+                {pubkey, "kept", namespace_id::GroupMessages, timestamp, timestamp + 1h, bytes},
+                {pubkey, "later", namespace_id::GroupMessages, timestamp, timestamp + 1h, bytes}});
+        storage.bulk_store(std::vector<message>{
+                {pubkey, "kept", namespace_id::GroupMessages, timestamp, timestamp + 3h, bytes}});
+        auto [all, more] = storage.retrieve(pubkey, namespace_id::GroupMessages, "");
+        REQUIRE(all.size() == 2);
+        CHECK(all[0].hash == "kept");
+        CHECK(all[0].expiry == timestamp + 3h);
+        CHECK(storage.get_message_count() == 2);
+    }
+}
+
 TEST_CASE("storage - retrieve limit", "[storage]") {
     StorageDeleter fixture;
 

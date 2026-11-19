@@ -183,6 +183,7 @@ class Database {
             std::chrono::system_clock::time_point* expiry = nullptr,
             int64_t* id = nullptr);
 
+    // Moves a copy stored under another namespace to the item's; callers check the hashes first.
     void bulk_store(std::span<const message> items);
 
     // Default value for message overhead calculations in `retrieve`.  In practice, overhead for the

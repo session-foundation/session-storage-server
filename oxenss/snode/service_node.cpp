@@ -1571,6 +1571,10 @@ bool ServiceNode::process_push_batch(std::string_view blob, std::string_view sen
 
     log::debug(logcat, "Got {} messages from peers, size: {}", items.size(), blob.size());
 
+    if (auto dropped = drop_mismatched_hashes(items))
+        log::debug(
+                logcat, "Dropped {} messages from {} whose hash does not match", dropped, sender);
+
     return save_bulk(items);
 }
 

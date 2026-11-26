@@ -548,3 +548,76 @@ def test_get_message_count(rpc, random_sn, sk, exclude):
     _store_in_namespaces(rpc, conns[0], sk, {0: 3, 13: 2, -21: 1})
 
     assert get_message_count() == {"total": 6, "namespace": {"0": 3, "13": 2, "-21": 1}}
+
+
+def test_retrieve_by_hash(rpc, random_sn, sk, exclude):
+    swarm = ss.get_swarm(rpc, random_sn, sk)
+    sns = ss.random_swarm_members(swarm, 2, exclude)
+    conns = [rpc.connect(sn) for sn in sns]
+    my_ss_id = '05' + sk.verify_key.encode().hex()
+
+    # Another account in the same swarm, so that its messages are on the node being asked
+    while True:
+        other_sk = SigningKey.generate()
+        if ss.get_swarm(rpc, random_sn, other_sk)['swarm'] == swarm['swarm']:
+            break
+
+    stored = _store_in_namespaces(rpc, conns[0], sk, {0: 2, 13: 1, -21: 1})
+    theirs = next(iter(_store_in_namespaces(rpc, conns[0], other_sk, {0: 1})[0]))
+    h0, h0b = stored[0]
+    h13 = next(iter(stored[13]))
+    h_pub = next(iter(stored[-21]))
+    unknown = 'A' * 43
+
+    def retrieve_by_hash(hashes, ns=0, *, signer=sk, sign_hashes=None, signed=True):
+        now = int(time.time() * 1000)
+        params = {"pubkey": my_ss_id, "messages": hashes}
+        if ns != 0:
+            params["namespace"] = ns
+        if signed:
+            to_sign = f"retrieve_by_hash{ns if ns != 0 else ''}{now}"
+            to_sign += ''.join(hashes if sign_hashes is None else sign_hashes)
+            params["timestamp"] = now
+            params["signature"] = signer.sign(
+                to_sign.encode(), encoder=Base64Encoder
+            ).signature.decode()
+        return rpc.request(conns[1], 'retrieve_by_hash', [json.dumps(params).encode()]).get()
+
+    def found(r):
+        assert len(r) == 1
+        r = json.loads(r[0])
+        assert set(r.keys()) == {"messages", "t", "hf"}
+        return r["messages"]
+
+    # Own messages come back in request order, in retrieve's format; unknown hashes and other
+    # accounts' messages are left out
+    msgs = found(retrieve_by_hash([h0b, unknown, theirs, h0]))
+    assert [m["hash"] for m in msgs] == [h0b, h0]
+    for m in msgs:
+        assert set(m.keys()) == {"hash", "timestamp", "expiration", "data"}
+        assert m["expiration"] == stored[0][m["hash"]]
+    assert {base64.b64decode(m["data"]) for m in msgs} == {b"ns 0 msg 0", b"ns 0 msg 1"}
+
+    # Only messages of the requested namespace are returned
+    assert found(retrieve_by_hash([h13, h0])) == []
+    assert [m["hash"] for m in found(retrieve_by_hash([h13, h0], 13))] == [h13]
+
+    # A public outbox may be read without a signature, but other namespaces may not
+    assert [m["hash"] for m in found(retrieve_by_hash([h_pub, h0], -21, signed=False))] == [h_pub]
+    assert retrieve_by_hash([h0], signed=False) == [
+        b'401',
+        b'retrieve_by_hash: request signature required',
+    ]
+
+    # Bad signatures are refused: another key's, or one over different hashes
+    failed = [b'401', b'retrieve_by_hash signature verification failed']
+    assert retrieve_by_hash([h0], signer=other_sk) == failed
+    assert retrieve_by_hash([h0], sign_hashes=[h0b]) == failed
+
+    # The number of hashes is capped
+    assert len(found(retrieve_by_hash([unknown] * 19 + [h0]))) == 1
+    r = retrieve_by_hash([unknown] * 20 + [h0])
+    assert r == [
+        b'400',
+        b'invalid request: too many message hashes: at most 20 may be requested at once',
+    ]

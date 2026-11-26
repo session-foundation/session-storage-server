@@ -244,6 +244,12 @@ class Database {
     // pubkey or namespace!
     std::optional<message> retrieve_by_hash(const std::string& msg_hash);
 
+    // Gets those of `pubkey`'s unexpired messages, in any namespace, whose hashes are in
+    // `msg_hashes`, in the order first requested; hashes not found are skipped.  The returned
+    // messages carry their stored namespace but not the pubkey.
+    std::vector<message> retrieve_by_hash(
+            const user_pubkey& pubkey, std::span<const std::string> msg_hashes);
+
     // Gets at most `limit` of `pubkey`'s unexpired messages in namespace `ns` whose row ids (as
     // `store` reports them) are at least `from_id`, with their row ids: oldest first, or newest
     // first if `newest_first`.

@@ -594,6 +594,52 @@ static bool is_valid_message_hash(std::string_view hash) {
 }
 
 template <typename Dict>
+static void load(retrieve_by_hash& r, Dict& d) {
+    auto [messages, msg_ns, pubkey, pk_ed25519, sig, subacc, subacc_sig, ts] =
+            load_fields<Vec<Str>, namespace_id, Str, SV, SV, SV, SV, TP>(
+                    d,
+                    "messages",
+                    "namespace",
+                    "pubkey",
+                    "pubkey_ed25519",
+                    "signature",
+                    "subaccount",
+                    "subaccount_sig",
+                    "timestamp");
+
+    if (msg_ns)
+        r.msg_namespace = *msg_ns;
+
+    // A missing signature is refused by the handler, which knows whether the namespace needs one.
+    if (pk_ed25519 || sig || ts) {
+        load_pk_signature(r, d, pubkey, pk_ed25519, sig);
+        load_subaccount(r, d, subacc, subacc_sig);
+        require("timestamp", ts);
+        r.timestamp = *ts;
+        r.check_signature = true;
+    } else {
+        load_pk(r, pubkey);
+    }
+
+    require("messages", messages);
+    r.messages = std::move(*messages);
+    if (r.messages.empty())
+        throw parse_error{"messages does not contain any message hashes"};
+    if (r.messages.size() > retrieve_by_hash::MAX_MESSAGES)
+        throw parse_error{"too many message hashes: at most {} may be requested at once"_format(
+                retrieve_by_hash::MAX_MESSAGES)};
+    for (const auto& m : r.messages)
+        if (!is_valid_message_hash(m))
+            throw parse_error{"invalid message hash: " + m};
+}
+void retrieve_by_hash::load_from(json params) {
+    load(*this, params);
+}
+void retrieve_by_hash::load_from(bt_dict_consumer params) {
+    load(*this, params);
+}
+
+template <typename Dict>
 static void load(delete_msgs& dm, Dict& d) {
     auto [messages, pubkey, pubkey_ed25519, required, signature, subacc, subacc_sig] =
             load_fields<Vec<Str>, Str, SV, bool, SV, SV, SV>(

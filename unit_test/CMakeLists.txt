@@ -13,6 +13,7 @@ add_executable(Test
     monitor.cpp
     onion_requests.cpp
     rate_limiter.cpp
+    retrieve_by_hash.cpp
     serialization.cpp
     service_node.cpp
     storage.cpp

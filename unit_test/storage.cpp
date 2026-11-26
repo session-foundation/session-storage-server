@@ -503,6 +503,54 @@ TEST_CASE("storage - all of a namespace's expiries", "[storage]") {
     CHECK(storage.get_expiries(nobody, ns0).empty());
 }
 
+TEST_CASE("storage - an account's messages by hash", "[storage]") {
+    StorageDeleter fixture;
+
+    Database storage{"."};
+
+    user_pubkey pk1, pk2, nobody;
+    REQUIRE(pk1.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    REQUIRE(pk2.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"));
+    REQUIRE(nobody.load("050123456789abcdef0123456789abcdef0123456789abcdef0123456789abcded"));
+
+    using hashes = std::vector<std::string>;
+    const auto now = std::chrono::system_clock::now();
+    const auto ns0 = namespace_id::Default;
+    const auto ns13 = namespace_id{13};
+
+    REQUIRE(storage.store({pk1, "a1", ns0, now - 1s, now + 1h, "one"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a2", ns13, now - 2s, now + 2h, "two"}) == StoreResult::New);
+    REQUIRE(storage.store({pk1, "a3", ns0, now - 3s, now + 3h, "three"}) == StoreResult::New);
+    // Expired but not yet cleaned up
+    REQUIRE(storage.store({pk1, "gone", ns0, now - 2h, now - 1min, "old"}) == StoreResult::New);
+    REQUIRE(storage.store({pk2, "b1", ns0, now, now + 1h, "theirs"}) == StoreResult::New);
+
+    auto names = [](const std::vector<message>& msgs) {
+        hashes h;
+        for (const auto& m : msgs)
+            h.push_back(m.hash);
+        return h;
+    };
+
+    // In request order, from any namespace, skipping unknown, expired and other owners' hashes, and
+    // repeats
+    auto found =
+            storage.retrieve_by_hash(pk1, hashes{"a3", "nope", "b1", "a2", "gone", "a3", "a1"});
+    REQUIRE(names(found) == hashes{"a3", "a2", "a1"});
+    CHECK(found[0].msg_namespace == ns0);
+    CHECK(to_epoch_ms(found[0].timestamp) == to_epoch_ms(now - 3s));
+    CHECK(to_epoch_ms(found[0].expiry) == to_epoch_ms(now + 3h));
+    CHECK(found[0].data == "three");
+    CHECK(found[1].msg_namespace == ns13);
+    CHECK(found[1].data == "two");
+    CHECK(found[2].msg_namespace == ns0);
+    CHECK(found[2].data == "one");
+
+    CHECK(names(storage.retrieve_by_hash(pk2, hashes{"a1", "b1"})) == hashes{"b1"});
+    CHECK(storage.retrieve_by_hash(nobody, hashes{"a1", "b1"}).empty());
+    CHECK(storage.retrieve_by_hash(pk1, hashes{}).empty());
+}
+
 TEST_CASE("storage - an account's message counts by namespace", "[storage]") {
     StorageDeleter fixture;
 
@@ -831,6 +879,10 @@ TEST_CASE("storage - deferred expiry extensions", "[storage][expiry]") {
         auto by_hash = storage.retrieve_by_hash("h1");
         REQUIRE(by_hash);
         CHECK(exp_ms(by_hash->expiry) == exp_ms(base + 10min));
+        auto owned_by_hash = storage.retrieve_by_hash(pk, hashes{"h1", "h2"});
+        REQUIRE(owned_by_hash.size() == 2);
+        CHECK(exp_ms(owned_by_hash[0].expiry) == exp_ms(base + 10min));
+        CHECK(exp_ms(owned_by_hash[1].expiry) == exp_ms(base));
         auto all = storage.retrieve_all();
         REQUIRE(all.size() == 4);
         CHECK(exp_ms(all[0].expiry) == exp_ms(base + 10min));

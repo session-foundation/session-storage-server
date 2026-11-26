@@ -861,6 +861,106 @@ void RequestHandler::process_client_req(
     return cb(Response{http::OK, std::move(res)});
 }
 
+// The hash is counted on top of the per-message overhead, as `Database::retrieve` counts it.
+static_assert(
+        rpc::retrieve_by_hash::MAX_MESSAGES * (rpc::store::MAX_MESSAGE_BODY / 3 * 4 + 43 +
+                                               Database::DEFAULT_MSG_OVERHEAD) <=
+                RETRIEVE_MAX_SIZE,
+        "retrieve_by_hash's largest possible response must fit within RETRIEVE_MAX_SIZE");
+
+void RequestHandler::process_client_req(
+        rpc::retrieve_by_hash&& req, std::function<void(rpc::Response)> cb) {
+    if (!swarm_.is_pubkey_for_us(req.pubkey))
+        return cb(handle_wrong_swarm(req.pubkey));
+
+    auto now = system_clock::now();
+
+    if (is_testing_namespace(req.msg_namespace)) {
+        json res{{"messages", json::array()}};
+        add_misc_response_fields(res, service_node_, now);
+        return cb(Response{http::OK, std::move(res)});
+    }
+
+    if (!is_noauth_retrieve_namespace(req.msg_namespace) && !req.check_signature) {
+        log::debug(logcat, "retrieve_by_hash: request signature required");
+        return cb(Response{http::UNAUTHORIZED, "retrieve_by_hash: request signature required"sv});
+    }
+
+    if (req.check_signature) {
+        if (req.timestamp < now - SIGNATURE_TOLERANCE ||
+            req.timestamp > now + SIGNATURE_TOLERANCE) {
+            log::debug(
+                    logcat,
+                    "retrieve_by_hash: invalid timestamp ({}s from now)",
+                    duration_cast<seconds>(req.timestamp - now).count());
+            return cb(Response{
+                    http::NOT_ACCEPTABLE,
+                    "retrieve_by_hash timestamp too far from current time"sv});
+        }
+
+        if (!verify_signature(
+                    *service_node_.db,
+                    req.pubkey,
+                    req.pubkey_ed25519,
+                    req.subaccount,
+                    subaccount_access::Read,
+                    is_unrevocable_namespace(req.msg_namespace),
+                    req.signature,
+                    "retrieve_by_hash",
+                    req.msg_namespace != namespace_id::Default
+                            ? fmt::to_string(to_int(req.msg_namespace))
+                            : ""s,
+                    req.timestamp,
+                    req.messages)) {
+            log::debug(logcat, "retrieve_by_hash: signature verification failed");
+            return cb(Response{
+                    http::UNAUTHORIZED, "retrieve_by_hash signature verification failed"sv});
+        }
+    }
+
+    std::vector<message> msgs;
+    try {
+        msgs = service_node_.db->retrieve_by_hash(req.pubkey, req.messages);
+        service_node_.record_retrieve_request();
+    } catch (const std::exception& e) {
+        auto msg = fmt::format(
+                "Internal Server Error. Could not retrieve messages for {}",
+                obfuscate_pubkey(req.pubkey));
+        log::critical(logcat, "{}", msg);
+        return cb(Response{http::INTERNAL_SERVER_ERROR, std::move(msg)});
+    }
+
+    json messages = json::array();
+    for (auto& msg : msgs) {
+        // The namespace scopes the authorization above (unauthenticated and revoked-subaccount
+        // access are only granted for some namespaces), so a message from any other namespace must
+        // not be returned.  A copy synced from a storage server too old to send namespaces is filed
+        // under the default namespace instead of its own; its hash covers the namespace, so a
+        // matching hash proves where it belongs.
+        if (msg.msg_namespace != req.msg_namespace &&
+            computeMessageHash(req.pubkey, req.msg_namespace, msg.data) != msg.hash)
+            continue;
+        messages.push_back(json{
+                {"hash", std::move(msg.hash)},
+                {"timestamp", to_epoch_ms(msg.timestamp)},
+                {"expiration", to_epoch_ms(msg.expiry)},
+                {"data", req.b64 ? oxenc::to_base64(msg.data) : std::move(msg.data)},
+        });
+    }
+
+    log::trace(
+            logcat,
+            "Retrieved {} of {} requested messages by hash for {}",
+            messages.size(),
+            req.messages.size(),
+            obfuscate_pubkey(req.pubkey));
+
+    json res{{"messages", std::move(messages)}};
+    add_misc_response_fields(res, service_node_, now);
+
+    return cb(Response{http::OK, std::move(res)});
+}
+
 void RequestHandler::process_client_req(rpc::info&&, std::function<void(rpc::Response)> cb) {
     auto res = json{
             {"version", STORAGE_SERVER_VERSION}, {"timestamp", to_epoch_ms(system_clock::now())}};

@@ -218,6 +218,7 @@ class RequestHandler {
     // Handlers for parsed client requests
     void process_client_req(rpc::store&& req, std::function<void(Response)> cb);
     void process_client_req(rpc::retrieve&& req, std::function<void(Response)> cb);
+    void process_client_req(rpc::retrieve_by_hash&& req, std::function<void(Response)> cb);
     void process_client_req(rpc::get_swarm&& req, std::function<void(Response)> cb);
     void process_client_req(rpc::oxend_request&& req, std::function<void(Response)> cb);
     void process_client_req(rpc::active_nodes_bin&& req, std::function<void(Response)> cb);

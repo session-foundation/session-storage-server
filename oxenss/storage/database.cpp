@@ -759,6 +759,45 @@ std::optional<message> Database::retrieve_by_hash(const std::string& msg_hash) {
     return msg;
 }
 
+std::vector<message> Database::retrieve_by_hash(
+        const user_pubkey& pubkey, std::span<const std::string> msg_hashes) {
+    auto conn = db_->conn();
+
+    // One statement per hash; see delete_by_hash.  The transaction only gives the lookups a single
+    // consistent snapshot.
+    std::vector<message> result;
+
+    auto transaction = conn.begin();
+
+    auto owner = exec_and_maybe_get<int64_t>(
+            conn.prepared_st("SELECT id FROM owners WHERE pubkey = ? AND type = ?"),
+            pubkey.raw_bytes(),
+            pubkey.type());
+    if (!owner)
+        return result;
+
+    auto st = conn.prepared_st(
+            "SELECT namespace, timestamp, expiry, data FROM messages"
+            " WHERE hash = ? AND owner = ? AND expiry > ?");
+    const auto now_ms = to_epoch_ms(std::chrono::system_clock::now());
+    std::unordered_set<std::string_view> seen;
+    for (const auto& hash : msg_hashes) {
+        if (!seen.insert(hash).second)
+            continue;
+        if (auto row = exec_and_maybe_get<namespace_id, int64_t, int64_t, std::string>(
+                    st, hash, *owner, now_ms)) {
+            auto& [ns, ts, exp, data] = *row;
+            result.emplace_back(hash, ns, from_epoch_ms(ts), from_epoch_ms(exp), std::move(data));
+        }
+        st->reset();
+    }
+
+    transaction.commit();
+
+    apply_deferred(result);
+    return result;
+}
+
 std::vector<std::pair<int64_t, message>> Database::retrieve_from_id(
         const user_pubkey& pubkey,
         namespace_id ns,

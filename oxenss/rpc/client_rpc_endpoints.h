@@ -267,6 +267,67 @@ struct retrieve final : endpoint {
     void load_from(oxenc::bt_dict_consumer params) override;
 };
 
+/// Retrieves specific messages of one namespace by hash, for a client that already knows the
+/// hashes (e.g. from a push notification that could not carry the message itself) and so has no
+/// use for `retrieve`'s `last_hash` paging.
+///
+/// Storage servers without this endpoint reject it as an unknown method; clients can treat that as
+/// the signal to fall back to `retrieve`.
+///
+/// Takes parameters of:
+/// - `pubkey` -- the account, in hex (66) or bytes (33).
+/// - `namespace` (optional) -- the namespace the messages belong to; omitting it is equivalent to
+///   specifying 0.  A message stored in a different namespace is not returned, with one exception:
+///   a copy filed under the wrong namespace (as synced from a storage server too old to send
+///   namespaces) is still returned when its hash shows that it belongs to this namespace.
+/// - `messages` -- array of 1 to `MAX_MESSAGES` message hash strings (as provided by the storage
+///   server) to retrieve.
+/// - `subaccount`/`subaccount_sig` (optional) -- see `store` for details.  Only subaccount tokens
+///   with the read bit set may invoke this method.
+///
+/// Authentication parameters, required for the same namespaces as `retrieve`: that is, for all
+/// namespaces except the ones `retrieve` permits unauthenticated access to.  When provided, the
+/// request is denied if the signature does not match.
+/// - `timestamp` -- the timestamp at which this request was initiated, in milliseconds since unix
+///   epoch; must be within ±60s of the current time.
+/// - `signature` -- Ed25519 signature of:
+///       ("retrieve_by_hash" || namespace || timestamp || messages[0] || ... || messages[N])
+///   where `namespace` is empty for namespace 0, and otherwise is the base10 expression of the
+///   namespace (as in `retrieve`), and `timestamp` is expressed as a base10 string.  Must be base64
+///   encoded for json requests; binary for OMQ requests.
+/// - `pubkey_ed25519` -- see `retrieve`.
+///
+/// On success, returns a dict containing key "messages" with a list of the requested messages
+/// that are stored for the account, in the same format as `retrieve`'s, in request order.
+/// Requested hashes that are not stored, have expired, belong to another account or belong to
+/// another namespace are omitted.  Each message details value is a dict containing keys:
+///
+/// - "hash" -- the message hash
+/// - "timestamp" -- the timestamp when the message was deposited
+/// - "expiration" -- the timestamp when the message is currently scheduled to expire
+/// - "data" -- the message data; b64-encoded for json, bytes for bt-encoded requests.
+struct retrieve_by_hash final : endpoint {
+    static constexpr auto names() { return NAMES("retrieve_by_hash"); }
+
+    // Bounds the response, which has no size limit of its own: at the maximum message size, 20
+    // messages make about a quarter of RETRIEVE_MAX_SIZE, which leaves room for other requests in
+    // the same batch.  It matches the number of single-hash requests a batch can carry.
+    inline static constexpr size_t MAX_MESSAGES = 20;
+
+    user_pubkey pubkey;
+    std::optional<signed_subaccount_token> subaccount;
+    namespace_id msg_namespace{0};
+    std::vector<std::string> messages;
+
+    bool check_signature = false;
+    std::optional<std::array<unsigned char, 32>> pubkey_ed25519;
+    std::chrono::system_clock::time_point timestamp;
+    std::array<unsigned char, 64> signature;
+
+    void load_from(nlohmann::json params) override;
+    void load_from(oxenc::bt_dict_consumer params) override;
+};
+
 /// Retrieves status information about this storage server.  Takes no parameters.
 ///
 /// Returns:
@@ -818,6 +879,7 @@ using client_rpc_subrequests = type_list<
         revoked_subaccounts,
         store,
         retrieve,
+        retrieve_by_hash,
         delete_msgs,
         delete_all,
         delete_before,
